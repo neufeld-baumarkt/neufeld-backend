@@ -1,6 +1,28 @@
+// server.js
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const bodyParser = require('body-parser');
+const { Pool } = require('pg');
+const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+
+const app = express(); // ✅ Das hat vorher gefehlt!
+const port = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'supersecretkey123';
 
+app.use(cors());
+app.use(bodyParser.json());
+
+const pool = new Pool({
+  host: process.env.DB_HOST,
+  port: process.env.DB_PORT,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+});
+
+// 🔐 Login mit Token-Ausgabe
 app.post('/api/login', async (req, res) => {
   const { name, password } = req.body;
 
@@ -35,4 +57,9 @@ app.post('/api/login', async (req, res) => {
     console.error('Login-Fehler:', err);
     return res.status(500).json({ message: 'Serverfehler' });
   }
+});
+
+// ✅ Serverstart
+app.listen(port, () => {
+  console.log(`✅ Backend läuft auf Port ${port}`);
 });
