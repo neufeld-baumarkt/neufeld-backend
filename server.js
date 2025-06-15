@@ -7,7 +7,7 @@ const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 
-const app = express(); // ✅ Das hat vorher gefehlt!
+const app = express();
 const port = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'supersecretkey123';
 
@@ -51,7 +51,13 @@ app.post('/api/login', async (req, res) => {
       { expiresIn: '8h' }
     );
 
-    return res.json({ token, name: user.name, role: user.role });
+    // ✅ WICHTIG: Jetzt auch "filiale" zurückgeben
+    return res.json({
+      token,
+      name: user.name,
+      role: user.role,
+      filiale: user.filiale  // 👈 diese Zeile ist neu!
+    });
 
   } catch (err) {
     console.error('Login-Fehler:', err);
