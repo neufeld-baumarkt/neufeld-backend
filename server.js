@@ -1,69 +1,29 @@
-// server.js
-require('dotenv').config();
+// /routes/reklamationen.js
 const express = require('express');
-const cors = require('cors');
-const bodyParser = require('body-parser');
-const { Pool } = require('pg');
-const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken');
+const router = express.Router();
+const verifyToken = require('../middleware/verifyToken');
+const pool = require('../db'); // zentraler Pool auslagern
 
-const app = express();
-const port = process.env.PORT || 3001;
-const JWT_SECRET = process.env.JWT_SECRET || 'supersecretkey123';
-
-app.use(cors());
-app.use(bodyParser.json());
-
-const pool = new Pool({
-  host: process.env.DB_HOST,
-  port: process.env.DB_PORT,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-});
-
-// 🔐 Login mit Token-Ausgabe
-app.post('/api/login', async (req, res) => {
-  const { name, password } = req.body;
-
-  if (!name || !password) {
-    return res.status(400).json({ message: 'Name und Passwort erforderlich' });
-  }
+router.get('/', verifyToken(), async (req, res) => {
+  const { role, filiale } = req.user;
 
   try {
-    const query = 'SELECT * FROM users WHERE name = $1';
-    const result = await pool.query(query, [name]);
+    let query;
+    let params = [];
 
-    if (result.rows.length === 0) {
-      return res.status(401).json({ message: 'Benutzer nicht gefunden' });
+    if (role === 'Admin' || filiale === 'alle') {
+      query = 'SELECT * FROM reklamationen ORDER BY datum DESC';
+    } else {
+      query = 'SELECT * FROM reklamationen WHERE filiale = $1 ORDER BY datum DESC';
+      params = [filiale];
     }
 
-    const user = result.rows[0];
-    const isMatch = await bcrypt.compare(password, user.password);
-
-    if (!isMatch) {
-      return res.status(401).json({ message: 'Falsches Passwort' });
-    }
-
-    const token = jwt.sign(
-      { id: user.id, name: user.name, role: user.role, filiale: user.filiale },
-      JWT_SECRET,
-      { expiresIn: '8h' }
-    );
-
-    return res.json({ token, name: user.name, role: user.role, filiale: user.filiale });
-
-  } catch (err) {
-    console.error('Login-Fehler:', err);
-    return res.status(500).json({ message: 'Serverfehler' });
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Fehler beim Abrufen der Reklamationen:', error);
+    res.status(500).json({ message: 'Fehler beim Abrufen der Reklamationen' });
   }
 });
 
-// 📦 Reklamationen-Routen aktivieren
-const reklamationenRoutes = require('./routes/reklamationen');
-app.use('/api/reklamationen', reklamationenRoutes);
-
-// ✅ Serverstart
-app.listen(port, () => {
-  console.log(`✅ Backend läuft auf Port ${port}`);
-});
+module.exports = router;
