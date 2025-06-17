@@ -7,7 +7,7 @@ const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 
-const app = express(); // ✅ Das hat vorher gefehlt!
+const app = express();
 const port = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'supersecretkey123';
 
@@ -46,18 +46,22 @@ app.post('/api/login', async (req, res) => {
     }
 
     const token = jwt.sign(
-      { id: user.id, name: user.name, role: user.role },
+      { id: user.id, name: user.name, role: user.role, filiale: user.filiale },
       JWT_SECRET,
       { expiresIn: '8h' }
     );
 
-    return res.json({ token, name: user.name, role: user.role });
+    return res.json({ token, name: user.name, role: user.role, filiale: user.filiale });
 
   } catch (err) {
     console.error('Login-Fehler:', err);
     return res.status(500).json({ message: 'Serverfehler' });
   }
 });
+
+// 📦 Reklamationen-Routen aktivieren
+const reklamationenRoutes = require('./routes/reklamationen');
+app.use('/api/reklamationen', reklamationenRoutes);
 
 // ✅ Serverstart
 app.listen(port, () => {
