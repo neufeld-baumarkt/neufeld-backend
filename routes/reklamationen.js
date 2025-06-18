@@ -1,17 +1,10 @@
 // /routes/reklamationen.js
 const express = require('express');
 const router = express.Router();
-const { Pool } = require('pg');
+const pool = require('../db');
 const verifyToken = require('../middleware/verifyToken');
 
-const pool = new Pool({
-  host: process.env.DB_HOST,
-  port: process.env.DB_PORT,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-});
-
+// GET /api/reklamationen – Liste nach Rolle/Filiale
 router.get('/', verifyToken(), async (req, res) => {
   const { role, filiale } = req.user;
 
@@ -31,6 +24,49 @@ router.get('/', verifyToken(), async (req, res) => {
   } catch (error) {
     console.error('Fehler beim Abrufen der Reklamationen:', error);
     res.status(500).json({ message: 'Fehler beim Abrufen der Reklamationen' });
+  }
+});
+
+// GET /api/reklamationen/:id – Detailansicht mit Positionen
+router.get('/:id', verifyToken(), async (req, res) => {
+  const { id } = req.params;
+  const { role, filiale } = req.user;
+
+  try {
+    const reklamationResult = await pool.query(
+      'SELECT * FROM reklamationen WHERE id = $1',
+      [id]
+    );
+
+    if (reklamationResult.rows.length === 0) {
+      return res.status(404).json({ message: 'Reklamation nicht gefunden' });
+    }
+
+    const reklamation = reklamationResult.rows[0];
+
+    // Berechtigungsprüfung
+    const rollenMitGlobalzugriff = ['Admin', 'Supervisor', 'Manager-1', 'Geschäftsführer'];
+    const istErlaubt =
+      rollenMitGlobalzugriff.includes(role) ||
+      filiale === 'alle' ||
+      filiale === reklamation.filiale;
+
+    if (!istErlaubt) {
+      return res.status(403).json({ message: 'Zugriff verweigert' });
+    }
+
+    const positionenResult = await pool.query(
+      'SELECT * FROM reklamation_positionen WHERE reklamation_id = $1',
+      [id]
+    );
+
+    res.json({
+      reklamation,
+      positionen: positionenResult.rows,
+    });
+  } catch (error) {
+    console.error('Fehler beim Abrufen der Detailreklamation:', error);
+    res.status(500).json({ message: 'Fehler beim Abrufen der Detailreklamation' });
   }
 });
 
