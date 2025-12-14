@@ -2,18 +2,17 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const bodyParser = require('body-parser');
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 
 const app = express();
-const port = process.env.PORT || 3001;
-const JWT_SECRET = process.env.JWT_SECRET || 'supersecretkey123';
 
+// Middleware
 app.use(cors());
-app.use(bodyParser.json());
+app.use(express.json());  // statt bodyParser.json()
 
+// DB Pool
 const pool = new Pool({
   host: process.env.DB_HOST,
   port: process.env.DB_PORT,
@@ -22,34 +21,27 @@ const pool = new Pool({
   database: process.env.DB_NAME,
 });
 
-// 🔐 Login
+// 🔐 Login Route
 app.post('/api/login', async (req, res) => {
   const { name, password } = req.body;
-
   if (!name || !password) {
     return res.status(400).json({ message: 'Name und Passwort erforderlich' });
   }
-
   try {
     const result = await pool.query('SELECT * FROM users WHERE name = $1', [name]);
-
     if (result.rows.length === 0) {
       return res.status(401).json({ message: 'Benutzer nicht gefunden' });
     }
-
     const user = result.rows[0];
     const isMatch = await bcrypt.compare(password, user.password);
-
     if (!isMatch) {
       return res.status(401).json({ message: 'Falsches Passwort' });
     }
-
     const token = jwt.sign(
       { id: user.id, name: user.name, role: user.role, filiale: user.filiale },
-      JWT_SECRET,
+      process.env.JWT_SECRET || 'supersecretkey123',
       { expiresIn: '8h' }
     );
-
     res.json({ token, name: user.name, role: user.role, filiale: user.filiale });
   } catch (err) {
     console.error('Login-Fehler:', err);
@@ -57,18 +49,23 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// Reklamationen-Routen
+// Routes importieren
 const reklamationenRoutes = require('./routes/reklamationen');
-app.use('/api/reklamationen', reklamationenRoutes);
-
-// Stammdaten-Routen – OHNE Prefix hier
 const stammdatenRoutes = require('./routes/stammdaten');
-app.use(stammdatenRoutes);  // <-- jetzt ohne '/api'
 
-// Pool exportieren (falls später mal nötig)
-module.exports.pool = pool;
+// Routes mounten – ALLE unter /api
+app.use('/api/reklamationen', reklamationenRoutes);
+app.use('/api', stammdatenRoutes);  // <-- Jetzt korrekt mit /api Prefix!
 
-// Server starten
-app.listen(port, () => {
-  console.log(`✅ Backend läuft auf Port ${port}`);
+// Temporäre Ping/Test-Route (kann später entfernt werden)
+app.get('/api/ping', (req, res) => {
+  console.log('🏓 Ping received – Backend ist wach und erreichbar');
+  res.json({ message: 'pong', timestamp: new Date().toISOString() });
+});
+
+// Port und Binding – WICHTIG für Render!
+const PORT = process.env.PORT || 3001;
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`✅ Backend läuft auf Port ${PORT} und bindet an 0.0.0.0`);
 });
