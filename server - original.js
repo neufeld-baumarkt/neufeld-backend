@@ -22,7 +22,7 @@ const pool = new Pool({
   database: process.env.DB_NAME,
 });
 
-// 🔐 Login
+// 🔐 Login mit Token-Ausgabe
 app.post('/api/login', async (req, res) => {
   const { name, password } = req.body;
 
@@ -31,7 +31,8 @@ app.post('/api/login', async (req, res) => {
   }
 
   try {
-    const result = await pool.query('SELECT * FROM users WHERE name = $1', [name]);
+    const query = 'SELECT * FROM users WHERE name = $1';
+    const result = await pool.query(query, [name]);
 
     if (result.rows.length === 0) {
       return res.status(401).json({ message: 'Benutzer nicht gefunden' });
@@ -50,25 +51,20 @@ app.post('/api/login', async (req, res) => {
       { expiresIn: '8h' }
     );
 
-    res.json({ token, name: user.name, role: user.role, filiale: user.filiale });
+    return res.json({ token, name: user.name, role: user.role, filiale: user.filiale });
+
   } catch (err) {
     console.error('Login-Fehler:', err);
-    res.status(500).json({ message: 'Serverfehler' });
+    return res.status(500).json({ message: 'Serverfehler' });
   }
 });
 
-// Reklamationen-Routen
+// 📦 Reklamationen-Routen aktivieren
+const verifyToken = require('./middleware/verifyToken'); // ✅ KORREKT: ./ statt ../
 const reklamationenRoutes = require('./routes/reklamationen');
 app.use('/api/reklamationen', reklamationenRoutes);
 
-// Stammdaten-Routen – OHNE Prefix hier
-const stammdatenRoutes = require('./routes/stammdaten');
-app.use(stammdatenRoutes);  // <-- jetzt ohne '/api'
-
-// Pool exportieren (falls später mal nötig)
-module.exports.pool = pool;
-
-// Server starten
+// ✅ Serverstart
 app.listen(port, () => {
   console.log(`✅ Backend läuft auf Port ${port}`);
 });
