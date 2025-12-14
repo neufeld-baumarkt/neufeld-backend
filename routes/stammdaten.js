@@ -11,10 +11,10 @@ router.use(verifyToken);
 
 // Alle Routen ohne zusätzlichen Prefix (weil /api schon in server.js gesetzt ist)
 
-// Filialen
+// Filialen – angepasst an deine Tabellenstruktur (Spalte "name" statt "bezeichnung")
 router.get('/filialen', async (req, res) => {
   try {
-    const result = await pool.query('SELECT id, bezeichnung AS name FROM filialen ORDER BY bezeichnung ASC');
+    const result = await pool.query('SELECT id, name FROM filialen WHERE aktiv = true ORDER BY name ASC');
     res.json(result.rows);
   } catch (err) {
     console.error('Fehler /api/filialen:', err);
