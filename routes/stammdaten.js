@@ -1,34 +1,33 @@
-// routes/stammdaten.js
+// routes/stammdaten.js – angepasste Version
+
 const express = require('express');
 const router = express.Router();
-
-// Pool aus db.js holen
 const pool = require('../db');
-
-// Auth-Middleware
 const verifyToken = require('../middleware/verifyToken');
-router.use(verifyToken);
+router.use(verifyToken); // Falls Auth wirklich nötig ist – siehe unten!
 
-// Alle Routen ohne zusätzlichen Prefix (weil /api schon in server.js gesetzt ist)
-
-// Filialen – angepasst an deine Tabellenstruktur (Spalte "name" statt "bezeichnung")
+// Filialen
 router.get('/filialen', async (req, res) => {
   try {
-    const result = await pool.query('SELECT id, name FROM filialen WHERE aktiv = true ORDER BY name ASC');
-    res.json(result.rows);
+    const result = await pool.query('SELECT name FROM filialen WHERE aktiv = true ORDER BY name ASC');
+    const data = result.rows.map(row => row.name);
+    console.log('/api/filialen aufgerufen –', data.length, 'Einträge');
+    res.json(data);
   } catch (err) {
-    console.error('Fehler /api/filialen:', err);
+    console.error('Fehler /api/filialen:', err.message);
     res.status(500).json({ error: 'Datenbankfehler' });
   }
 });
 
-// Art der Reklamation
-router.get('/art_der_reklamation', async (req, res) => {
+// Reklamationsarten
+router.get('/reklamationsarten', async (req, res) => {
   try {
-    const result = await pool.query('SELECT id, bezeichnung AS name FROM art_der_reklamation ORDER BY bezeichnung ASC');
-    res.json(result.rows);
+    const result = await pool.query('SELECT bezeichnung FROM art_der_reklamation ORDER BY bezeichnung ASC');
+    const data = result.rows.map(row => row.bezeichnung);
+    console.log('/api/reklamationsarten aufgerufen –', data.length, 'Einträge');
+    res.json(data);
   } catch (err) {
-    console.error('Fehler /api/art_der_reklamation:', err);
+    console.error('Fehler /api/reklamationsarten:', err.message);
     res.status(500).json({ error: 'Datenbankfehler' });
   }
 });
@@ -36,21 +35,25 @@ router.get('/art_der_reklamation', async (req, res) => {
 // Lieferanten
 router.get('/lieferanten', async (req, res) => {
   try {
-    const result = await pool.query('SELECT id, bezeichnung AS name FROM lieferanten ORDER BY bezeichnung ASC');
-    res.json(result.rows);
+    const result = await pool.query('SELECT bezeichnung FROM lieferanten ORDER BY bezeichnung ASC');
+    const data = result.rows.map(row => row.bezeichnung);
+    console.log('/api/lieferanten aufgerufen –', data.length, 'Einträge');
+    res.json(data);
   } catch (err) {
-    console.error('Fehler /api/lieferanten:', err);
+    console.error('Fehler /api/lieferanten:', err.message);
     res.status(500).json({ error: 'Datenbankfehler' });
   }
 });
 
-// Einheit
-router.get('/einheit', async (req, res) => {
+// Einheiten
+router.get('/einheiten', async (req, res) => {
   try {
-    const result = await pool.query('SELECT id, bezeichnung AS name FROM einheit ORDER BY bezeichnung ASC');
-    res.json(result.rows);
+    const result = await pool.query('SELECT bezeichnung FROM einheit ORDER BY bezeichnung ASC');
+    const data = result.rows.map(row => row.bezeichnung);
+    console.log('/api/einheiten aufgerufen –', data.length, 'Einträge');
+    res.json(data);
   } catch (err) {
-    console.error('Fehler /api/einheit:', err);
+    console.error('Fehler /api/einheiten:', err.message);
     res.status(500).json({ error: 'Datenbankfehler' });
   }
 });
@@ -58,10 +61,12 @@ router.get('/einheit', async (req, res) => {
 // Status
 router.get('/status', async (req, res) => {
   try {
-    const result = await pool.query('SELECT id, bezeichnung AS name FROM status ORDER BY bezeichnung ASC');
-    res.json(result.rows);
+    const result = await pool.query('SELECT bezeichnung FROM status ORDER BY id ASC');
+    const data = result.rows.map(row => row.bezeichnung);
+    console.log('/api/status aufgerufen –', data.length, 'Einträge');
+    res.json(data);
   } catch (err) {
-    console.error('Fehler /api/status:', err);
+    console.error('Fehler /api/status:', err.message);
     res.status(500).json({ error: 'Datenbankfehler' });
   }
 });
