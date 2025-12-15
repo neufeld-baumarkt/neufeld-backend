@@ -1,11 +1,11 @@
-// /routes/reklamationen.js
+// /routes/reklamationen.js – komplette Datei mit POST-Route
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
 const verifyToken = require('../middleware/verifyToken');
 
 // GET /api/reklamationen – Liste nach Rolle/Filiale
-router.get('/', verifyToken(), async (req, res) => {
+router.get('/', verifyToken, async (req, res) => {
   const { role, filiale } = req.user;
 
   try {
@@ -28,7 +28,7 @@ router.get('/', verifyToken(), async (req, res) => {
 });
 
 // GET /api/reklamationen/:id – Detailansicht mit Positionen
-router.get('/:id', verifyToken(), async (req, res) => {
+router.get('/:id', verifyToken, async (req, res) => {
   const { id } = req.params;
   const { role, filiale } = req.user;
 
@@ -67,6 +67,74 @@ router.get('/:id', verifyToken(), async (req, res) => {
   } catch (error) {
     console.error('Fehler beim Abrufen der Detailreklamation:', error);
     res.status(500).json({ message: 'Fehler beim Abrufen der Detailreklamation' });
+  }
+});
+
+// POST /api/reklamationen – Neue Reklamation anlegen
+router.post('/', verifyToken, async (req, res) => {
+  const user = req.user;  // role und filiale aus dem JWT
+  const data = req.body;
+
+  // Filial-Nutzer dürfen nur Reklamationen für ihre eigene Filiale anlegen
+  if (user.role === 'Filiale' && data.filiale && data.filiale !== user.filiale) {
+    return res.status(403).json({ message: 'Nur Reklamationen für die eigene Filiale anlegbar' });
+  }
+
+  try {
+    // Duplikatsprüfung für rekla_nr
+    const dupeCheck = await pool.query(
+      'SELECT id FROM reklamationen WHERE rekla_nr = $1',
+      [data.rekla_nr]
+    );
+    if (dupeCheck.rows.length > 0) {
+      return res.status(409).json({ message: 'Reklamationsnummer bereits vergeben' });
+    }
+
+    // INSERT in die Tabelle reklamationen
+    const insertQuery = `
+      INSERT INTO reklamationen (
+        filiale, art, datum, rekla_nr, lieferant, ls_nummer_grund,
+        versand, tracking_id, artikelnummer, ean,
+        bestell_menge, bestell_einheit, rekla_menge, rekla_einheit,
+        status, letzte_aenderung
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+        $11, $12, $13, $14, $15, $16
+      ) RETURNING id;
+    `;
+
+    const values = [
+      data.filiale || null,
+      data.art || null,
+      data.datum || null,
+      data.rekla_nr,
+      data.lieferant || null,
+      data.ls_nummer_grund || null,
+      data.versand || false,
+      data.tracking_id || null,
+      data.artikelnummer || null,
+      data.ean || null,
+      data.bestell_menge || null,
+      data.bestell_einheit || null,
+      data.rekla_menge || null,
+      data.rekla_einheit || null,
+      data.status || 'Angelegt',
+      data.letzte_aenderung || null
+    ];
+
+    const result = await pool.query(insertQuery, values);
+    const newId = result.rows[0].id;
+
+    console.log(`Neue Reklamation angelegt – ID: ${newId}, Rekla-Nr: ${data.rekla_nr}`);
+
+    res.status(201).json({
+      message: 'Reklamation erfolgreich angelegt',
+      id: newId,
+      rekla_nr: data.rekla_nr
+    });
+  } catch (err) {
+    console.error('Fehler beim Anlegen der Reklamation:', err.message);
+    res.status(500).json({ message: 'Serverfehler beim Speichern' });
   }
 });
 
