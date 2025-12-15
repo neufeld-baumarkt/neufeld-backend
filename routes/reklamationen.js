@@ -1,4 +1,4 @@
-// /routes/reklamationen.js – finale Version: Reklamation + Position korrekt speichern
+// /routes/reklamationen.js – komplette Datei mit rekla_id (fortlaufend)
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
@@ -13,9 +13,9 @@ router.get('/', verifyToken(), async (req, res) => {
     let params = [];
 
     if (role === 'Admin' || filiale === 'alle') {
-      query = 'SELECT * FROM reklamationen ORDER BY datum DESC';
+      query = 'SELECT * FROM reklamationen ORDER BY rekla_id DESC'; // sortiert nach fortlaufender Nummer
     } else {
-      query = 'SELECT * FROM reklamationen WHERE filiale = $1 ORDER BY datum DESC';
+      query = 'SELECT * FROM reklamationen WHERE filiale = $1 ORDER BY rekla_id DESC';
       params = [filiale];
     }
 
@@ -69,12 +69,11 @@ router.get('/:id', verifyToken(), async (req, res) => {
   }
 });
 
-// POST /api/reklamationen – Neue Reklamation + eine Position anlegen
+// POST /api/reklamationen – Neue Reklamation + Position anlegen (rekla_id automatisch)
 router.post('/', verifyToken(), async (req, res) => {
   const user = req.user;
   const data = req.body;
 
-  // Filial-Prüfung
   if (user.role === 'Filiale' && data.filiale && data.filiale !== user.filiale) {
     return res.status(403).json({ message: 'Nur eigene Filiale anlegbar' });
   }
@@ -84,14 +83,14 @@ router.post('/', verifyToken(), async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // 1. Reklamation anlegen (nur Hauptfelder)
+    // Reklamation anlegen (rekla_id automatisch durch Sequence)
     const reklaQuery = `
       INSERT INTO reklamationen (
         datum, letzte_aenderung, art, rekla_nr, lieferant, filiale, status,
         ls_nummer_grund, versand, tracking_id
       ) VALUES (
         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
-      ) RETURNING id;
+      ) RETURNING id, rekla_id;
     `;
 
     const reklaValues = [
@@ -109,8 +108,9 @@ router.post('/', verifyToken(), async (req, res) => {
 
     const reklaResult = await client.query(reklaQuery, reklaValues);
     const reklamationId = reklaResult.rows[0].id;
+    const newReklaId = reklaResult.rows[0].rekla_id;
 
-    // 2. Position anlegen (Artikel-Details)
+    // Position anlegen
     const posQuery = `
       INSERT INTO reklamation_positionen (
         reklamation_id, artikelnummer, ean, bestell_menge, bestell_einheit,
@@ -134,9 +134,13 @@ router.post('/', verifyToken(), async (req, res) => {
 
     await client.query('COMMIT');
 
-    console.log(`Reklamation angelegt – ID: ${reklamationId}, Rekla-Nr: ${data.rekla_nr}`);
+    console.log(`Reklamation angelegt – UUID: ${reklamationId}, Laufende Nr: ${newReklaId}, Rekla-Nr: ${data.rekla_nr}`);
 
-    res.status(201).json({ message: 'Reklamation erfolgreich angelegt', id: reklamationId });
+    res.status(201).json({ 
+      message: 'Reklamation erfolgreich angelegt', 
+      id: reklamationId,
+      rekla_id: newReklaId  // die fortlaufende Nummer
+    });
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('Fehler beim Anlegen:', err.message);
