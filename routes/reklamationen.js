@@ -1,4 +1,4 @@
-// /routes/reklamationen.js – komplette Datei mit rekla_id (fortlaufend)
+// /routes/reklamationen.js – finale Version, id automatisch mit uuid_generate_v4()
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
@@ -13,9 +13,9 @@ router.get('/', verifyToken(), async (req, res) => {
     let params = [];
 
     if (role === 'Admin' || filiale === 'alle') {
-      query = 'SELECT * FROM reklamationen ORDER BY rekla_id DESC'; // sortiert nach fortlaufender Nummer
+      query = 'SELECT * FROM reklamationen ORDER BY datum DESC';
     } else {
-      query = 'SELECT * FROM reklamationen WHERE filiale = $1 ORDER BY rekla_id DESC';
+      query = 'SELECT * FROM reklamationen WHERE filiale = $1 ORDER BY datum DESC';
       params = [filiale];
     }
 
@@ -69,7 +69,7 @@ router.get('/:id', verifyToken(), async (req, res) => {
   }
 });
 
-// POST /api/reklamationen – Neue Reklamation + Position anlegen (rekla_id automatisch)
+// POST /api/reklamationen – Neue Reklamation + Position anlegen (id automatisch)
 router.post('/', verifyToken(), async (req, res) => {
   const user = req.user;
   const data = req.body;
@@ -83,14 +83,14 @@ router.post('/', verifyToken(), async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Reklamation anlegen (rekla_id automatisch durch Sequence)
+    // Reklamation anlegen (id wird automatisch durch uuid_generate_v4() generiert)
     const reklaQuery = `
       INSERT INTO reklamationen (
         datum, letzte_aenderung, art, rekla_nr, lieferant, filiale, status,
         ls_nummer_grund, versand, tracking_id
       ) VALUES (
         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
-      ) RETURNING id, rekla_id;
+      ) RETURNING id;
     `;
 
     const reklaValues = [
@@ -108,7 +108,6 @@ router.post('/', verifyToken(), async (req, res) => {
 
     const reklaResult = await client.query(reklaQuery, reklaValues);
     const reklamationId = reklaResult.rows[0].id;
-    const newReklaId = reklaResult.rows[0].rekla_id;
 
     // Position anlegen
     const posQuery = `
@@ -134,13 +133,9 @@ router.post('/', verifyToken(), async (req, res) => {
 
     await client.query('COMMIT');
 
-    console.log(`Reklamation angelegt – UUID: ${reklamationId}, Laufende Nr: ${newReklaId}, Rekla-Nr: ${data.rekla_nr}`);
+    console.log(`Reklamation angelegt – ID: ${reklamationId}, Rekla-Nr: ${data.rekla_nr}`);
 
-    res.status(201).json({ 
-      message: 'Reklamation erfolgreich angelegt', 
-      id: reklamationId,
-      rekla_id: newReklaId  // die fortlaufende Nummer
-    });
+    res.status(201).json({ message: 'Reklamation erfolgreich angelegt', id: reklamationId });
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('Fehler beim Anlegen:', err.message);
