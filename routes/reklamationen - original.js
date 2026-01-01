@@ -12,7 +12,15 @@ router.get('/', verifyToken(), async (req, res) => {
     let query;
     let params = [];
 
-    if (role === 'Admin' || filiale === 'alle') {
+    // Globale Sicht für Admin, Supervisor & Co. ODER wenn keine eigene Filiale zugewiesen ist (Zentrale)
+    const rollenMitGlobalzugriff = ['Admin', 'Supervisor', 'Manager-1', 'Geschäftsführer'];
+
+    if (
+      rollenMitGlobalzugriff.includes(role) ||
+      filiale === 'alle' ||
+      !filiale ||                    // NEU: Wenn keine Filiale im Token → Zentrale-User → alles sehen
+      filiale === ''                 // Falls leerer String
+    ) {
       query = 'SELECT * FROM reklamationen ORDER BY datum DESC';
     } else {
       query = 'SELECT * FROM reklamationen WHERE filiale = $1 ORDER BY datum DESC';
@@ -48,6 +56,8 @@ router.get('/:id', verifyToken(), async (req, res) => {
     const istErlaubt =
       rollenMitGlobalzugriff.includes(role) ||
       filiale === 'alle' ||
+      !filiale ||                                // Auch hier für Konsistenz
+      filiale === '' ||
       filiale === reklamation.filiale;
 
     if (!istErlaubt) {
