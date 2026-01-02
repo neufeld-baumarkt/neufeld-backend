@@ -1,8 +1,14 @@
-// /routes/reklamationen.js – finale Version, id automatisch mit uuid_generate_v4()
+// routes/reklamationen.js – FINALE VERSION MIT STRENGEN ROLLENREGELN
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
 const verifyToken = require('../middleware/verifyToken');
+
+// Rollen mit globaler Sicht (für GET-Anzeige)
+const rollenMitGlobalzugriff = ['Admin', 'Supervisor', 'Manager-1', 'Geschäftsführer'];
+
+// Rollen mit Bearbeitungs- und Löschrecht – NUR diese beiden!
+const rollenMitBearbeitungsrecht = ['Admin', 'Supervisor'];
 
 // GET /api/reklamationen – Liste nach Rolle/Filiale
 router.get('/', verifyToken(), async (req, res) => {
@@ -12,14 +18,11 @@ router.get('/', verifyToken(), async (req, res) => {
     let query;
     let params = [];
 
-    // Globale Sicht für Admin, Supervisor & Co. ODER wenn keine eigene Filiale zugewiesen ist (Zentrale)
-    const rollenMitGlobalzugriff = ['Admin', 'Supervisor', 'Manager-1', 'Geschäftsführer'];
-
     if (
       rollenMitGlobalzugriff.includes(role) ||
       filiale === 'alle' ||
-      !filiale ||                    // NEU: Wenn keine Filiale im Token → Zentrale-User → alles sehen
-      filiale === ''                 // Falls leerer String
+      !filiale ||
+      filiale === ''
     ) {
       query = 'SELECT * FROM reklamationen ORDER BY datum DESC';
     } else {
@@ -52,11 +55,10 @@ router.get('/:id', verifyToken(), async (req, res) => {
 
     const reklamation = reklamationResult.rows[0];
 
-    const rollenMitGlobalzugriff = ['Admin', 'Supervisor', 'Manager-1', 'Geschäftsführer'];
     const istErlaubt =
       rollenMitGlobalzugriff.includes(role) ||
       filiale === 'alle' ||
-      !filiale ||                                // Auch hier für Konsistenz
+      !filiale ||
       filiale === '' ||
       filiale === reklamation.filiale;
 
@@ -65,7 +67,7 @@ router.get('/:id', verifyToken(), async (req, res) => {
     }
 
     const positionenResult = await pool.query(
-      'SELECT * FROM reklamation_positionen WHERE reklamation_id = $1',
+      'SELECT * FROM reklamation_positionen WHERE reklamation_id = $1 ORDER BY pos_id',
       [id]
     );
 
@@ -79,11 +81,12 @@ router.get('/:id', verifyToken(), async (req, res) => {
   }
 });
 
-// POST /api/reklamationen – Neue Reklamation + Position anlegen (id automatisch)
+// POST /api/reklamationen – Neue Reklamation anlegen (für alle angemeldeten User)
 router.post('/', verifyToken(), async (req, res) => {
   const user = req.user;
   const data = req.body;
 
+  // Filiale-User dürfen nur in ihrer eigenen Filiale anlegen
   if (user.role === 'Filiale' && data.filiale && data.filiale !== user.filiale) {
     return res.status(403).json({ message: 'Nur eigene Filiale anlegbar' });
   }
@@ -93,23 +96,21 @@ router.post('/', verifyToken(), async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Reklamation anlegen (id wird automatisch durch uuid_generate_v4() generiert)
     const reklaQuery = `
       INSERT INTO reklamationen (
         datum, letzte_aenderung, art, rekla_nr, lieferant, filiale, status,
         ls_nummer_grund, versand, tracking_id
       ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+        $1, CURRENT_DATE, $2, $3, $4, $5, $6, $7, $8, $9
       ) RETURNING id;
     `;
 
     const reklaValues = [
       data.datum || null,
-      data.letzte_aenderung || null,
       data.art || null,
       data.rekla_nr || null,
       data.lieferant || null,
-      data.filiale || null,
+      data.filiale || user.filiale || null,
       data.status || 'Angelegt',
       data.ls_nummer_grund || null,
       data.versand || false,
@@ -119,37 +120,224 @@ router.post('/', verifyToken(), async (req, res) => {
     const reklaResult = await client.query(reklaQuery, reklaValues);
     const reklamationId = reklaResult.rows[0].id;
 
-    // Position anlegen
-    const posQuery = `
-      INSERT INTO reklamation_positionen (
-        reklamation_id, artikelnummer, ean, bestell_menge, bestell_einheit,
-        rekla_menge, rekla_einheit
-      ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7
-      );
-    `;
+    // Positionen (kann Array mit mehreren sein – auch nur eine)
+    if (data.positionen && Array.isArray(data.positionen) && data.positionen.length > 0) {
+      const posQuery = `
+        INSERT INTO reklamation_positionen (
+          reklamation_id, artikelnummer, ean, bestell_menge, bestell_einheit,
+          rekla_menge, rekla_einheit
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `;
 
-    const posValues = [
-      reklamationId,
-      data.artikelnummer || null,
-      data.ean || null,
-      data.bestell_menge || null,
-      data.bestell_einheit || null,
-      data.rekla_menge || null,
-      data.rekla_einheit || null
-    ];
-
-    await client.query(posQuery, posValues);
+      for (const pos of data.positionen) {
+        const posValues = [
+          reklamationId,
+          pos.artikelnummer || null,
+          pos.ean || null,
+          pos.bestell_menge || null,
+          pos.bestell_einheit || null,
+          pos.rekla_menge || null,
+          pos.rekla_einheit || null
+        ];
+        await client.query(posQuery, posValues);
+      }
+    }
 
     await client.query('COMMIT');
-
-    console.log(`Reklamation angelegt – ID: ${reklamationId}, Rekla-Nr: ${data.rekla_nr}`);
-
+    console.log(`Reklamation angelegt – ID: ${reklamationId} von ${user.name} (${user.role})`);
     res.status(201).json({ message: 'Reklamation erfolgreich angelegt', id: reklamationId });
   } catch (err) {
     await client.query('ROLLBACK');
     console.error('Fehler beim Anlegen:', err.message);
-    res.status(500).json({ message: 'Serverfehler beim Speichern', error: err.message });
+    res.status(500).json({ message: 'Serverfehler beim Speichern' });
+  } finally {
+    client.release();
+  }
+});
+
+// PUT /api/reklamationen/:id – Komplett bearbeiten (NUR Admin/Supervisor)
+router.put('/:id', verifyToken(), async (req, res) => {
+  const { id } = req.params;
+  const user = req.user;
+  const data = req.body;
+
+  if (!rollenMitBearbeitungsrecht.includes(user.role)) {
+    return res.status(403).json({ 
+      message: 'Zugriff verweigert: Nur Admin oder Supervisor dürfen bearbeiten' 
+    });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const updateQuery = `
+      UPDATE reklamationen SET
+        datum = $1,
+        letzte_aenderung = CURRENT_DATE,
+        art = $2,
+        rekla_nr = $3,
+        lieferant = $4,
+        filiale = $5,
+        status = $6,
+        ls_nummer_grund = $7,
+        versand = $8,
+        tracking_id = $9
+      WHERE id = $10
+    `;
+
+    const updateValues = [
+      data.datum || null,
+      data.art || null,
+      data.rekla_nr || null,
+      data.lieferant || null,
+      data.filiale || null,
+      data.status || null,
+      data.ls_nummer_grund || null,
+      data.versand ?? false,
+      data.tracking_id || null,
+      id
+    ];
+
+    const result = await client.query(updateQuery, updateValues);
+    if (result.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Reklamation nicht gefunden' });
+    }
+
+    // Alle Positionen löschen und neue einfügen
+    await client.query('DELETE FROM reklamation_positionen WHERE reklamation_id = $1', [id]);
+
+    if (data.positionen && Array.isArray(data.positionen) && data.positionen.length > 0) {
+      const posQuery = `
+        INSERT INTO reklamation_positionen (
+          reklamation_id, artikelnummer, ean, bestell_menge, bestell_einheit,
+          rekla_menge, rekla_einheit
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `;
+
+      for (const pos of data.positionen) {
+        const posValues = [
+          id,
+          pos.artikelnummer || null,
+          pos.ean || null,
+          pos.bestell_menge || null,
+          pos.bestell_einheit || null,
+          pos.rekla_menge || null,
+          pos.rekla_einheit || null
+        ];
+        await client.query(posQuery, posValues);
+      }
+    }
+
+    await client.query('COMMIT');
+    console.log(`Reklamation vollständig bearbeitet – ID: ${id} von ${user.name} (${user.role})`);
+    res.json({ message: 'Reklamation erfolgreich aktualisiert' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Fehler beim Bearbeiten:', err.message);
+    res.status(500).json({ message: 'Serverfehler beim Aktualisieren' });
+  } finally {
+    client.release();
+  }
+});
+
+// PATCH /api/reklamationen/:id – Teil-Update (NUR Admin/Supervisor)
+router.patch('/:id', verifyToken(), async (req, res) => {
+  const { id } = req.params;
+  const user = req.user;
+  const updates = req.body;
+
+  if (!rollenMitBearbeitungsrecht.includes(user.role)) {
+    return res.status(403).json({ 
+      message: 'Zugriff verweigert: Nur Admin oder Supervisor dürfen Änderungen vornehmen' 
+    });
+  }
+
+  if (Object.keys(updates).length === 0) {
+    return res.status(400).json({ message: 'Keine Änderungen übermittelt' });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const checkResult = await client.query('SELECT id FROM reklamationen WHERE id = $1', [id]);
+    if (checkResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Reklamation nicht gefunden' });
+    }
+
+    const allowedFields = ['status', 'versand', 'tracking_id', 'ls_nummer_grund'];
+    const setClauses = [];
+    const values = [];
+    let paramIndex = 1;
+
+    for (const field of allowedFields) {
+      if (updates[field] !== undefined) {
+        setClauses.push(`${field} = $${paramIndex}`);
+        values.push(updates[field]);
+        paramIndex++;
+      }
+    }
+
+    if (setClauses.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'Keine gültigen Felder zum Updaten' });
+    }
+
+    setClauses.push('letzte_aenderung = CURRENT_DATE');
+    const query = `UPDATE reklamationen SET ${setClauses.join(', ')} WHERE id = $${paramIndex}`;
+    values.push(id);
+
+    await client.query(query, values);
+
+    await client.query('COMMIT');
+    console.log(`Reklamation Teil-Update – ID: ${id} von ${user.name} (${user.role}): ${JSON.stringify(updates)}`);
+    res.json({ message: 'Reklamation erfolgreich teilweise aktualisiert' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Fehler beim PATCH:', err.message);
+    res.status(500).json({ message: 'Serverfehler beim Aktualisieren' });
+  } finally {
+    client.release();
+  }
+});
+
+// DELETE /api/reklamationen/:id – Löschen (NUR Admin/Supervisor)
+router.delete('/:id', verifyToken(), async (req, res) => {
+  const { id } = req.params;
+  const user = req.user;
+
+  if (!rollenMitBearbeitungsrecht.includes(user.role)) {
+    return res.status(403).json({ 
+      message: 'Zugriff verweigert: Nur Admin oder Supervisor dürfen löschen' 
+    });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    await client.query('DELETE FROM reklamation_positionen WHERE reklamation_id = $1', [id]);
+
+    const result = await client.query('DELETE FROM reklamationen WHERE id = $1 RETURNING rekla_nr', [id]);
+
+    if (result.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Reklamation nicht gefunden' });
+    }
+
+    await client.query('COMMIT');
+    console.log(`Reklamation gelöscht – ID: ${id}, Nr: ${result.rows[0].rekla_nr} von ${user.name} (${user.role})`);
+    res.json({ message: 'Reklamation erfolgreich gelöscht' });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error('Fehler beim Löschen:', err.message);
+    res.status(500).json({ message: 'Serverfehler beim Löschen' });
   } finally {
     client.release();
   }
