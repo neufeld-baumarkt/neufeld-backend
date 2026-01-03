@@ -1,4 +1,4 @@
-// routes/reklamationen.js – V1.0.1 (FIX) mit LFD_NR-Aggregaten für die Listenansicht
+// routes/reklamationen.js – V1.1.0 (LFD_NR-Auto pro Filiale + Jahr, Edit-Fall B = Nummern bleiben stabil)
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
@@ -9,6 +9,72 @@ const rollenMitGlobalzugriff = ['Admin', 'Supervisor', 'Manager-1', 'Geschäftsf
 
 // Rollen mit Bearbeitungs- und Löschrecht – NUR diese beiden!
 const rollenMitBearbeitungsrecht = ['Admin', 'Supervisor'];
+
+/**
+ * Vergibt lfd_nr blockweise, transaktionssicher (Row-Lock) pro Filiale + Jahr.
+ * - Nutzt Tabelle: lfd_nr_counter (filiale, jahr, last_value, updated_at)
+ * - Garantiert: einmalig, fortlaufend, kein Reuse (auch nicht bei Delete)
+ */
+async function allocateLfdNumbers(client, filiale, jahr, count) {
+  if (!filiale || typeof filiale !== 'string' || filiale.trim() === '') {
+    throw new Error('LFD_NR: filiale fehlt/ungültig');
+  }
+  if (!Number.isInteger(jahr) || jahr < 2000 || jahr > 3000) {
+    throw new Error('LFD_NR: jahr fehlt/ungültig');
+  }
+  if (!Number.isInteger(count) || count <= 0) {
+    return { start: null, end: null };
+  }
+
+  // ensure row exists
+  await client.query(
+    `
+    INSERT INTO lfd_nr_counter (filiale, jahr, last_value)
+    VALUES ($1, $2, 0)
+    ON CONFLICT (filiale, jahr) DO NOTHING;
+    `,
+    [filiale, jahr]
+  );
+
+  // lock + increment atomar
+  const result = await client.query(
+    `
+    WITH locked AS (
+      SELECT last_value
+      FROM lfd_nr_counter
+      WHERE filiale = $1 AND jahr = $2
+      FOR UPDATE
+    ),
+    upd AS (
+      UPDATE lfd_nr_counter c
+      SET last_value = locked.last_value + $3,
+          updated_at = now()
+      FROM locked
+      WHERE c.filiale = $1 AND c.jahr = $2
+      RETURNING locked.last_value AS old_last, c.last_value AS new_last
+    )
+    SELECT old_last, new_last FROM upd;
+    `,
+    [filiale, jahr, count]
+  );
+
+  if (!result.rows || result.rows.length === 0) {
+    throw new Error('LFD_NR: Counter-Update fehlgeschlagen');
+  }
+
+  const oldLast = Number(result.rows[0].old_last);
+  const newLast = Number(result.rows[0].new_last);
+
+  if (!Number.isFinite(oldLast) || !Number.isFinite(newLast) || newLast - oldLast !== count) {
+    throw new Error('LFD_NR: Counter-Werte inkonsistent');
+  }
+
+  return { start: oldLast + 1, end: newLast };
+}
+
+function getCurrentYear() {
+  return new Date().getFullYear();
+}
 
 /**
  * GET /api/reklamationen
@@ -94,7 +160,12 @@ router.get('/:id', verifyToken(), async (req, res) => {
     }
 
     const positionenResult = await pool.query(
-      'SELECT * FROM reklamation_positionen WHERE reklamation_id = $1 ORDER BY pos_id',
+      `
+      SELECT *
+      FROM reklamation_positionen
+      WHERE reklamation_id = $1
+      ORDER BY lfd_nr NULLS LAST, pos_id;
+      `,
       [id]
     );
 
@@ -111,7 +182,7 @@ router.get('/:id', verifyToken(), async (req, res) => {
 /**
  * POST /api/reklamationen
  * Neue Reklamation anlegen (alle User, Filialuser nur eigene Filiale)
- * Hinweis: lfd_nr-Vergabe ist hier noch NICHT enthalten (kommt als nächster Schritt).
+ * Neu: lfd_nr wird automatisch vergeben pro Filiale + Jahr, einmalig/fortlaufend, transaktionssicher.
  */
 router.post('/', verifyToken(), async (req, res) => {
   const user = req.user;
@@ -125,6 +196,8 @@ router.post('/', verifyToken(), async (req, res) => {
 
   try {
     await client.query('BEGIN');
+
+    const filialeFinal = (data.filiale || user.filiale || '').toString();
 
     const reklaQuery = `
       INSERT INTO reklamationen (
@@ -143,7 +216,7 @@ router.post('/', verifyToken(), async (req, res) => {
       data.art || null,
       data.rekla_nr || null,
       data.lieferant || null,
-      data.filiale || user.filiale || null,
+      filialeFinal || null,
       data.status || 'Angelegt',
       data.ls_nummer_grund || null,
       data.versand || false,
@@ -153,16 +226,21 @@ router.post('/', verifyToken(), async (req, res) => {
     const reklaResult = await client.query(reklaQuery, reklaValues);
     const reklamationId = reklaResult.rows[0].id;
 
-    if (data.positionen && Array.isArray(data.positionen) && data.positionen.length > 0) {
+    const positionen = Array.isArray(data.positionen) ? data.positionen : [];
+    if (positionen.length > 0) {
+      const jahr = getCurrentYear();
+      const { start } = await allocateLfdNumbers(client, filialeFinal, jahr, positionen.length);
+
       const posQuery = `
         INSERT INTO reklamation_positionen (
           reklamation_id, artikelnummer, ean, bestell_menge, bestell_einheit,
-          rekla_menge, rekla_einheit
+          rekla_menge, rekla_einheit, lfd_nr
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7);
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8);
       `;
 
-      for (const pos of data.positionen) {
+      let nextNr = start;
+      for (const pos of positionen) {
         const posValues = [
           reklamationId,
           pos.artikelnummer || null,
@@ -171,9 +249,10 @@ router.post('/', verifyToken(), async (req, res) => {
           pos.bestell_einheit || null,
           pos.rekla_menge || null,
           pos.rekla_einheit || null,
+          nextNr,
         ];
-
         await client.query(posQuery, posValues);
+        nextNr++;
       }
     }
 
@@ -197,6 +276,11 @@ router.post('/', verifyToken(), async (req, res) => {
  * PUT /api/reklamationen/:id
  * Komplett bearbeiten (Reklamation + Positionen ersetzen)
  * Nur Admin/Supervisor
+ *
+ * Fall B (gewünscht): lfd_nr bleibt stabil.
+ * - Vorhandene lfd_nr werden als "zulässig" aus DB gelesen.
+ * - Beim Speichern werden nur lfd_nr akzeptiert, die vorher zu dieser Reklamation gehörten.
+ * - Neue Positionen (ohne gültige lfd_nr) bekommen neue Nummern aus dem Counter (pro Filiale+Jahr).
  */
 router.put('/:id', verifyToken(), async (req, res) => {
   const { id } = req.params;
@@ -226,7 +310,8 @@ router.put('/:id', verifyToken(), async (req, res) => {
         ls_nummer_grund = $7,
         versand = $8,
         tracking_id = $9
-      WHERE id = $10;
+      WHERE id = $10
+      RETURNING filiale;
     `;
 
     const updateValues = [
@@ -249,18 +334,66 @@ router.put('/:id', verifyToken(), async (req, res) => {
       return res.status(404).json({ message: 'Reklamation nicht gefunden' });
     }
 
+    const filialeFinal = (result.rows[0].filiale || '').toString();
+
+    // bestehende lfd_nr dieser Reklamation "merken" (Schutz gegen Manipulation)
+    const existingLfdRes = await client.query(
+      `
+      SELECT lfd_nr
+      FROM reklamation_positionen
+      WHERE reklamation_id = $1 AND lfd_nr IS NOT NULL;
+      `,
+      [id]
+    );
+    const existingLfdSet = new Set(existingLfdRes.rows.map((r) => Number(r.lfd_nr)).filter(Number.isFinite));
+
+    // alte Positionen löschen (wir setzen sie neu ein, aber mit stabilen lfd_nr)
     await client.query('DELETE FROM reklamation_positionen WHERE reklamation_id = $1', [id]);
 
-    if (data.positionen && Array.isArray(data.positionen) && data.positionen.length > 0) {
+    const positionen = Array.isArray(data.positionen) ? data.positionen : [];
+    if (positionen.length > 0) {
+      // ermitteln, welche Positionen neue Nummern brauchen
+      const needsNew = [];
+      const keepNr = [];
+
+      for (const pos of positionen) {
+        const incoming = pos && pos.lfd_nr !== undefined && pos.lfd_nr !== null ? Number(pos.lfd_nr) : null;
+        if (Number.isFinite(incoming) && existingLfdSet.has(incoming)) {
+          keepNr.push({ pos, lfd_nr: incoming });
+        } else {
+          needsNew.push(pos);
+        }
+      }
+
+      // neue Nummern blockweise ziehen
+      let nextNew = null;
+      if (needsNew.length > 0) {
+        const jahr = getCurrentYear();
+        const alloc = await allocateLfdNumbers(client, filialeFinal, jahr, needsNew.length);
+        nextNew = alloc.start;
+      }
+
       const posQuery = `
         INSERT INTO reklamation_positionen (
           reklamation_id, artikelnummer, ean, bestell_menge, bestell_einheit,
-          rekla_menge, rekla_einheit
+          rekla_menge, rekla_einheit, lfd_nr
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7);
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8);
       `;
 
-      for (const pos of data.positionen) {
+      // Wichtig: Reihenfolge beibehalten, wie sie aus dem Frontend kommt.
+      // Wir setzen lfd_nr je Position stabil (falls gültig) oder neu.
+      for (const pos of positionen) {
+        let lfdNrToUse = null;
+
+        const incoming = pos && pos.lfd_nr !== undefined && pos.lfd_nr !== null ? Number(pos.lfd_nr) : null;
+        if (Number.isFinite(incoming) && existingLfdSet.has(incoming)) {
+          lfdNrToUse = incoming;
+        } else {
+          lfdNrToUse = nextNew;
+          nextNew++;
+        }
+
         const posValues = [
           id,
           pos.artikelnummer || null,
@@ -269,6 +402,7 @@ router.put('/:id', verifyToken(), async (req, res) => {
           pos.bestell_einheit || null,
           pos.rekla_menge || null,
           pos.rekla_einheit || null,
+          lfdNrToUse,
         ];
 
         await client.query(posQuery, posValues);
@@ -277,7 +411,9 @@ router.put('/:id', verifyToken(), async (req, res) => {
 
     await client.query('COMMIT');
 
-    console.log(`Reklamation vollständig bearbeitet – ID: ${id} von ${user.name} (${user.role})`);
+    console.log(
+      `Reklamation vollständig bearbeitet – ID: ${id} von ${user.name} (${user.role})`
+    );
     res.json({ message: 'Reklamation erfolgreich aktualisiert' });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -347,7 +483,9 @@ router.patch('/:id', verifyToken(), async (req, res) => {
     await client.query('COMMIT');
 
     console.log(
-      `Reklamation Teil-Update – ID: ${id} von ${user.name} (${user.role}): ${JSON.stringify(updates)}`
+      `Reklamation Teil-Update – ID: ${id} von ${user.name} (${user.role}): ${JSON.stringify(
+        updates
+      )}`
     );
 
     res.json({ message: 'Reklamation erfolgreich teilweise aktualisiert' });
