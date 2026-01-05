@@ -1,8 +1,9 @@
-// routes/reklamationen.js – V1.1.1 (FIX)
+// routes/reklamationen.js – V1.1.2 (Notiz-PATCH ergänzt, CRUD vollständig)
 // - lfd_nr Vergabe: pro Filiale + Jahr (Jahr aus Anlegedatum `datum`, nicht Serverjahr)
 // - Counter initialisiert/absichert sich automatisch aus MAX(lfd_nr) in der DB
 // - Transaktionssicher (SELECT ... FOR UPDATE)
 // - Edit-Fall B: bestehende lfd_nr bleiben, neue Positionen bekommen neue
+// - Neu: Notiz-Feld (notiz) via PATCH, inkl. notiz_von + notiz_am automatisch
 
 const express = require('express');
 const router = express.Router();
@@ -231,7 +232,7 @@ router.get('/:id', verifyToken(), async (req, res) => {
 /**
  * POST /api/reklamationen
  * Neue Reklamation anlegen (alle User, Filialuser nur eigene Filiale)
- * Neu: Jahr für lfd_nr wird aus Anlegedatum (datum) abgeleitet
+ * Jahr für lfd_nr wird aus Anlegedatum (datum) abgeleitet
  */
 router.post('/', verifyToken(), async (req, res) => {
   const user = req.user;
@@ -275,7 +276,6 @@ router.post('/', verifyToken(), async (req, res) => {
     const reklaResult = await client.query(reklaQuery, reklaValues);
     const reklamationId = reklaResult.rows[0].id;
 
-    // Jahr aus gespeicherten datum (bevorzugt), sonst aus payload, sonst aktuelles Jahr
     const storedDatum = reklaResult.rows[0].datum;
     const jahr =
       getYearFromDateValue(storedDatum) ||
@@ -313,10 +313,7 @@ router.post('/', verifyToken(), async (req, res) => {
 
     await client.query('COMMIT');
 
-    console.log(
-      `Reklamation angelegt – ID: ${reklamationId} von ${user.name} (${user.role})`
-    );
-
+    console.log(`Reklamation angelegt – ID: ${reklamationId} von ${user.name} (${user.role})`);
     res.status(201).json({ message: 'Reklamation erfolgreich angelegt', id: reklamationId });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -332,10 +329,7 @@ router.post('/', verifyToken(), async (req, res) => {
  * Komplett bearbeiten (Reklamation + Positionen ersetzen)
  * Nur Admin/Supervisor
  *
- * Fall B (gewünscht): lfd_nr bleibt stabil.
- * - Vorhandene lfd_nr werden als "zulässig" aus DB gelesen.
- * - Beim Speichern werden nur lfd_nr akzeptiert, die vorher zu dieser Reklamation gehörten.
- * - Neue Positionen (ohne gültige lfd_nr) bekommen neue Nummern aus dem Counter (pro Filiale+Jahr aus datum).
+ * Fall B: lfd_nr bleibt stabil.
  */
 router.put('/:id', verifyToken(), async (req, res) => {
   const { id } = req.params;
@@ -397,7 +391,6 @@ router.put('/:id', verifyToken(), async (req, res) => {
       getYearFromDateValue(data.datum) ||
       getCurrentYear();
 
-    // bestehende lfd_nr dieser Reklamation "merken" (Schutz gegen Manipulation)
     const existingLfdRes = await client.query(
       `
       SELECT lfd_nr
@@ -410,12 +403,10 @@ router.put('/:id', verifyToken(), async (req, res) => {
       existingLfdRes.rows.map((r) => Number(r.lfd_nr)).filter(Number.isFinite)
     );
 
-    // alte Positionen löschen (wir setzen sie neu ein, aber mit stabilen lfd_nr)
     await client.query('DELETE FROM reklamation_positionen WHERE reklamation_id = $1', [id]);
 
     const positionen = Array.isArray(data.positionen) ? data.positionen : [];
     if (positionen.length > 0) {
-      // ermitteln, wie viele Positionen neue Nummern brauchen
       let newNeededCount = 0;
 
       for (const pos of positionen) {
@@ -427,7 +418,6 @@ router.put('/:id', verifyToken(), async (req, res) => {
         }
       }
 
-      // neue Nummern blockweise ziehen
       let nextNew = null;
       if (newNeededCount > 0) {
         const alloc = await allocateLfdNumbers(client, filialeFinal, jahr, newNeededCount);
@@ -442,7 +432,6 @@ router.put('/:id', verifyToken(), async (req, res) => {
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8);
       `;
 
-      // Reihenfolge beibehalten wie aus dem Frontend kommt.
       for (const pos of positionen) {
         let lfdNrToUse = null;
 
@@ -473,9 +462,7 @@ router.put('/:id', verifyToken(), async (req, res) => {
 
     await client.query('COMMIT');
 
-    console.log(
-      `Reklamation vollständig bearbeitet – ID: ${id} von ${user.name} (${user.role})`
-    );
+    console.log(`Reklamation vollständig bearbeitet – ID: ${id} von ${user.name} (${user.role})`);
     res.json({ message: 'Reklamation erfolgreich aktualisiert' });
   } catch (err) {
     await client.query('ROLLBACK');
@@ -488,8 +475,12 @@ router.put('/:id', verifyToken(), async (req, res) => {
 
 /**
  * PATCH /api/reklamationen/:id
- * Teil-Update: status, versand, tracking_id, ls_nummer_grund
+ * Teil-Update: status, versand, tracking_id, ls_nummer_grund, notiz
  * Nur Admin/Supervisor
+ *
+ * Neu:
+ * - notiz wird getrimmt, leer => NULL
+ * - bei notiz-Update werden notiz_von + notiz_am automatisch gesetzt
  */
 router.patch('/:id', verifyToken(), async (req, res) => {
   const { id } = req.params;
@@ -502,7 +493,7 @@ router.patch('/:id', verifyToken(), async (req, res) => {
     });
   }
 
-  if (Object.keys(updates).length === 0) {
+  if (!updates || Object.keys(updates).length === 0) {
     return res.status(400).json({ message: 'Keine Änderungen übermittelt' });
   }
 
@@ -517,16 +508,28 @@ router.patch('/:id', verifyToken(), async (req, res) => {
       return res.status(404).json({ message: 'Reklamation nicht gefunden' });
     }
 
-    const allowedFields = ['status', 'versand', 'tracking_id', 'ls_nummer_grund'];
+    const allowedFields = ['status', 'versand', 'tracking_id', 'ls_nummer_grund', 'notiz'];
     const setClauses = [];
     const values = [];
     let paramIndex = 1;
 
+    let touchedNote = false;
+
     for (const field of allowedFields) {
       if (updates[field] !== undefined) {
-        setClauses.push(`${field} = $${paramIndex}`);
-        values.push(updates[field]);
-        paramIndex++;
+        if (field === 'notiz') {
+          touchedNote = true;
+          const raw = typeof updates.notiz === 'string' ? updates.notiz.trim() : '';
+          const clean = raw.length > 0 ? raw : null;
+
+          setClauses.push(`notiz = $${paramIndex}`);
+          values.push(clean);
+          paramIndex++;
+        } else {
+          setClauses.push(`${field} = $${paramIndex}`);
+          values.push(updates[field]);
+          paramIndex++;
+        }
       }
     }
 
@@ -535,7 +538,16 @@ router.patch('/:id', verifyToken(), async (req, res) => {
       return res.status(400).json({ message: 'Keine gültigen Felder zum Updaten' });
     }
 
+    // Audit + letzte_aenderung
     setClauses.push('letzte_aenderung = CURRENT_DATE');
+
+    if (touchedNote) {
+      setClauses.push(`notiz_von = $${paramIndex}`);
+      values.push(user.name || null);
+      paramIndex++;
+
+      setClauses.push('notiz_am = NOW()');
+    }
 
     const query = `UPDATE reklamationen SET ${setClauses.join(', ')} WHERE id = $${paramIndex}`;
     values.push(id);
@@ -545,9 +557,7 @@ router.patch('/:id', verifyToken(), async (req, res) => {
     await client.query('COMMIT');
 
     console.log(
-      `Reklamation Teil-Update – ID: ${id} von ${user.name} (${user.role}): ${JSON.stringify(
-        updates
-      )}`
+      `Reklamation PATCH – ID: ${id} von ${user.name} (${user.role}): ${JSON.stringify(updates)}`
     );
 
     res.json({ message: 'Reklamation erfolgreich teilweise aktualisiert' });
