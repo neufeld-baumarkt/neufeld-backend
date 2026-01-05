@@ -1,9 +1,10 @@
-// routes/reklamationen.js – V1.1.2 (Notiz-PATCH ergänzt, CRUD vollständig)
+// routes/reklamationen.js – V1.1.2+ (SodaFixx-Regeln + Tracking-Unique Handling)
 // - lfd_nr Vergabe: pro Filiale + Jahr (Jahr aus Anlegedatum `datum`, nicht Serverjahr)
 // - Counter initialisiert/absichert sich automatisch aus MAX(lfd_nr) in der DB
 // - Transaktionssicher (SELECT ... FOR UPDATE)
 // - Edit-Fall B: bestehende lfd_nr bleiben, neue Positionen bekommen neue
-// - Neu: Notiz-Feld (notiz) via PATCH, inkl. notiz_von + notiz_am automatisch
+// - Notiz-Feld (notiz) via PATCH, inkl. notiz_von + notiz_am automatisch
+// - Neu: SodaFixx-Regeln (Regel 1/3) + Duplicate Tracking (Regel 2 via DB Unique Index)
 
 const express = require('express');
 const router = express.Router();
@@ -29,185 +30,194 @@ function getYearFromDateValue(datum) {
   }
 
   if (typeof datum === 'string') {
-    const m = datum.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-    if (m) {
-      const y = Number(m[1]);
-      if (Number.isInteger(y) && y >= 2000 && y <= 3000) return y;
-    }
+    const m = datum.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (!m) return null;
+    const year = Number(m[1]);
+    return Number.isFinite(year) ? year : null;
   }
 
   return null;
 }
 
-/**
- * Vergibt lfd_nr blockweise, transaktionssicher (Row-Lock) pro Filiale + Jahr.
- * - Nutzt Tabelle: lfd_nr_counter (filiale, jahr, last_value, updated_at)
- * - Initialisiert Counter beim ersten Mal automatisch mit MAX(lfd_nr) aus der DB
- * - Garantiert: einmalig, fortlaufend, kein Reuse (auch nicht bei Delete)
- */
-async function allocateLfdNumbers(client, filiale, jahr, count) {
-  if (!filiale || typeof filiale !== 'string' || filiale.trim() === '') {
-    throw new Error('LFD_NR: filiale fehlt/ungültig');
-  }
-  if (!Number.isInteger(jahr) || jahr < 2000 || jahr > 3000) {
-    throw new Error('LFD_NR: jahr fehlt/ungültig');
-  }
-  if (!Number.isInteger(count) || count <= 0) {
-    return { start: null, end: null };
+function normText(v) {
+  return (v ?? '').toString().trim();
+}
+
+function isSodaFixx(lieferant) {
+  return normText(lieferant).toLowerCase() === 'sodafixx';
+}
+
+function normalizeTrackingId(trackingId) {
+  const t = normText(trackingId);
+  return t.length > 0 ? t : null;
+}
+
+function parseCountLike(value) {
+  // akzeptiert "18", "18.0", "18,0" -> Number
+  const raw = normText(value);
+  if (!raw) return NaN;
+  const normalized = raw.replace(',', '.');
+  const n = Number(normalized);
+  return Number.isFinite(n) ? n : NaN;
+}
+
+function validateSodaFixxCartonMax18(positionen) {
+  const list = Array.isArray(positionen) ? positionen : [];
+  let sum = 0;
+
+  for (let i = 0; i < list.length; i++) {
+    const qty = parseCountLike(list[i]?.rekla_menge);
+
+    if (!Number.isFinite(qty) || qty < 0) {
+      return {
+        ok: false,
+        message: `SodaFixx: Ungültige Reklamationsmenge in Position ${i + 1}. Erwartet Zahl (z. B. 1..18).`,
+      };
+    }
+
+    // Zylinder sind Stückzahlen -> ganzzahlig
+    if (!Number.isInteger(qty)) {
+      return {
+        ok: false,
+        message: `SodaFixx: Reklamationsmenge in Position ${i + 1} muss eine ganze Zahl sein.`,
+      };
+    }
+
+    sum += qty;
+
+    if (sum > 18) {
+      return {
+        ok: false,
+        message: 'SodaFixx: Maximal 18 Zylinder pro Reklamation/Karton erlaubt (Summe aller Positionen).',
+      };
+    }
   }
 
-  // 1) Counter-Zeile sicherstellen:
-  //    Initialwert = MAX(lfd_nr) aus DB (falls Altbestand vorhanden), sonst 0
+  return { ok: true };
+}
+
+/**
+ * Vergibt lfd_nr blockweise, transaktionssicher (Row-Lock) pro Filiale + Jahr.
+ * - Stellt sicher, dass der Counter mindestens MAX(lfd_nr) der DB ist.
+ * - Liefert Startwert (inkl.) für `count` neue Nummern.
+ */
+async function allocateLfdNrBlock(client, filiale, jahr, count) {
+  if (!count || count <= 0) return null;
+
+  // 1) Counter-Zeile locken/holen
   await client.query(
     `
-    INSERT INTO lfd_nr_counter (filiale, jahr, last_value)
-    SELECT
-      $1,
-      $2,
-      (
-        SELECT COALESCE(MAX(p.lfd_nr), 0)
-        FROM reklamation_positionen p
-        JOIN reklamationen r ON r.id = p.reklamation_id
-        WHERE r.filiale = $1
-          AND p.lfd_nr IS NOT NULL
-          AND r.datum IS NOT NULL
-          AND EXTRACT(YEAR FROM r.datum)::int = $2
-      ) AS last_value
+    INSERT INTO lfd_nr_counter (filiale, jahr, current_value)
+    VALUES ($1, $2, 0)
     ON CONFLICT (filiale, jahr) DO NOTHING;
     `,
     [filiale, jahr]
   );
 
-  // 2) Row-Lock + atomare Erhöhung
-  //    Absicherung: counter >= MAX(lfd_nr) (falls importiert / manuell gesetzt)
-  const result = await client.query(
+  const lockRes = await client.query(
     `
-    WITH locked AS (
-      SELECT last_value
-      FROM lfd_nr_counter
-      WHERE filiale = $1 AND jahr = $2
-      FOR UPDATE
-    ),
-    mx AS (
-      SELECT COALESCE(MAX(p.lfd_nr), 0) AS max_lfd
-      FROM reklamation_positionen p
-      JOIN reklamationen r ON r.id = p.reklamation_id
-      WHERE r.filiale = $1
-        AND p.lfd_nr IS NOT NULL
-        AND r.datum IS NOT NULL
-        AND EXTRACT(YEAR FROM r.datum)::int = $2
-    ),
-    upd AS (
-      UPDATE lfd_nr_counter c
-      SET last_value = GREATEST(locked.last_value, mx.max_lfd) + $3,
-          updated_at = now()
-      FROM locked, mx
-      WHERE c.filiale = $1 AND c.jahr = $2
-      RETURNING
-        GREATEST(locked.last_value, mx.max_lfd) AS base_last,
-        c.last_value AS new_last
-    )
-    SELECT base_last, new_last FROM upd;
+    SELECT current_value
+    FROM lfd_nr_counter
+    WHERE filiale = $1 AND jahr = $2
+    FOR UPDATE;
     `,
-    [filiale, jahr, count]
+    [filiale, jahr]
   );
 
-  if (!result.rows || result.rows.length === 0) {
-    throw new Error('LFD_NR: Counter-Update fehlgeschlagen');
-  }
+  const currentVal = Number(lockRes.rows[0]?.current_value ?? 0);
 
-  const baseLast = Number(result.rows[0].base_last);
-  const newLast = Number(result.rows[0].new_last);
+  // 2) MAX(lfd_nr) aus DB prüfen (Sicherheitsnetz)
+  const maxRes = await client.query(
+    `
+    SELECT COALESCE(MAX(lfd_nr), 0) AS max_lfd
+    FROM reklamation_positionen
+    WHERE lfd_nr IS NOT NULL
+      AND reklamation_id IN (
+        SELECT id FROM reklamationen WHERE filiale = $1
+          AND EXTRACT(YEAR FROM datum) = $2
+      );
+    `,
+    [filiale, jahr]
+  );
 
-  if (!Number.isFinite(baseLast) || !Number.isFinite(newLast) || newLast - baseLast !== count) {
-    throw new Error('LFD_NR: Counter-Werte inkonsistent');
-  }
+  const maxLfd = Number(maxRes.rows[0]?.max_lfd ?? 0);
 
-  return { start: baseLast + 1, end: newLast };
+  const base = Math.max(currentVal, maxLfd);
+
+  // 3) Counter erhöhen
+  const newVal = base + count;
+
+  await client.query(
+    `
+    UPDATE lfd_nr_counter
+    SET current_value = $3
+    WHERE filiale = $1 AND jahr = $2;
+    `,
+    [filiale, jahr, newVal]
+  );
+
+  // Startwert für Vergabe
+  return base + 1;
 }
 
 /**
- * GET /api/reklamationen
- * Liefert Reklamationen gefiltert nach Rolle/Filiale.
- * Zusätzlich:
- * - position_count = Anzahl Positionen
- * - min_lfd_nr     = kleinste lfd_nr der Positionen (für Anzeige "30+3")
+ * GET /api/reklamationen – Liste nach Rolle/Filiale
+ * Liefert zusätzliche Felder:
+ * - min_lfd_nr: kleinste laufende Nummer je Reklamation
+ * - position_count: Anzahl Positionen je Reklamation
  */
 router.get('/', verifyToken(), async (req, res) => {
   const { role, filiale } = req.user;
 
   try {
-    let query;
-    let params = [];
+    const global = rollenMitGlobalzugriff.includes(role);
 
-    const baseSelect = `
+    const query = `
       SELECT
         r.*,
-        COUNT(p.id)    AS position_count,
-        MIN(p.lfd_nr)  AS min_lfd_nr
+        MIN(p.lfd_nr) AS min_lfd_nr,
+        COUNT(p.id) AS position_count
       FROM reklamationen r
-      LEFT JOIN reklamation_positionen p ON r.id = p.reklamation_id
+      LEFT JOIN reklamation_positionen p ON p.reklamation_id = r.id
+      ${global ? '' : 'WHERE r.filiale = $1'}
+      GROUP BY r.id
+      ORDER BY r.datum DESC;
     `;
 
-    if (
-      rollenMitGlobalzugriff.includes(role) ||
-      filiale === 'alle' ||
-      !filiale ||
-      filiale === ''
-    ) {
-      query = `
-        ${baseSelect}
-        GROUP BY r.id
-        ORDER BY r.datum DESC
-      `;
-    } else {
-      query = `
-        ${baseSelect}
-        WHERE r.filiale = $1
-        GROUP BY r.id
-        ORDER BY r.datum DESC
-      `;
-      params = [filiale];
-    }
-
+    const params = global ? [] : [filiale];
     const result = await pool.query(query, params);
     res.json(result.rows);
   } catch (error) {
     console.error('Fehler beim Abrufen der Reklamationen:', error);
-    res.status(500).json({ message: 'Fehler beim Abrufen der Reklamationen' });
+    res.status(500).json({ message: 'Serverfehler beim Abrufen' });
   }
 });
 
 /**
- * GET /api/reklamationen/:id
- * Detail + Positionen, gleiche Berechtigungsprüfung wie Liste
+ * GET /api/reklamationen/:id – Detail (Reklamation + Positionen)
  */
 router.get('/:id', verifyToken(), async (req, res) => {
   const { id } = req.params;
   const { role, filiale } = req.user;
 
   try {
-    const reklamationResult = await pool.query(
-      'SELECT * FROM reklamationen WHERE id = $1',
-      [id]
+    const global = rollenMitGlobalzugriff.includes(role);
+
+    const reklaResult = await pool.query(
+      `
+      SELECT *
+      FROM reklamationen
+      WHERE id = $1
+      ${global ? '' : 'AND filiale = $2'}
+      `,
+      global ? [id] : [id, filiale]
     );
 
-    if (reklamationResult.rows.length === 0) {
+    if (reklaResult.rows.length === 0) {
       return res.status(404).json({ message: 'Reklamation nicht gefunden' });
     }
 
-    const reklamation = reklamationResult.rows[0];
-
-    const istErlaubt =
-      rollenMitGlobalzugriff.includes(role) ||
-      filiale === 'alle' ||
-      !filiale ||
-      filiale === '' ||
-      filiale === reklamation.filiale;
-
-    if (!istErlaubt) {
-      return res.status(403).json({ message: 'Zugriff verweigert' });
-    }
+    const reklamation = reklaResult.rows[0];
 
     const positionenResult = await pool.query(
       `
@@ -225,14 +235,13 @@ router.get('/:id', verifyToken(), async (req, res) => {
     });
   } catch (error) {
     console.error('Fehler beim Abrufen der Detailreklamation:', error);
-    res.status(500).json({ message: 'Fehler beim Abrufen der Detailreklamation' });
+    res.status(500).json({ message: 'Serverfehler beim Abrufen' });
   }
 });
 
 /**
  * POST /api/reklamationen
- * Neue Reklamation anlegen (alle User, Filialuser nur eigene Filiale)
- * Jahr für lfd_nr wird aus Anlegedatum (datum) abgeleitet
+ * Neu anlegen (Reklamation + Positionen)
  */
 router.post('/', verifyToken(), async (req, res) => {
   const user = req.user;
@@ -240,6 +249,31 @@ router.post('/', verifyToken(), async (req, res) => {
 
   if (user.role === 'Filiale' && data.filiale && data.filiale !== user.filiale) {
     return res.status(403).json({ message: 'Nur eigene Filiale anlegbar' });
+  }
+
+  // --- SodaFixx Sonderregeln (Backend-hart) ---
+  // Regel 1: SodaFixx => versand immer true + tracking_id Pflicht
+  // Regel 3: SodaFixx => 1 Reklamation = 1 Karton = max 18 Zylinder (Summe aller Positionen)
+  const supplierIncoming = data?.lieferant;
+  const sodaFixx = isSodaFixx(supplierIncoming);
+
+  if (sodaFixx) {
+    data.versand = true;
+
+    data.tracking_id = normalizeTrackingId(data.tracking_id);
+    if (!data.tracking_id) {
+      return res.status(400).json({
+        message: 'SodaFixx: Tracking-ID ist Pflicht (GLS Rücksendung).',
+      });
+    }
+
+    const v = validateSodaFixxCartonMax18(data.positionen);
+    if (!v.ok) {
+      return res.status(400).json({ message: v.message });
+    }
+  } else {
+    // Non-SodaFixx: tracking_id sauber trimmen (optional), aber nicht erzwingen
+    data.tracking_id = normalizeTrackingId(data.tracking_id);
   }
 
   const client = await pool.connect();
@@ -277,25 +311,32 @@ router.post('/', verifyToken(), async (req, res) => {
     const reklamationId = reklaResult.rows[0].id;
 
     const storedDatum = reklaResult.rows[0].datum;
-    const jahr =
-      getYearFromDateValue(storedDatum) ||
-      getYearFromDateValue(data.datum) ||
-      getCurrentYear();
+    const jahr = getYearFromDateValue(storedDatum) || getYearFromDateValue(data.datum) || getCurrentYear();
 
     const positionen = Array.isArray(data.positionen) ? data.positionen : [];
+
+    // lfd_nr Vergabe nur, wenn Positionen vorhanden
     if (positionen.length > 0) {
-      const { start } = await allocateLfdNumbers(client, filialeFinal, jahr, positionen.length);
+      const startLfd = await allocateLfdNrBlock(client, filialeFinal, jahr, positionen.length);
 
       const posQuery = `
         INSERT INTO reklamation_positionen (
-          reklamation_id, artikelnummer, ean, bestell_menge, bestell_einheit,
-          rekla_menge, rekla_einheit, lfd_nr
+          reklamation_id,
+          artikelnummer,
+          ean,
+          bestell_menge,
+          bestell_einheit,
+          rekla_menge,
+          rekla_einheit,
+          lfd_nr
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8);
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8);
       `;
 
-      let nextNr = start;
-      for (const pos of positionen) {
+      for (let i = 0; i < positionen.length; i++) {
+        const pos = positionen[i] || {};
+        const lfdNrToUse = startLfd + i;
+
         const posValues = [
           reklamationId,
           pos.artikelnummer || null,
@@ -304,10 +345,10 @@ router.post('/', verifyToken(), async (req, res) => {
           pos.bestell_einheit || null,
           pos.rekla_menge || null,
           pos.rekla_einheit || null,
-          nextNr,
+          lfdNrToUse,
         ];
+
         await client.query(posQuery, posValues);
-        nextNr++;
       }
     }
 
@@ -317,7 +358,15 @@ router.post('/', verifyToken(), async (req, res) => {
     res.status(201).json({ message: 'Reklamation erfolgreich angelegt', id: reklamationId });
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error('Fehler beim Anlegen:', err.message);
+    console.error('Fehler beim Anlegen:', err);
+
+    // Unique Tracking-ID (Regel 2) – DB wirft 23505
+    if (err && err.code === '23505') {
+      return res.status(409).json({
+        message: 'Tracking-ID bereits vorhanden (muss global eindeutig sein).',
+      });
+    }
+
     res.status(500).json({ message: 'Serverfehler beim Speichern' });
   } finally {
     client.release();
@@ -347,6 +396,49 @@ router.put('/:id', verifyToken(), async (req, res) => {
   try {
     await client.query('BEGIN');
 
+    // --- SodaFixx Sonderregeln (Backend-hart) ---
+    // Regel 1: SodaFixx => versand immer true + tracking_id Pflicht
+    // Regel 3: SodaFixx => 1 Reklamation = 1 Karton = max 18 Zylinder (Summe aller Positionen)
+    const existingReklaRes = await client.query(
+      'SELECT lieferant, tracking_id FROM reklamationen WHERE id = $1',
+      [id]
+    );
+
+    if (existingReklaRes.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Reklamation nicht gefunden' });
+    }
+
+    const existingLieferant = existingReklaRes.rows[0].lieferant;
+    const existingTracking = existingReklaRes.rows[0].tracking_id;
+
+    const supplierFinal =
+      normText(data?.lieferant).length > 0 ? data.lieferant : existingLieferant;
+
+    const sodaFixx = isSodaFixx(supplierFinal);
+
+    let versandFinal = data.versand ?? false;
+    let trackingFinal = normalizeTrackingId(
+      data.tracking_id !== undefined ? data.tracking_id : existingTracking
+    );
+
+    if (sodaFixx) {
+      versandFinal = true;
+
+      if (!trackingFinal) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          message: 'SodaFixx: Tracking-ID ist Pflicht (GLS Rücksendung).',
+        });
+      }
+
+      const v = validateSodaFixxCartonMax18(data.positionen);
+      if (!v.ok) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: v.message });
+      }
+    }
+
     const updateQuery = `
       UPDATE reklamationen SET
         datum = $1,
@@ -367,12 +459,12 @@ router.put('/:id', verifyToken(), async (req, res) => {
       data.datum || null,
       data.art || null,
       data.rekla_nr || null,
-      data.lieferant || null,
+      supplierFinal || null,
       data.filiale || null,
       data.status || null,
       data.ls_nummer_grund || null,
-      data.versand ?? false,
-      data.tracking_id || null,
+      versandFinal,
+      trackingFinal,
       id,
     ];
 
@@ -418,31 +510,35 @@ router.put('/:id', verifyToken(), async (req, res) => {
         }
       }
 
-      let nextNew = null;
-      if (newNeededCount > 0) {
-        const alloc = await allocateLfdNumbers(client, filialeFinal, jahr, newNeededCount);
-        nextNew = alloc.start;
-      }
+      const startLfd = await allocateLfdNrBlock(client, filialeFinal, jahr, newNeededCount);
+
+      let allocCursor = startLfd;
 
       const posQuery = `
         INSERT INTO reklamation_positionen (
-          reklamation_id, artikelnummer, ean, bestell_menge, bestell_einheit,
-          rekla_menge, rekla_einheit, lfd_nr
+          reklamation_id,
+          artikelnummer,
+          ean,
+          bestell_menge,
+          bestell_einheit,
+          rekla_menge,
+          rekla_einheit,
+          lfd_nr
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8);
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8);
       `;
 
       for (const pos of positionen) {
-        let lfdNrToUse = null;
-
         const incoming =
           pos && pos.lfd_nr !== undefined && pos.lfd_nr !== null ? Number(pos.lfd_nr) : null;
+
+        let lfdNrToUse = null;
 
         if (Number.isFinite(incoming) && existingLfdSet.has(incoming)) {
           lfdNrToUse = incoming;
         } else {
-          lfdNrToUse = nextNew;
-          nextNew++;
+          lfdNrToUse = allocCursor;
+          allocCursor++;
         }
 
         const posValues = [
@@ -466,7 +562,15 @@ router.put('/:id', verifyToken(), async (req, res) => {
     res.json({ message: 'Reklamation erfolgreich aktualisiert' });
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error('Fehler beim Bearbeiten:', err.message);
+    console.error('Fehler beim Bearbeiten:', err);
+
+    // Unique Tracking-ID (Regel 2) – DB wirft 23505
+    if (err && err.code === '23505') {
+      return res.status(409).json({
+        message: 'Tracking-ID bereits vorhanden (muss global eindeutig sein).',
+      });
+    }
+
     res.status(500).json({ message: 'Serverfehler beim Aktualisieren' });
   } finally {
     client.release();
@@ -477,24 +581,16 @@ router.put('/:id', verifyToken(), async (req, res) => {
  * PATCH /api/reklamationen/:id
  * Teil-Update: status, versand, tracking_id, ls_nummer_grund, notiz
  * Nur Admin/Supervisor
- *
- * Neu:
- * - notiz wird getrimmt, leer => NULL
- * - bei notiz-Update werden notiz_von + notiz_am automatisch gesetzt
  */
 router.patch('/:id', verifyToken(), async (req, res) => {
   const { id } = req.params;
   const user = req.user;
-  const updates = req.body;
+  const updates = req.body || {};
 
   if (!rollenMitBearbeitungsrecht.includes(user.role)) {
     return res.status(403).json({
-      message: 'Zugriff verweigert: Nur Admin oder Supervisor dürfen Änderungen vornehmen',
+      message: 'Zugriff verweigert: Nur Admin oder Supervisor dürfen bearbeiten',
     });
-  }
-
-  if (!updates || Object.keys(updates).length === 0) {
-    return res.status(400).json({ message: 'Keine Änderungen übermittelt' });
   }
 
   const client = await pool.connect();
@@ -502,10 +598,41 @@ router.patch('/:id', verifyToken(), async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    const checkResult = await client.query('SELECT id FROM reklamationen WHERE id = $1', [id]);
+    const checkResult = await client.query('SELECT id, lieferant, tracking_id, versand FROM reklamationen WHERE id = $1', [id]);
     if (checkResult.rows.length === 0) {
       await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Reklamation nicht gefunden' });
+    }
+
+    const existing = checkResult.rows[0];
+    const sodaFixx = isSodaFixx(existing?.lieferant);
+    const existingTrackingNorm = normalizeTrackingId(existing?.tracking_id);
+
+    // SodaFixx: tracking_id darf nie leer sein (Regel 1)
+    if (sodaFixx && updates.tracking_id === undefined && !existingTrackingNorm) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        message: 'SodaFixx: Tracking-ID ist Pflicht (bitte zuerst Tracking-ID setzen).',
+      });
+    }
+
+    // SodaFixx: versand ist immer true (Regel 1)
+    if (sodaFixx && updates.versand !== undefined) {
+      updates.versand = true;
+    }
+
+    // Normalize tracking id (trim) und SodaFixx-Pflicht prüfen
+    if (updates.tracking_id !== undefined) {
+      const norm = normalizeTrackingId(updates.tracking_id);
+
+      if (sodaFixx && !norm) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({
+          message: 'SodaFixx: Tracking-ID ist Pflicht (GLS Rücksendung).',
+        });
+      }
+
+      updates.tracking_id = norm;
     }
 
     const allowedFields = ['status', 'versand', 'tracking_id', 'ls_nummer_grund', 'notiz'];
@@ -519,12 +646,18 @@ router.patch('/:id', verifyToken(), async (req, res) => {
       if (updates[field] !== undefined) {
         if (field === 'notiz') {
           touchedNote = true;
-          const raw = typeof updates.notiz === 'string' ? updates.notiz.trim() : '';
-          const clean = raw.length > 0 ? raw : null;
+          const trimmed = normText(updates.notiz);
+          const finalNote = trimmed.length > 0 ? trimmed : null;
 
           setClauses.push(`notiz = $${paramIndex}`);
-          values.push(clean);
+          values.push(finalNote);
           paramIndex++;
+
+          setClauses.push(`notiz_von = $${paramIndex}`);
+          values.push(user.name || user.username || 'Unbekannt');
+          paramIndex++;
+
+          setClauses.push(`notiz_am = NOW()`);
         } else {
           setClauses.push(`${field} = $${paramIndex}`);
           values.push(updates[field]);
@@ -538,21 +671,19 @@ router.patch('/:id', verifyToken(), async (req, res) => {
       return res.status(400).json({ message: 'Keine gültigen Felder zum Updaten' });
     }
 
-    // Audit + letzte_aenderung
-    setClauses.push('letzte_aenderung = CURRENT_DATE');
+    // Audit + letzte_aenderung immer setzen
+    setClauses.push(`letzte_aenderung = CURRENT_DATE`);
 
-    if (touchedNote) {
-      setClauses.push(`notiz_von = $${paramIndex}`);
-      values.push(user.name || null);
-      paramIndex++;
-
-      setClauses.push('notiz_am = NOW()');
-    }
-
-    const query = `UPDATE reklamationen SET ${setClauses.join(', ')} WHERE id = $${paramIndex}`;
     values.push(id);
 
-    await client.query(query, values);
+    const query = `
+      UPDATE reklamationen
+      SET ${setClauses.join(', ')}
+      WHERE id = $${paramIndex}
+      RETURNING id;
+    `;
+
+    const updRes = await client.query(query, values);
 
     await client.query('COMMIT');
 
@@ -563,7 +694,15 @@ router.patch('/:id', verifyToken(), async (req, res) => {
     res.json({ message: 'Reklamation erfolgreich teilweise aktualisiert' });
   } catch (err) {
     await client.query('ROLLBACK');
-    console.error('Fehler beim PATCH:', err.message);
+    console.error('Fehler beim PATCH:', err);
+
+    // Unique Tracking-ID (Regel 2) – DB wirft 23505
+    if (err && err.code === '23505') {
+      return res.status(409).json({
+        message: 'Tracking-ID bereits vorhanden (muss global eindeutig sein).',
+      });
+    }
+
     res.status(500).json({ message: 'Serverfehler beim Aktualisieren' });
   } finally {
     client.release();
@@ -584,35 +723,18 @@ router.delete('/:id', verifyToken(), async (req, res) => {
     });
   }
 
-  const client = await pool.connect();
-
   try {
-    await client.query('BEGIN');
-
-    await client.query('DELETE FROM reklamation_positionen WHERE reklamation_id = $1', [id]);
-    const result = await client.query(
-      'DELETE FROM reklamationen WHERE id = $1 RETURNING rekla_nr',
-      [id]
-    );
+    const result = await pool.query('DELETE FROM reklamationen WHERE id = $1', [id]);
 
     if (result.rowCount === 0) {
-      await client.query('ROLLBACK');
       return res.status(404).json({ message: 'Reklamation nicht gefunden' });
     }
 
-    await client.query('COMMIT');
-
-    console.log(
-      `Reklamation gelöscht – ID: ${id}, Nr: ${result.rows[0].rekla_nr} von ${user.name} (${user.role})`
-    );
-
+    console.log(`Reklamation gelöscht – ID: ${id} von ${user.name} (${user.role})`);
     res.json({ message: 'Reklamation erfolgreich gelöscht' });
   } catch (err) {
-    await client.query('ROLLBACK');
     console.error('Fehler beim Löschen:', err.message);
     res.status(500).json({ message: 'Serverfehler beim Löschen' });
-  } finally {
-    client.release();
   }
 });
 
