@@ -101,7 +101,7 @@ router.patch('/:id', verifyToken(), async (req, res) => {
 
     res.json({ success: true });
   } catch (err) {
-    console.error('Fehler beim Speichern der Notiz:', err);
+    console.error('Fehler beim Speichern der Notizen:', err);
     res.status(500).json({ error: 'Notiz konnte nicht gespeichert werden' });
   }
 });
