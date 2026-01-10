@@ -23,13 +23,7 @@ router.get('/filialen', async (req, res) => {
 // Reklamationsarten
 router.get('/reklamationsarten', async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT bezeichnung
-      FROM art_der_reklamation
-      ORDER BY
-        CASE WHEN bezeichnung = 'Kundenreklamation MDE' THEN 0 ELSE 1 END,
-        bezeichnung ASC
-    `);
+    const result = await pool.query('SELECT bezeichnung FROM art_der_reklamation ORDER BY bezeichnung ASC');
     const data = result.rows.map(row => row.bezeichnung);
     console.log(`📋 /api/reklamationsarten – ${req.user.name}: ${data.length} Arten`);
     res.json(data);
@@ -55,13 +49,7 @@ router.get('/lieferanten', async (req, res) => {
 // Einheiten
 router.get('/einheiten', async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT bezeichnung
-      FROM einheit
-      ORDER BY
-        CASE WHEN bezeichnung = 'Stück' THEN 0 ELSE 1 END,
-        bezeichnung ASC
-    `);
+    const result = await pool.query('SELECT bezeichnung FROM einheit ORDER BY bezeichnung ASC');
     const data = result.rows.map(row => row.bezeichnung);
     console.log(`📋 /api/einheiten – ${req.user.name}: ${data.length} Einheiten`);
     res.json(data);
