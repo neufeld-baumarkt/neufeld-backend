@@ -1,4 +1,4 @@
-// server.js
+// server.js – produktiv: Fingerprint auf jeder Response + klare Public/Private Trennung
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -8,27 +8,20 @@ const jwt = require('jsonwebtoken');
 
 const app = express();
 
+// ---- Fingerprint (damit wir nie wieder raten) ----
+const BUILD_TAG = process.env.BUILD_TAG || 'local-unknown';
+const START_TS = new Date().toISOString();
+
 // Middleware
 app.use(cors());
 app.use(express.json());
 
-// --- Version / Fingerprint (damit wir live nie wieder raten müssen) ---
-const BUILD_TAG = process.env.BUILD_TAG || 'local-unknown';
-const START_TS = new Date().toISOString();
-
-// ✅ Public: Health / Version (ohne Token!)
-app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'neufeld-backend',
-    buildTag: BUILD_TAG,
-    startedAt: START_TS,
-  });
-});
-
-// ✅ Public: Ping (ohne Token!)
-app.get('/api/ping', (req, res) => {
-  res.json({ message: 'pong', timestamp: new Date().toISOString() });
+// Fingerprint-Header auf JEDER Response (auch Fehler)
+app.use((req, res, next) => {
+  res.setHeader('x-neufeld-service', 'neufeld-backend');
+  res.setHeader('x-neufeld-build-tag', BUILD_TAG);
+  res.setHeader('x-neufeld-started-at', START_TS);
+  next();
 });
 
 // DB Pool
@@ -40,7 +33,22 @@ const pool = new Pool({
   database: process.env.DB_NAME,
 });
 
-// 🔐 Public: Login Route (ohne Token!)
+// ✅ Public: Health (ohne Token)
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'neufeld-backend',
+    buildTag: BUILD_TAG,
+    startedAt: START_TS,
+  });
+});
+
+// ✅ Public: Ping (ohne Token)
+app.get('/api/ping', (req, res) => {
+  res.json({ message: 'pong', timestamp: new Date().toISOString() });
+});
+
+// ✅ Public: Login (ohne Token)
 app.post('/api/login', async (req, res) => {
   const { name, password } = req.body;
 
@@ -74,23 +82,26 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// Routes importieren
+// Routes mounten
 const reklamationenRoutes = require('./routes/reklamationen');
 const stammdatenRoutes = require('./routes/stammdaten');
 
-// Routes mounten
 app.use('/api/reklamationen', reklamationenRoutes);
 app.use('/api', stammdatenRoutes);
 
-// 404 Fallback (damit wir genau sehen, was fehlt)
+// 404 Fallback – als JSON + Fingerprint (damit wir sehen WER antwortet)
 app.use((req, res) => {
-  res.status(404).send(`Cannot ${req.method} ${req.originalUrl}`);
+  res.status(404).json({
+    error: 'not_found',
+    message: `Cannot ${req.method} ${req.originalUrl}`,
+    buildTag: BUILD_TAG,
+    startedAt: START_TS,
+  });
 });
 
-// Port und Binding – WICHTIG für Render!
+// Port / Binding für Render
 const PORT = process.env.PORT || 3001;
-
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅ Backend läuft auf Port ${PORT} und bindet an 0.0.0.0`);
+  console.log(`✅ Backend läuft auf Port ${PORT} (0.0.0.0)`);
   console.log(`🧩 BUILD_TAG=${BUILD_TAG} START_TS=${START_TS}`);
 });
