@@ -1,4 +1,4 @@
-// routes/reklamationen.js – V1.1.2+ (SodaFixx-Regeln + Tracking-Unique Handling)
+// routes/reklamationen.js – V1.1.2+ (SodaFixx-Regeln + XX Tracking-Unique Handling)
 // - lfd_nr Vergabe: pro Filiale + Jahr (Jahr aus Anlegedatum `datum`, nicht Serverjahr)
 // - Counter initialisiert/absichert sich automatisch aus MAX(lfd_nr) in der DB
 // - Transaktionssicher (SELECT ... FOR UPDATE)

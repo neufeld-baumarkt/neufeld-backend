@@ -1,4 +1,4 @@
-// routes/stammdaten.js – ALLE ROUTEN WIEDER GESCHÜTZT!
+// routes/stammdaten.js – ALLE ROUTEN WIEDER X GESCHÜTZT!
 const express = require('express');
 const router = express.Router();
 const pool = require('../db');
