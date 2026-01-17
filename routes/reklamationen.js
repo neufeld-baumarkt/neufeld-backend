@@ -175,6 +175,7 @@ router.get('/', verifyToken(), async (req, res) => {
     const query = `
       SELECT
         r.*,
+        CASE WHEN r.notiz IS NOT NULL AND BTRIM(r.notiz) <> '' THEN true ELSE false END AS has_notiz,
         MIN(p.lfd_nr) AS min_lfd_nr,
         COUNT(p.id) AS position_count
       FROM reklamationen r
