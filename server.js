@@ -2,9 +2,10 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+
+const pool = require('./db'); // ✅ EIN DB-Pool (kein Doppel-Pool mehr)
 
 const app = express();
 
@@ -22,15 +23,6 @@ app.use((req, res, next) => {
   res.setHeader('x-neufeld-build-tag', BUILD_TAG);
   res.setHeader('x-neufeld-started-at', START_TS);
   next();
-});
-
-// DB Pool
-const pool = new Pool({
-  host: process.env.DB_HOST,
-  port: process.env.DB_PORT,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
 });
 
 // ✅ Public: Health (ohne Token)
@@ -85,8 +77,10 @@ app.post('/api/login', async (req, res) => {
 // Routes mounten
 const reklamationenRoutes = require('./routes/reklamationen');
 const stammdatenRoutes = require('./routes/stammdaten');
+const budgetRoutes = require('./routes/budget'); // ✅ NEU
 
 app.use('/api/reklamationen', reklamationenRoutes);
+app.use('/api/budget', budgetRoutes); // ✅ NEU: Budget API V1
 app.use('/api', stammdatenRoutes);
 
 // 404 Fallback – als JSON + Fingerprint (damit wir sehen WER antwortet)
