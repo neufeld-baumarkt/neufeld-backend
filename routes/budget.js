@@ -1,16 +1,16 @@
-// routes/budget.js – Budget API V1 + MS4 (Bookings)  (SSoT: 18.–20.01.2026)
+// routes/budget.js – Budget API V1 + MS4 (Bookings)
+// Stand: 21.01.2026
 // READ:  budget.v_week_summary (read-only)
 // WRITE: budget.week_budgets (umsatz_vorwoche_brutto per UPSERT)
 // WRITE: budget.bookings     (MS4 CRUD)
-// Regeln:
+//
+// Grundregeln:
 // - Backend rechnet NICHT selbst, liefert View 1:1
 // - View wird NICHT beschrieben
-// - Filialzugriff: Filiale-User nur eigene Filiale; Zentrale-Rollen optional ?filiale=XYZ
-// - Umsatz-PUT: nur Admin/Supervisor
-// - Bookings-Rechte (MS4):
-//   - typ='bestellung'   : Filiale (eigene) + Supervisor + Admin dürfen schreiben; Filiale darf auch DELETE (Storno/Vertipper)
-//   - typ='aktionsvorab' : Schreiben/Lesen: Manager-1, Geschäftsführer, Supervisor, Admin; Filialen nur lesen
-//   - typ='abgabe'/'korrektur': Schreiben/Lesen: Supervisor, Admin; Filialen nur lesen
+//
+// Sonderregel (verbindlich):
+// - Wenn role !== "Filiale": dann MUSS eine Filiale explizit per ?filiale=XYZ angegeben werden.
+//   (Damit verhindern wir, dass Zentral-User versehentlich in "Alle" schreiben/lesen.)
 
 const express = require('express');
 const router = express.Router();
@@ -26,49 +26,81 @@ const ROLE_ADMIN = 'Admin';
 const ROLE_SUPERVISOR = 'Supervisor';
 const ROLE_MANAGER_1 = 'Manager-1';
 const ROLE_GF = 'Geschäftsführer';
-
-const ROLES_GLOBAL_FILIALE = [ROLE_ADMIN, ROLE_SUPERVISOR, ROLE_MANAGER_1, ROLE_GF]; // dürfen ?filiale=XYZ nutzen (read); write je Typ separat
-const ROLES_UMSATZ_WRITE = [ROLE_ADMIN, ROLE_SUPERVISOR];
+const ROLE_FILIALE = 'Filiale';
 
 const BOOKING_TYPES = ['bestellung', 'aktionsvorab', 'abgabe', 'korrektur'];
 
-function isGlobalFilialeRole(role) {
-  return ROLES_GLOBAL_FILIALE.includes(role);
+function isFilialeRole(role) {
+  return role === ROLE_FILIALE;
+}
+
+function isCentralRole(role) {
+  return !isFilialeRole(role);
+}
+
+function normalizeFiliale(value) {
+  if (typeof value !== 'string') return null;
+  const t = value.trim();
+  if (!t) return null;
+  return t;
+}
+
+function resolveFiliale(req) {
+  // Sonderregel:
+  // - Filiale-User: Filiale aus JWT
+  // - Zentral-User: Filiale MUSS via ?filiale=XYZ kommen
+  const { role, filiale: tokenFiliale } = req.user || {};
+  const queryFiliale = normalizeFiliale(req.query?.filiale);
+
+  if (isFilialeRole(role)) {
+    return normalizeFiliale(tokenFiliale);
+  }
+
+  // Zentral: zwingend Query
+  return queryFiliale;
+}
+
+function enforceFilialeForCentral(req, res) {
+  const { role } = req.user || {};
+  if (isCentralRole(role)) {
+    const f = normalizeFiliale(req.query?.filiale);
+    if (!f) {
+      res.status(400).json({
+        message: 'Filiale fehlt: Für zentrale Rollen muss ?filiale=XYZ gesetzt sein.'
+      });
+      return false;
+    }
+    if (f.toLowerCase() === 'alle') {
+      res.status(400).json({
+        message: 'Ungültige Filiale: "Alle" ist im Budget-Kontext nicht erlaubt. Bitte ?filiale=XYZ setzen.'
+      });
+      return false;
+    }
+  }
+  return true;
 }
 
 function canWriteBookingType(role, bookingType) {
   if (!BOOKING_TYPES.includes(bookingType)) return false;
 
   if (bookingType === 'bestellung') {
-    // Filiale darf (eigene Filiale). Supervisor/Admin dürfen.
-    return role === ROLE_ADMIN || role === ROLE_SUPERVISOR || !isGlobalFilialeRole(role); // "nicht global" = Filialrolle
+    // Filiale (eigene), Supervisor, Admin dürfen schreiben
+    return role === ROLE_FILIALE || role === ROLE_SUPERVISOR || role === ROLE_ADMIN;
   }
 
   if (bookingType === 'aktionsvorab') {
+    // Schreiben: BZL (Manager-1), GL, Supervisor, Admin
     return role === ROLE_ADMIN || role === ROLE_SUPERVISOR || role === ROLE_MANAGER_1 || role === ROLE_GF;
   }
 
-  // abgabe / korrektur
+  // abgabe / korrektur: Schreiben: Supervisor, Admin
   return role === ROLE_ADMIN || role === ROLE_SUPERVISOR;
 }
 
 function canReadBookingType(role, bookingType) {
   if (!BOOKING_TYPES.includes(bookingType)) return false;
-
-  // Lesen: grundsätzlich filialbezogen. Filialen dürfen Aktionen lesen, aber nicht schreiben.
-  // Zentrale dürfen immer lesen (filialbezogen via token oder ?filiale=XYZ).
-  if (isGlobalFilialeRole(role)) return true;
-
-  // Filialrolle:
-  // - bestellung: lesen ja
-  // - aktionsvorab: lesen ja
-  // - abgabe/korrektur: lesen ja (wenn du das später einschränken willst: hier anpassen)
+  // Lesen ist grundsätzlich erlaubt (filialbezogen wird über resolveFiliale erzwungen)
   return true;
-}
-
-function isFilialeRole(role) {
-  // In eurem System sind "Zentrale"-Rollen bekannt; alles andere behandeln wir als Filiale-User.
-  return !isGlobalFilialeRole(role);
 }
 
 // =====================================================
@@ -119,25 +151,16 @@ function parseDateOptional(value) {
   if (!t) return null;
 
   // simple YYYY-MM-DD check (DB validiert endgültig)
-  // akzeptiert auch ISO mit Zeit, aber wir nehmen nur YYYY-MM-DD
   const m = t.match(/^(\d{4})-(\d{2})-(\d{2})$/);
   if (!m) return null;
   return t;
 }
 
-function resolveFiliale(req) {
-  // Standard: filiale aus JWT
-  // Zentrale-Rollen: optional ?filiale=XYZ
-  const { role, filiale: tokenFiliale } = req.user || {};
-  const queryFiliale = typeof req.query.filiale === 'string' ? req.query.filiale.trim() : '';
-
-  if (isGlobalFilialeRole(role) && queryFiliale) return queryFiliale;
-  return tokenFiliale || null;
-}
-
 function getActor(req) {
   const u = req.user || {};
-  return (typeof u.name === 'string' && u.name.trim()) ? u.name.trim() : (u.id ? String(u.id) : 'unknown');
+  return (typeof u.name === 'string' && u.name.trim())
+    ? u.name.trim()
+    : (u.id ? String(u.id) : 'unknown');
 }
 
 // =====================================================
@@ -147,7 +170,6 @@ function getActor(req) {
 //   -> anlegen mit Snapshots aus week_rules, umsatz bleibt NULL
 // =====================================================
 async function ensureWeekBudgetId(client, filiale, jahr, kw) {
-  // 1) exists?
   const existsRes = await client.query(
     `
       SELECT id
@@ -160,7 +182,6 @@ async function ensureWeekBudgetId(client, filiale, jahr, kw) {
 
   if (existsRes.rows.length > 0) return existsRes.rows[0].id;
 
-  // 2) week_rules lesen
   const ruleRes = await client.query(
     `
       SELECT prozentsatz, mwst_faktor
@@ -179,7 +200,6 @@ async function ensureWeekBudgetId(client, filiale, jahr, kw) {
 
   const { prozentsatz, mwst_faktor } = ruleRes.rows[0];
 
-  // 3) insert (umsatz NULL), conflict-safe
   const insRes = await client.query(
     `
       INSERT INTO budget.week_budgets
@@ -195,7 +215,6 @@ async function ensureWeekBudgetId(client, filiale, jahr, kw) {
 
   if (insRes.rows.length > 0) return insRes.rows[0].id;
 
-  // 4) falls parallel angelegt wurde: nochmal select
   const againRes = await client.query(
     `
       SELECT id
@@ -229,9 +248,11 @@ async function fetchWeekSummary(client, filiale, jahr, kw) {
 }
 
 // =====================================================
-// GET /api/budget/:jahr/:kw  (V1)
+// GET /api/budget/:jahr/:kw
 // =====================================================
 router.get('/:jahr/:kw', verifyToken(), async (req, res) => {
+  if (!enforceFilialeForCentral(req, res)) return;
+
   const jahr = parseIntStrict(req.params.jahr);
   const kw = parseIntStrict(req.params.kw);
   const filiale = resolveFiliale(req);
@@ -243,7 +264,7 @@ router.get('/:jahr/:kw', verifyToken(), async (req, res) => {
     return res.status(400).json({ message: 'Ungültige Kalenderwoche (kw muss 1..53 sein).' });
   }
   if (!filiale) {
-    return res.status(400).json({ message: 'Filiale fehlt im Token (oder Query) – Zugriff nicht möglich.' });
+    return res.status(400).json({ message: 'Filiale fehlt – Zugriff nicht möglich.' });
   }
 
   try {
@@ -274,15 +295,17 @@ router.get('/:jahr/:kw', verifyToken(), async (req, res) => {
 });
 
 // =====================================================
-// PUT /api/budget/:jahr/:kw/umsatz  (V1)
-// Body: { umsatz_vorwoche_brutto: number|string }
+// PUT /api/budget/:jahr/:kw/umsatz
 // Rechte: Admin, Supervisor
+// Sonderregel: Zentral-User müssen ?filiale=XYZ setzen
 // =====================================================
 router.put('/:jahr/:kw/umsatz', verifyToken(), async (req, res) => {
   const { role } = req.user || {};
-  if (!ROLES_UMSATZ_WRITE.includes(role)) {
+  if (role !== ROLE_ADMIN && role !== ROLE_SUPERVISOR) {
     return res.status(403).json({ message: 'Zugriff verweigert. Erforderliche Rolle: Admin oder Supervisor.' });
   }
+
+  if (!enforceFilialeForCentral(req, res)) return;
 
   const jahr = parseIntStrict(req.params.jahr);
   const kw = parseIntStrict(req.params.kw);
@@ -295,7 +318,7 @@ router.put('/:jahr/:kw/umsatz', verifyToken(), async (req, res) => {
     return res.status(400).json({ message: 'Ungültige Kalenderwoche (kw muss 1..53 sein).' });
   }
   if (!filiale) {
-    return res.status(400).json({ message: 'Filiale fehlt (Token oder Query ?filiale=XYZ).' });
+    return res.status(400).json({ message: 'Filiale fehlt – Zugriff nicht möglich.' });
   }
 
   const umsatz = parseNumericNonNegative(req.body?.umsatz_vorwoche_brutto);
@@ -374,14 +397,10 @@ router.put('/:jahr/:kw/umsatz', verifyToken(), async (req, res) => {
 // MS4 – BOOKINGS
 // =====================================================
 
-// -----------------------------------------------------
 // GET /api/budget/:jahr/:kw/bookings
-// - Filiale: nur eigene Filiale
-// - Zentrale: optional ?filiale=XYZ
-// - Liefert alle Bookings der Woche (week_budget) für diese Filiale
-// Optional: ?typ=bestellung|aktionsvorab|abgabe|korrektur
-// -----------------------------------------------------
 router.get('/:jahr/:kw/bookings', verifyToken(), async (req, res) => {
+  if (!enforceFilialeForCentral(req, res)) return;
+
   const { role } = req.user || {};
   const jahr = parseIntStrict(req.params.jahr);
   const kw = parseIntStrict(req.params.kw);
@@ -394,7 +413,7 @@ router.get('/:jahr/:kw/bookings', verifyToken(), async (req, res) => {
     return res.status(400).json({ message: 'Ungültige Kalenderwoche (kw muss 1..53 sein).' });
   }
   if (!filiale) {
-    return res.status(400).json({ message: 'Filiale fehlt im Token (oder Query) – Zugriff nicht möglich.' });
+    return res.status(400).json({ message: 'Filiale fehlt – Zugriff nicht möglich.' });
   }
 
   const typFilterRaw = typeof req.query.typ === 'string' ? req.query.typ.trim() : '';
@@ -417,7 +436,6 @@ router.get('/:jahr/:kw/bookings', verifyToken(), async (req, res) => {
       );
 
       if (weekBudgetIdRes.rows.length === 0) {
-        // Noch keine WeekBudget-Zeile angelegt -> dann gibt es auch keine Bookings
         return res.json({
           filiale,
           jahr,
@@ -455,10 +473,7 @@ router.get('/:jahr/:kw/bookings', verifyToken(), async (req, res) => {
         [weekBudgetId, typFilter]
       );
 
-      // Typ-spezifische Sicht: Filiale darf alles lesen (laut Vorgabe). Falls du abgabe/korrektur später verstecken willst:
-      // -> hier nach role/typ filtern.
       const filtered = bookingsRes.rows.filter((row) => canReadBookingType(role, row.typ));
-
       const weekSummary = await fetchWeekSummary(client, filiale, jahr, kw);
 
       return res.json({
@@ -477,18 +492,10 @@ router.get('/:jahr/:kw/bookings', verifyToken(), async (req, res) => {
   }
 });
 
-// -----------------------------------------------------
 // POST /api/budget/:jahr/:kw/bookings
-// Body (minimal):
-//  - typ (required)
-//  - betrag (required, != 0)  (negativ belastet Budget; positiv = Gutschrift/Korrektur)
-//  - beschreibung (required)
-// Optional:
-//  - datum (YYYY-MM-DD)
-//  - lieferant, aktion_nr, von_filiale, an_filiale
-// Rechte: typ-spezifisch (siehe oben)
-// -----------------------------------------------------
 router.post('/:jahr/:kw/bookings', verifyToken(), async (req, res) => {
+  if (!enforceFilialeForCentral(req, res)) return;
+
   const { role, filiale: tokenFiliale } = req.user || {};
   const jahr = parseIntStrict(req.params.jahr);
   const kw = parseIntStrict(req.params.kw);
@@ -501,7 +508,7 @@ router.post('/:jahr/:kw/bookings', verifyToken(), async (req, res) => {
     return res.status(400).json({ message: 'Ungültige Kalenderwoche (kw muss 1..53 sein).' });
   }
   if (!filiale) {
-    return res.status(400).json({ message: 'Filiale fehlt im Token (oder Query) – Zugriff nicht möglich.' });
+    return res.status(400).json({ message: 'Filiale fehlt – Zugriff nicht möglich.' });
   }
 
   const typ = parseTextRequired(req.body?.typ);
@@ -509,8 +516,7 @@ router.post('/:jahr/:kw/bookings', verifyToken(), async (req, res) => {
     return res.status(400).json({ message: `Ungültiger Body: typ muss einer von ${BOOKING_TYPES.join(', ')} sein.` });
   }
 
-  // Filiale darf nur eigene Filiale schreiben (bei bestellung)
-  if (isFilialeRole(role) && filiale !== tokenFiliale) {
+  if (isFilialeRole(role) && normalizeFiliale(tokenFiliale) && filiale !== normalizeFiliale(tokenFiliale)) {
     return res.status(403).json({ message: 'Zugriff verweigert: Filialuser darf nur in eigener Filiale schreiben.' });
   }
 
@@ -589,13 +595,7 @@ router.post('/:jahr/:kw/bookings', verifyToken(), async (req, res) => {
   }
 });
 
-// -----------------------------------------------------
 // PUT /api/budget/bookings/:id
-// - typ ist NICHT änderbar (Rechte hängen daran)
-// - Update-Felder:
-//   betrag (!=0), beschreibung (pflicht), datum (optional), lieferant/aktion_nr/von_filiale/an_filiale (optional)
-// Rechte: typ-spezifisch + filialbezogen (bei bestellung darf Filiale nur eigene)
-// -----------------------------------------------------
 router.put('/bookings/:id', verifyToken(), async (req, res) => {
   const { role, filiale: tokenFiliale } = req.user || {};
   const bookingId = typeof req.params.id === 'string' ? req.params.id.trim() : '';
@@ -629,7 +629,6 @@ router.put('/bookings/:id', verifyToken(), async (req, res) => {
     try {
       await client.query('BEGIN');
 
-      // Booking + Filiale/Jahr/KW auflösen
       const curRes = await client.query(
         `
           SELECT
@@ -659,8 +658,12 @@ router.put('/bookings/:id', verifyToken(), async (req, res) => {
         return res.status(403).json({ message: `Zugriff verweigert: Rolle darf typ='${current.typ}' nicht bearbeiten.` });
       }
 
-      // Filialbegrenzung bei bestellung für Filialrolle
-      if (current.typ === 'bestellung' && isFilialeRole(role) && current.filiale !== tokenFiliale) {
+      if (
+        current.typ === 'bestellung' &&
+        isFilialeRole(role) &&
+        normalizeFiliale(tokenFiliale) &&
+        current.filiale !== normalizeFiliale(tokenFiliale)
+      ) {
         await client.query('ROLLBACK');
         return res.status(403).json({ message: 'Zugriff verweigert: Filialuser darf nur eigene Bestellungen bearbeiten.' });
       }
@@ -704,10 +707,7 @@ router.put('/bookings/:id', verifyToken(), async (req, res) => {
   }
 });
 
-// -----------------------------------------------------
 // DELETE /api/budget/bookings/:id
-// Rechte: typ-spezifisch + filialbezogen (bei bestellung darf Filiale nur eigene)
-// -----------------------------------------------------
 router.delete('/bookings/:id', verifyToken(), async (req, res) => {
   const { role, filiale: tokenFiliale } = req.user || {};
   const bookingId = typeof req.params.id === 'string' ? req.params.id.trim() : '';
@@ -750,8 +750,12 @@ router.delete('/bookings/:id', verifyToken(), async (req, res) => {
         return res.status(403).json({ message: `Zugriff verweigert: Rolle darf typ='${current.typ}' nicht löschen.` });
       }
 
-      // Filialbegrenzung bei bestellung für Filialrolle
-      if (current.typ === 'bestellung' && isFilialeRole(role) && current.filiale !== tokenFiliale) {
+      if (
+        current.typ === 'bestellung' &&
+        isFilialeRole(role) &&
+        normalizeFiliale(tokenFiliale) &&
+        current.filiale !== normalizeFiliale(tokenFiliale)
+      ) {
         await client.query('ROLLBACK');
         return res.status(403).json({ message: 'Zugriff verweigert: Filialuser darf nur eigene Bestellungen löschen.' });
       }
