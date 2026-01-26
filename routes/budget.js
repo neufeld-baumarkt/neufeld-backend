@@ -1,16 +1,22 @@
-// routes/budget.js – Budget API V1 + MS4 (Bookings)
-// Stand: 21.01.2026
+// routes/budget.js – Budget API V1 + MS4 (Bookings) + Rule-Update + Response-Redaction
+// Stand: 26.01.2026
+//
 // READ:  budget.v_week_summary (read-only)
 // WRITE: budget.week_budgets (umsatz_vorwoche_brutto per UPSERT)
 // WRITE: budget.bookings     (MS4 CRUD)
+// WRITE: budget.week_rules   (NEU: Admin/Supervisor dürfen prozentsatz/mwst_faktor pflegen)
 //
 // Grundregeln:
-// - Backend rechnet NICHT selbst, liefert View 1:1
+// - Backend rechnet NICHT selbst, liefert View 1:1 (aber mit Redaction je Rolle)
 // - View wird NICHT beschrieben
 //
 // Sonderregel (verbindlich):
 // - Wenn role !== "Filiale": dann MUSS eine Filiale explizit per ?filiale=XYZ angegeben werden.
 //   (Damit verhindern wir, dass Zentral-User versehentlich in "Alle" schreiben/lesen.)
+//
+// Sicherheitsregel (NEU, verbindlich):
+// - Filiale darf den Wochen-Prozentsatz NICHT sehen.
+// - Das bedeutet: prozentsatz_* und mwst_faktor_* werden serverseitig aus Responses entfernt.
 
 const express = require('express');
 const router = express.Router();
@@ -36,6 +42,10 @@ function isFilialeRole(role) {
 
 function isCentralRole(role) {
   return !isFilialeRole(role);
+}
+
+function isAdminOrSupervisor(role) {
+  return role === ROLE_ADMIN || role === ROLE_SUPERVISOR;
 }
 
 function normalizeFiliale(value) {
@@ -104,6 +114,32 @@ function canReadBookingType(role, bookingType) {
 }
 
 // =====================================================
+// Redaction (Sicherheit): Filiale darf Prozentsätze/MwSt nicht sehen
+// =====================================================
+
+function redactWeekSummaryForRole(row, role) {
+  if (!row) return row;
+  if (!isFilialeRole(role)) return row;
+
+  // Clone & remove sensitive rule fields
+  const clean = { ...row };
+
+  // View-Felder (effektiv)
+  delete clean.prozentsatz_effektiv;
+  delete clean.mwst_faktor_effektiv;
+
+  // Falls View/Query irgendwann Snapshots durchreicht (defensiv)
+  delete clean.prozentsatz_snapshot;
+  delete clean.mwst_faktor_snapshot;
+
+  // OPTIONAL: wenn du auch verhindern willst, dass Filialen rückwärts auf Umsatz schließen:
+  // (aktuell NICHT gefordert -> bleibt drin)
+  // delete clean.umsatz_vorwoche_brutto;
+
+  return clean;
+}
+
+// =====================================================
 // Parser / Helper
 // =====================================================
 
@@ -127,6 +163,22 @@ function parseNumericNonZero(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return null;
   if (n === 0) return null;
+  return n;
+}
+
+function parseNumericBetween0And1(value) {
+  if (value === null || value === undefined) return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  if (n < 0 || n > 1) return null;
+  return n;
+}
+
+function parseNumericPositive(value) {
+  if (value === null || value === undefined) return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  if (n <= 0) return null;
   return n;
 }
 
@@ -248,11 +300,95 @@ async function fetchWeekSummary(client, filiale, jahr, kw) {
 }
 
 // =====================================================
+// NEU: PUT /api/budget/:jahr/:kw/rule
+// Rechte: Admin, Supervisor
+// Zweck: prozentsatz (0..1) und optional mwst_faktor (>0) pflegen
+// =====================================================
+router.put('/:jahr/:kw/rule', verifyToken(), async (req, res) => {
+  const { role } = req.user || {};
+  if (!isAdminOrSupervisor(role)) {
+    return res.status(403).json({ message: 'Zugriff verweigert. Erforderliche Rolle: Admin oder Supervisor.' });
+  }
+
+  const jahr = parseIntStrict(req.params.jahr);
+  const kw = parseIntStrict(req.params.kw);
+
+  if (!jahr || !kw) {
+    return res.status(400).json({ message: 'Ungültige Parameter: jahr und kw müssen Integer sein.' });
+  }
+  if (kw < 1 || kw > 53) {
+    return res.status(400).json({ message: 'Ungültige Kalenderwoche (kw muss 1..53 sein).' });
+  }
+
+  // prozentsatz ist Pflicht
+  const prozentsatz = parseNumericBetween0And1(req.body?.prozentsatz);
+  if (prozentsatz === null) {
+    return res.status(400).json({
+      message: 'Ungültiger Body: prozentsatz muss eine Zahl zwischen 0 und 1 sein (z.B. 0.48 für 48%).'
+    });
+  }
+
+  // mwst_faktor optional
+  let mwstFaktor = null;
+  if (req.body?.mwst_faktor !== undefined && req.body?.mwst_faktor !== null) {
+    mwstFaktor = parseNumericPositive(req.body?.mwst_faktor);
+    if (mwstFaktor === null) {
+      return res.status(400).json({
+        message: 'Ungültiger Body: mwst_faktor muss eine Zahl > 0 sein (oder weglassen).'
+      });
+    }
+  }
+
+  try {
+    // Existenz prüfen (wir machen bewusst UPDATE; wenn nicht vorhanden -> 404)
+    const curRes = await pool.query(
+      `
+        SELECT jahr, kw, prozentsatz, mwst_faktor
+        FROM budget.week_rules
+        WHERE jahr = $1 AND kw = $2
+        LIMIT 1
+      `,
+      [jahr, kw]
+    );
+
+    if (curRes.rows.length === 0) {
+      return res.status(404).json({
+        message: 'Keine week_rules gefunden für jahr/kw – Update nicht möglich.',
+        jahr,
+        kw
+      });
+    }
+
+    const updRes = await pool.query(
+      `
+        UPDATE budget.week_rules
+        SET
+          prozentsatz = $3,
+          mwst_faktor = COALESCE($4, mwst_faktor),
+          updated_at = NOW()
+        WHERE jahr = $1 AND kw = $2
+        RETURNING jahr, kw, prozentsatz, mwst_faktor, updated_at
+      `,
+      [jahr, kw, prozentsatz, mwstFaktor]
+    );
+
+    return res.json({
+      message: 'week_rules aktualisiert.',
+      rule: updRes.rows[0]
+    });
+  } catch (err) {
+    console.error('Fehler PUT /api/budget/:jahr/:kw/rule:', err.message);
+    return res.status(500).json({ message: 'Serverfehler (Rule UPDATE).' });
+  }
+});
+
+// =====================================================
 // GET /api/budget/:jahr/:kw
 // =====================================================
 router.get('/:jahr/:kw', verifyToken(), async (req, res) => {
   if (!enforceFilialeForCentral(req, res)) return;
 
+  const { role } = req.user || {};
   const jahr = parseIntStrict(req.params.jahr);
   const kw = parseIntStrict(req.params.kw);
   const filiale = resolveFiliale(req);
@@ -287,7 +423,8 @@ router.get('/:jahr/:kw', verifyToken(), async (req, res) => {
       });
     }
 
-    return res.json(result.rows[0]);
+    const row = redactWeekSummaryForRole(result.rows[0], role);
+    return res.json(row);
   } catch (err) {
     console.error('Fehler GET /api/budget/:jahr/:kw:', err.message);
     return res.status(500).json({ message: 'Serverfehler (Budget READ).' });
@@ -386,6 +523,7 @@ router.put('/:jahr/:kw/umsatz', verifyToken(), async (req, res) => {
       });
     }
 
+    // Admin/Supervisor only route -> keine Redaction nötig
     return res.json(viewRes.rows[0]);
   } catch (err) {
     console.error('Fehler PUT /api/budget/:jahr/:kw/umsatz:', err.message);
@@ -435,13 +573,16 @@ router.get('/:jahr/:kw/bookings', verifyToken(), async (req, res) => {
         [filiale, jahr, kw]
       );
 
+      const weekSummaryRaw = await fetchWeekSummary(client, filiale, jahr, kw);
+      const weekSummary = redactWeekSummaryForRole(weekSummaryRaw, role);
+
       if (weekBudgetIdRes.rows.length === 0) {
         return res.json({
           filiale,
           jahr,
           kw,
           bookings: [],
-          week_summary: await fetchWeekSummary(client, filiale, jahr, kw)
+          week_summary: weekSummary
         });
       }
 
@@ -474,7 +615,6 @@ router.get('/:jahr/:kw/bookings', verifyToken(), async (req, res) => {
       );
 
       const filtered = bookingsRes.rows.filter((row) => canReadBookingType(role, row.typ));
-      const weekSummary = await fetchWeekSummary(client, filiale, jahr, kw);
 
       return res.json({
         filiale,
@@ -566,7 +706,8 @@ router.post('/:jahr/:kw/bookings', verifyToken(), async (req, res) => {
         [weekBudgetId, datum, typ, betrag, lieferant, aktion_nr, beschreibung, von_filiale, an_filiale, createdBy]
       );
 
-      const weekSummary = await fetchWeekSummary(client, filiale, jahr, kw);
+      const weekSummaryRaw = await fetchWeekSummary(client, filiale, jahr, kw);
+      const weekSummary = redactWeekSummaryForRole(weekSummaryRaw, role);
 
       await client.query('COMMIT');
       return res.status(201).json({
@@ -687,7 +828,8 @@ router.put('/bookings/:id', verifyToken(), async (req, res) => {
         [bookingId, betrag, beschreibung, datum, lieferant, aktion_nr, von_filiale, an_filiale]
       );
 
-      const weekSummary = await fetchWeekSummary(client, current.filiale, current.jahr, current.kw);
+      const weekSummaryRaw = await fetchWeekSummary(client, current.filiale, current.jahr, current.kw);
+      const weekSummary = redactWeekSummaryForRole(weekSummaryRaw, role);
 
       await client.query('COMMIT');
       return res.json({
@@ -762,7 +904,8 @@ router.delete('/bookings/:id', verifyToken(), async (req, res) => {
 
       await client.query(`DELETE FROM budget.bookings WHERE id = $1`, [bookingId]);
 
-      const weekSummary = await fetchWeekSummary(client, current.filiale, current.jahr, current.kw);
+      const weekSummaryRaw = await fetchWeekSummary(client, current.filiale, current.jahr, current.kw);
+      const weekSummary = redactWeekSummaryForRole(weekSummaryRaw, role);
 
       await client.query('COMMIT');
       return res.json({
