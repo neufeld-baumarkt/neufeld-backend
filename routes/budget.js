@@ -1,10 +1,10 @@
 // routes/budget.js – Budget API V1 + MS4 (Bookings) + Rule-Update + Response-Redaction
-// Stand: 26.01.2026
+// Stand: 27.01.2026 (Backend-Ebene: Option 1 umgesetzt)
 //
-// READ:  budget.v_week_summary (read-only)
+// READ:  budget.v_week_summary_global_ytd (read-only)   ✅ NEU
 // WRITE: budget.week_budgets (umsatz_vorwoche_brutto per UPSERT)
 // WRITE: budget.bookings     (MS4 CRUD)
-// WRITE: budget.week_rules   (NEU: Admin/Supervisor dürfen prozentsatz/mwst_faktor pflegen)
+// WRITE: budget.week_rules   (Admin/Supervisor dürfen prozentsatz/mwst_faktor pflegen)
 //
 // Grundregeln:
 // - Backend rechnet NICHT selbst, liefert View 1:1 (aber mit Redaction je Rolle)
@@ -14,9 +14,10 @@
 // - Wenn role !== "Filiale": dann MUSS eine Filiale explizit per ?filiale=XYZ angegeben werden.
 //   (Damit verhindern wir, dass Zentral-User versehentlich in "Alle" schreiben/lesen.)
 //
-// Sicherheitsregel (NEU, verbindlich):
+// Sicherheitsregel (verbindlich):
 // - Filiale darf den Wochen-Prozentsatz NICHT sehen.
-// - Das bedeutet: prozentsatz_* und mwst_faktor_* werden serverseitig aus Responses entfernt.
+// - Das bedeutet: prozentsatz_* und mwst_faktor_* sowie budget_satz_ytd_prozent
+//   werden serverseitig aus Responses entfernt.
 
 const express = require('express');
 const router = express.Router();
@@ -124,173 +125,30 @@ function redactWeekSummaryForRole(row, role) {
   // Clone & remove sensitive rule fields
   const clean = { ...row };
 
-  // View-Felder (effektiv)
+  // View-Felder (effektiv / snapshot / global)
   delete clean.prozentsatz_effektiv;
-  delete clean.mwst_faktor_effektiv;
-
-  // Falls View/Query irgendwann Snapshots durchreicht (defensiv)
   delete clean.prozentsatz_snapshot;
+  delete clean.prozentsatz;
+  delete clean.mwst_faktor_effektiv;
   delete clean.mwst_faktor_snapshot;
+  delete clean.mwst_faktor;
 
-  // OPTIONAL: wenn du auch verhindern willst, dass Filialen rückwärts auf Umsatz schließen:
-  // (aktuell NICHT gefordert -> bleibt drin)
-  // delete clean.umsatz_vorwoche_brutto;
+  // YTD-Felder, die indirekt den Satz verraten würden
+  delete clean.budget_satz_ytd_prozent;
 
   return clean;
 }
 
 // =====================================================
-// Parser / Helper
+// Helpers
 // =====================================================
-
-function parseIntStrict(value) {
-  if (value === null || value === undefined) return null;
-  const n = Number(value);
-  if (!Number.isInteger(n)) return null;
-  return n;
-}
-
-function parseNumericNonNegative(value) {
-  if (value === null || value === undefined) return null;
-  const n = Number(value);
-  if (!Number.isFinite(n)) return null;
-  if (n < 0) return null;
-  return n;
-}
-
-function parseNumericNonZero(value) {
-  if (value === null || value === undefined) return null;
-  const n = Number(value);
-  if (!Number.isFinite(n)) return null;
-  if (n === 0) return null;
-  return n;
-}
-
-function parseNumericBetween0And1(value) {
-  if (value === null || value === undefined) return null;
-  const n = Number(value);
-  if (!Number.isFinite(n)) return null;
-  if (n < 0 || n > 1) return null;
-  return n;
-}
-
-function parseNumericPositive(value) {
-  if (value === null || value === undefined) return null;
-  const n = Number(value);
-  if (!Number.isFinite(n)) return null;
-  if (n <= 0) return null;
-  return n;
-}
-
-function parseTextRequired(value) {
-  if (typeof value !== 'string') return null;
-  const t = value.trim();
-  if (!t) return null;
-  return t;
-}
-
-function parseTextOptional(value) {
-  if (value === null || value === undefined) return null;
-  if (typeof value !== 'string') return null;
-  const t = value.trim();
-  return t ? t : null;
-}
-
-function parseDateOptional(value) {
-  if (value === null || value === undefined) return null;
-  if (typeof value !== 'string') return null;
-  const t = value.trim();
-  if (!t) return null;
-
-  // simple YYYY-MM-DD check (DB validiert endgültig)
-  const m = t.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if (!m) return null;
-  return t;
-}
-
-function getActor(req) {
-  const u = req.user || {};
-  return (typeof u.name === 'string' && u.name.trim())
-    ? u.name.trim()
-    : (u.id ? String(u.id) : 'unknown');
-}
-
-// =====================================================
-// WeekBudget sicherstellen (für Bookings)
-// - Bookings referenzieren week_budgets.id (FK)
-// - Falls week_budgets für filiale/jahr/kw noch nicht existiert:
-//   -> anlegen mit Snapshots aus week_rules, umsatz bleibt NULL
-// =====================================================
-async function ensureWeekBudgetId(client, filiale, jahr, kw) {
-  const existsRes = await client.query(
-    `
-      SELECT id
-      FROM budget.week_budgets
-      WHERE filiale = $1 AND jahr = $2 AND kw = $3
-      LIMIT 1
-    `,
-    [filiale, jahr, kw]
-  );
-
-  if (existsRes.rows.length > 0) return existsRes.rows[0].id;
-
-  const ruleRes = await client.query(
-    `
-      SELECT prozentsatz, mwst_faktor
-      FROM budget.week_rules
-      WHERE jahr = $1 AND kw = $2
-      LIMIT 1
-    `,
-    [jahr, kw]
-  );
-
-  if (ruleRes.rows.length === 0) {
-    const err = new Error('NO_WEEK_RULES');
-    err.meta = { jahr, kw };
-    throw err;
-  }
-
-  const { prozentsatz, mwst_faktor } = ruleRes.rows[0];
-
-  const insRes = await client.query(
-    `
-      INSERT INTO budget.week_budgets
-        (filiale, jahr, kw, umsatz_vorwoche_brutto, prozentsatz_snapshot, mwst_faktor_snapshot, updated_at)
-      VALUES
-        ($1, $2, $3, NULL, $4, $5, NOW())
-      ON CONFLICT (filiale, jahr, kw)
-      DO NOTHING
-      RETURNING id
-    `,
-    [filiale, jahr, kw, prozentsatz, mwst_faktor]
-  );
-
-  if (insRes.rows.length > 0) return insRes.rows[0].id;
-
-  const againRes = await client.query(
-    `
-      SELECT id
-      FROM budget.week_budgets
-      WHERE filiale = $1 AND jahr = $2 AND kw = $3
-      LIMIT 1
-    `,
-    [filiale, jahr, kw]
-  );
-
-  if (againRes.rows.length === 0) {
-    const err = new Error('WEEK_BUDGET_CREATE_FAILED');
-    err.meta = { filiale, jahr, kw };
-    throw err;
-  }
-
-  return againRes.rows[0].id;
-}
 
 async function fetchWeekSummary(client, filiale, jahr, kw) {
+  // ✅ NEU: Option 1 View mit Global-Regeln + YTD
   const viewRes = await client.query(
     `
       SELECT *
-      FROM budget.v_week_summary
+      FROM budget.v_week_summary_global_ytd
       WHERE filiale = $1 AND jahr = $2 AND kw = $3
       LIMIT 1
     `,
@@ -299,51 +157,39 @@ async function fetchWeekSummary(client, filiale, jahr, kw) {
   return viewRes.rows.length ? viewRes.rows[0] : null;
 }
 
+function parseIntSafe(v) {
+  const n = parseInt(v, 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+function parseNumericSafe(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 // =====================================================
-// NEU: PUT /api/budget/:jahr/:kw/rule
-// Rechte: Admin, Supervisor
-// Zweck: prozentsatz (0..1) und optional mwst_faktor (>0) pflegen
+// RULES (GLOBAL/WOCHE): Admin/Supervisor dürfen ändern
 // =====================================================
-router.put('/:jahr/:kw/rule', verifyToken(), async (req, res) => {
+
+// GET /api/budget/rules?jahr=2026&kw=2
+router.get('/rules', verifyToken(), async (req, res) => {
   const { role } = req.user || {};
   if (!isAdminOrSupervisor(role)) {
-    return res.status(403).json({ message: 'Zugriff verweigert. Erforderliche Rolle: Admin oder Supervisor.' });
+    return res.status(403).json({ message: 'Zugriff verweigert: Nur Admin/Supervisor dürfen Rules sehen.' });
   }
 
-  const jahr = parseIntStrict(req.params.jahr);
-  const kw = parseIntStrict(req.params.kw);
+  const jahr = parseIntSafe(req.query?.jahr);
+  const kw = parseIntSafe(req.query?.kw);
 
   if (!jahr || !kw) {
-    return res.status(400).json({ message: 'Ungültige Parameter: jahr und kw müssen Integer sein.' });
-  }
-  if (kw < 1 || kw > 53) {
-    return res.status(400).json({ message: 'Ungültige Kalenderwoche (kw muss 1..53 sein).' });
-  }
-
-  // prozentsatz ist Pflicht
-  const prozentsatz = parseNumericBetween0And1(req.body?.prozentsatz);
-  if (prozentsatz === null) {
-    return res.status(400).json({
-      message: 'Ungültiger Body: prozentsatz muss eine Zahl zwischen 0 und 1 sein (z.B. 0.48 für 48%).'
-    });
-  }
-
-  // mwst_faktor optional
-  let mwstFaktor = null;
-  if (req.body?.mwst_faktor !== undefined && req.body?.mwst_faktor !== null) {
-    mwstFaktor = parseNumericPositive(req.body?.mwst_faktor);
-    if (mwstFaktor === null) {
-      return res.status(400).json({
-        message: 'Ungültiger Body: mwst_faktor muss eine Zahl > 0 sein (oder weglassen).'
-      });
-    }
+    return res.status(400).json({ message: 'jahr und kw sind erforderlich (Query-Parameter).' });
   }
 
   try {
-    // Existenz prüfen (wir machen bewusst UPDATE; wenn nicht vorhanden -> 404)
-    const curRes = await pool.query(
+    const r = await pool.query(
       `
-        SELECT jahr, kw, prozentsatz, mwst_faktor
+        SELECT jahr, kw, prozentsatz, mwst_faktor, gueltig_ab, gueltig_bis, updated_at
         FROM budget.week_rules
         WHERE jahr = $1 AND kw = $2
         LIMIT 1
@@ -351,577 +197,499 @@ router.put('/:jahr/:kw/rule', verifyToken(), async (req, res) => {
       [jahr, kw]
     );
 
-    if (curRes.rows.length === 0) {
-      return res.status(404).json({
-        message: 'Keine week_rules gefunden für jahr/kw – Update nicht möglich.',
-        jahr,
-        kw
-      });
+    if (r.rows.length === 0) {
+      return res.status(404).json({ message: 'Keine Rule gefunden für diese Woche.' });
     }
 
-    const updRes = await pool.query(
+    return res.json(r.rows[0]);
+  } catch (e) {
+    console.error('Fehler GET /api/budget/rules:', e.message);
+    return res.status(500).json({ message: 'Serverfehler (Rules GET).' });
+  }
+});
+
+// PUT /api/budget/rules  Body: { jahr, kw, prozentsatz, mwst_faktor? }
+router.put('/rules', verifyToken(), async (req, res) => {
+  const { role } = req.user || {};
+  if (!isAdminOrSupervisor(role)) {
+    return res.status(403).json({ message: 'Zugriff verweigert: Nur Admin/Supervisor dürfen Rules ändern.' });
+  }
+
+  const jahr = parseIntSafe(req.body?.jahr);
+  const kw = parseIntSafe(req.body?.kw);
+  const prozentsatz = parseNumericSafe(req.body?.prozentsatz);
+  const mwst_faktor = parseNumericSafe(req.body?.mwst_faktor);
+
+  if (!jahr || !kw) {
+    return res.status(400).json({ message: 'jahr und kw sind erforderlich.' });
+  }
+  if (prozentsatz === null || prozentsatz === undefined) {
+    return res.status(400).json({ message: 'prozentsatz ist erforderlich.' });
+  }
+  if (prozentsatz < 0 || prozentsatz > 1) {
+    return res.status(400).json({ message: 'prozentsatz muss zwischen 0 und 1 liegen (z.B. 0.48).' });
+  }
+  if (mwst_faktor !== null && (mwst_faktor <= 0 || mwst_faktor > 5)) {
+    return res.status(400).json({ message: 'mwst_faktor ist ungültig.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1) Update versuchen
+    const upd = await client.query(
       `
         UPDATE budget.week_rules
-        SET
-          prozentsatz = $3,
-          mwst_faktor = COALESCE($4, mwst_faktor),
-          updated_at = NOW()
+        SET prozentsatz = $3,
+            mwst_faktor = COALESCE($4, mwst_faktor),
+            updated_at = NOW()
         WHERE jahr = $1 AND kw = $2
-        RETURNING jahr, kw, prozentsatz, mwst_faktor, updated_at
+        RETURNING jahr, kw, prozentsatz, mwst_faktor, gueltig_ab, gueltig_bis, updated_at
       `,
-      [jahr, kw, prozentsatz, mwstFaktor]
+      [jahr, kw, prozentsatz, mwst_faktor]
     );
 
+    if (upd.rows.length > 0) {
+      await client.query('COMMIT');
+      return res.json({
+        message: 'Rule aktualisiert.',
+        rule: upd.rows[0]
+      });
+    }
+
+    // 2) Insert falls noch nicht vorhanden
+    const ins = await client.query(
+      `
+        INSERT INTO budget.week_rules (jahr, kw, prozentsatz, mwst_faktor, gueltig_ab, gueltig_bis, updated_at)
+        VALUES ($1, $2, $3, COALESCE($4, 1.19), NULL, NULL, NOW())
+        RETURNING jahr, kw, prozentsatz, mwst_faktor, gueltig_ab, gueltig_bis, updated_at
+      `,
+      [jahr, kw, prozentsatz, mwst_faktor]
+    );
+
+    await client.query('COMMIT');
     return res.json({
-      message: 'week_rules aktualisiert.',
-      rule: updRes.rows[0]
+      message: 'Rule angelegt.',
+      rule: ins.rows[0]
     });
-  } catch (err) {
-    console.error('Fehler PUT /api/budget/:jahr/:kw/rule:', err.message);
-    return res.status(500).json({ message: 'Serverfehler (Rule UPDATE).' });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('Fehler PUT /api/budget/rules:', e.message);
+    return res.status(500).json({ message: 'Serverfehler (Rules PUT).' });
+  } finally {
+    client.release();
   }
 });
 
 // =====================================================
-// GET /api/budget/:jahr/:kw
+// Week Summary (Budget-Kopfwerte)
 // =====================================================
-router.get('/:jahr/:kw', verifyToken(), async (req, res) => {
+
+// GET /api/budget/week-summary?jahr=2026&kw=2[&filiale=Münster]
+router.get('/week-summary', verifyToken(), async (req, res) => {
+  const { role } = req.user || {};
+
+  // Zentral: Filiale muss gesetzt sein
   if (!enforceFilialeForCentral(req, res)) return;
 
-  const { role } = req.user || {};
-  const jahr = parseIntStrict(req.params.jahr);
-  const kw = parseIntStrict(req.params.kw);
   const filiale = resolveFiliale(req);
+  const jahr = parseIntSafe(req.query?.jahr);
+  const kw = parseIntSafe(req.query?.kw);
 
-  if (!jahr || !kw) {
-    return res.status(400).json({ message: 'Ungültige Parameter: jahr und kw müssen Integer sein.' });
-  }
-  if (kw < 1 || kw > 53) {
-    return res.status(400).json({ message: 'Ungültige Kalenderwoche (kw muss 1..53 sein).' });
-  }
-  if (!filiale) {
-    return res.status(400).json({ message: 'Filiale fehlt – Zugriff nicht möglich.' });
-  }
-
-  try {
-    const result = await pool.query(
-      `
-        SELECT *
-        FROM budget.v_week_summary
-        WHERE filiale = $1 AND jahr = $2 AND kw = $3
-        LIMIT 1
-      `,
-      [filiale, jahr, kw]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        message: 'Keine Budgetdaten gefunden (v_week_summary).',
-        filiale,
-        jahr,
-        kw
-      });
-    }
-
-    const row = redactWeekSummaryForRole(result.rows[0], role);
-    return res.json(row);
-  } catch (err) {
-    console.error('Fehler GET /api/budget/:jahr/:kw:', err.message);
-    return res.status(500).json({ message: 'Serverfehler (Budget READ).' });
-  }
-});
-
-// =====================================================
-// PUT /api/budget/:jahr/:kw/umsatz
-// Rechte: Admin, Supervisor
-// Sonderregel: Zentral-User müssen ?filiale=XYZ setzen
-// =====================================================
-router.put('/:jahr/:kw/umsatz', verifyToken(), async (req, res) => {
-  const { role } = req.user || {};
-  if (role !== ROLE_ADMIN && role !== ROLE_SUPERVISOR) {
-    return res.status(403).json({ message: 'Zugriff verweigert. Erforderliche Rolle: Admin oder Supervisor.' });
-  }
-
-  if (!enforceFilialeForCentral(req, res)) return;
-
-  const jahr = parseIntStrict(req.params.jahr);
-  const kw = parseIntStrict(req.params.kw);
-  const filiale = resolveFiliale(req);
-
-  if (!jahr || !kw) {
-    return res.status(400).json({ message: 'Ungültige Parameter: jahr und kw müssen Integer sein.' });
-  }
-  if (kw < 1 || kw > 53) {
-    return res.status(400).json({ message: 'Ungültige Kalenderwoche (kw muss 1..53 sein).' });
-  }
-  if (!filiale) {
-    return res.status(400).json({ message: 'Filiale fehlt – Zugriff nicht möglich.' });
-  }
-
-  const umsatz = parseNumericNonNegative(req.body?.umsatz_vorwoche_brutto);
-  if (umsatz === null) {
-    return res.status(400).json({
-      message: 'Ungültiger Body: umsatz_vorwoche_brutto muss eine Zahl >= 0 sein.'
-    });
-  }
-
-  try {
-    const ruleRes = await pool.query(
-      `
-        SELECT prozentsatz, mwst_faktor
-        FROM budget.week_rules
-        WHERE jahr = $1 AND kw = $2
-        LIMIT 1
-      `,
-      [jahr, kw]
-    );
-
-    if (ruleRes.rows.length === 0) {
-      return res.status(404).json({
-        message: 'Keine week_rules gefunden für jahr/kw – UPSERT nicht möglich.',
-        jahr,
-        kw
-      });
-    }
-
-    const { prozentsatz, mwst_faktor } = ruleRes.rows[0];
-
-    const upsertRes = await pool.query(
-      `
-        INSERT INTO budget.week_budgets
-          (filiale, jahr, kw, umsatz_vorwoche_brutto, prozentsatz_snapshot, mwst_faktor_snapshot, updated_at)
-        VALUES
-          ($1, $2, $3, $4, $5, $6, NOW())
-        ON CONFLICT (filiale, jahr, kw)
-        DO UPDATE SET
-          umsatz_vorwoche_brutto = EXCLUDED.umsatz_vorwoche_brutto,
-          updated_at = NOW()
-        RETURNING id
-      `,
-      [filiale, jahr, kw, umsatz, prozentsatz, mwst_faktor]
-    );
-
-    const weekBudgetId = upsertRes.rows?.[0]?.id;
-
-    const viewRes = await pool.query(
-      `
-        SELECT *
-        FROM budget.v_week_summary
-        WHERE filiale = $1 AND jahr = $2 AND kw = $3
-        LIMIT 1
-      `,
-      [filiale, jahr, kw]
-    );
-
-    if (viewRes.rows.length === 0) {
-      return res.status(200).json({
-        message: 'Umsatz gespeichert, aber View lieferte keinen Datensatz.',
-        id: weekBudgetId || null,
-        filiale,
-        jahr,
-        kw
-      });
-    }
-
-    // Admin/Supervisor only route -> keine Redaction nötig
-    return res.json(viewRes.rows[0]);
-  } catch (err) {
-    console.error('Fehler PUT /api/budget/:jahr/:kw/umsatz:', err.message);
-    return res.status(500).json({ message: 'Serverfehler (Budget WRITE).' });
-  }
-});
-
-// =====================================================
-// MS4 – BOOKINGS
-// =====================================================
-
-// GET /api/budget/:jahr/:kw/bookings
-router.get('/:jahr/:kw/bookings', verifyToken(), async (req, res) => {
-  if (!enforceFilialeForCentral(req, res)) return;
-
-  const { role } = req.user || {};
-  const jahr = parseIntStrict(req.params.jahr);
-  const kw = parseIntStrict(req.params.kw);
-  const filiale = resolveFiliale(req);
-
-  if (!jahr || !kw) {
-    return res.status(400).json({ message: 'Ungültige Parameter: jahr und kw müssen Integer sein.' });
-  }
-  if (kw < 1 || kw > 53) {
-    return res.status(400).json({ message: 'Ungültige Kalenderwoche (kw muss 1..53 sein).' });
-  }
-  if (!filiale) {
-    return res.status(400).json({ message: 'Filiale fehlt – Zugriff nicht möglich.' });
-  }
-
-  const typFilterRaw = typeof req.query.typ === 'string' ? req.query.typ.trim() : '';
-  const typFilter = typFilterRaw ? typFilterRaw : null;
-  if (typFilter && !BOOKING_TYPES.includes(typFilter)) {
-    return res.status(400).json({ message: `Ungültiger typ-Filter. Erlaubt: ${BOOKING_TYPES.join(', ')}` });
-  }
+  if (!filiale) return res.status(400).json({ message: 'Filiale konnte nicht ermittelt werden.' });
+  if (!jahr || !kw) return res.status(400).json({ message: 'jahr und kw sind erforderlich.' });
 
   try {
     const client = await pool.connect();
     try {
-      const weekBudgetIdRes = await client.query(
-        `
-          SELECT id
-          FROM budget.week_budgets
-          WHERE filiale = $1 AND jahr = $2 AND kw = $3
-          LIMIT 1
-        `,
-        [filiale, jahr, kw]
-      );
-
-      const weekSummaryRaw = await fetchWeekSummary(client, filiale, jahr, kw);
-      const weekSummary = redactWeekSummaryForRole(weekSummaryRaw, role);
-
-      if (weekBudgetIdRes.rows.length === 0) {
-        return res.json({
-          filiale,
-          jahr,
-          kw,
-          bookings: [],
-          week_summary: weekSummary
-        });
-      }
-
-      const weekBudgetId = weekBudgetIdRes.rows[0].id;
-
-      const bookingsRes = await client.query(
-        `
-          SELECT
-            b.id,
-            b.week_budget_id,
-            b.datum,
-            b.typ,
-            b.betrag,
-            b.lieferant,
-            b.aktion_nr,
-            b.beschreibung,
-            b.von_filiale,
-            b.an_filiale,
-            b.status,
-            b.bestaetigt_von,
-            b.bestaetigt_am,
-            b.created_by,
-            b.created_at
-          FROM budget.bookings b
-          WHERE b.week_budget_id = $1
-            AND ($2::text IS NULL OR b.typ = $2::text)
-          ORDER BY b.created_at DESC
-        `,
-        [weekBudgetId, typFilter]
-      );
-
-      const filtered = bookingsRes.rows.filter((row) => canReadBookingType(role, row.typ));
-
-      return res.json({
-        filiale,
-        jahr,
-        kw,
-        bookings: filtered,
-        week_summary: weekSummary
-      });
+      const raw = await fetchWeekSummary(client, filiale, jahr, kw);
+      const weekSummary = redactWeekSummaryForRole(raw, role);
+      return res.json(weekSummary);
     } finally {
       client.release();
     }
-  } catch (err) {
-    console.error('Fehler GET /api/budget/:jahr/:kw/bookings:', err.message);
-    return res.status(500).json({ message: 'Serverfehler (Bookings READ).' });
+  } catch (e) {
+    console.error('Fehler GET /api/budget/week-summary:', e.message);
+    return res.status(500).json({ message: 'Serverfehler (Week Summary).' });
   }
 });
 
-// POST /api/budget/:jahr/:kw/bookings
-router.post('/:jahr/:kw/bookings', verifyToken(), async (req, res) => {
+// =====================================================
+// Umsatz Vorwoche speichern / upsert week_budgets
+// =====================================================
+
+// PUT /api/budget/umsatz-vorwoche
+// Body: { jahr, kw, umsatz_vorwoche_brutto }
+router.put('/umsatz-vorwoche', verifyToken(), async (req, res) => {
+  const { role, filiale: tokenFiliale } = req.user || {};
+
+  // Nur Admin/Supervisor dürfen Umsatz Vorwoche setzen (wie bisher)
+  if (!isAdminOrSupervisor(role)) {
+    return res.status(403).json({ message: 'Zugriff verweigert: Nur Admin/Supervisor dürfen Umsatz Vorwoche setzen.' });
+  }
+
+  // Zentral: Filiale muss gesetzt sein (verbindlich)
   if (!enforceFilialeForCentral(req, res)) return;
 
-  const { role, filiale: tokenFiliale } = req.user || {};
-  const jahr = parseIntStrict(req.params.jahr);
-  const kw = parseIntStrict(req.params.kw);
   const filiale = resolveFiliale(req);
+  const jahr = parseIntSafe(req.body?.jahr);
+  const kw = parseIntSafe(req.body?.kw);
+  const umsatz = parseNumericSafe(req.body?.umsatz_vorwoche_brutto);
 
-  if (!jahr || !kw) {
-    return res.status(400).json({ message: 'Ungültige Parameter: jahr und kw müssen Integer sein.' });
-  }
-  if (kw < 1 || kw > 53) {
-    return res.status(400).json({ message: 'Ungültige Kalenderwoche (kw muss 1..53 sein).' });
-  }
-  if (!filiale) {
-    return res.status(400).json({ message: 'Filiale fehlt – Zugriff nicht möglich.' });
-  }
-
-  const typ = parseTextRequired(req.body?.typ);
-  if (!typ || !BOOKING_TYPES.includes(typ)) {
-    return res.status(400).json({ message: `Ungültiger Body: typ muss einer von ${BOOKING_TYPES.join(', ')} sein.` });
-  }
-
-  if (isFilialeRole(role) && normalizeFiliale(tokenFiliale) && filiale !== normalizeFiliale(tokenFiliale)) {
-    return res.status(403).json({ message: 'Zugriff verweigert: Filialuser darf nur in eigener Filiale schreiben.' });
-  }
-
-  if (!canWriteBookingType(role, typ)) {
-    return res.status(403).json({ message: `Zugriff verweigert: Rolle darf typ='${typ}' nicht anlegen.` });
-  }
-
-  const betrag = parseNumericNonZero(req.body?.betrag);
-  if (betrag === null) {
-    return res.status(400).json({ message: 'Ungültiger Body: betrag muss eine Zahl sein und darf nicht 0 sein.' });
-  }
-
-  const beschreibung = parseTextRequired(req.body?.beschreibung);
-  if (!beschreibung) {
-    return res.status(400).json({ message: 'Ungültiger Body: beschreibung ist Pflicht.' });
-  }
-
-  const datum = parseDateOptional(req.body?.datum);
-  if (req.body?.datum !== undefined && req.body?.datum !== null && datum === null) {
-    return res.status(400).json({ message: 'Ungültiger Body: datum muss YYYY-MM-DD sein (oder weglassen).' });
-  }
-
-  const lieferant = parseTextOptional(req.body?.lieferant);
-  const aktion_nr = parseTextOptional(req.body?.aktion_nr);
-  const von_filiale = parseTextOptional(req.body?.von_filiale);
-  const an_filiale = parseTextOptional(req.body?.an_filiale);
-
-  const createdBy = getActor(req);
+  if (!filiale) return res.status(400).json({ message: 'Filiale konnte nicht ermittelt werden.' });
+  if (!jahr || !kw) return res.status(400).json({ message: 'jahr und kw sind erforderlich.' });
+  if (umsatz === null) return res.status(400).json({ message: 'umsatz_vorwoche_brutto ist erforderlich.' });
 
   try {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
 
-      const weekBudgetId = await ensureWeekBudgetId(client, filiale, jahr, kw);
-
-      const insertRes = await client.query(
+      // week_budget upsert (umsatz + timestamp)
+      const upsert = await client.query(
         `
-          INSERT INTO budget.bookings
-            (week_budget_id, datum, typ, betrag, lieferant, aktion_nr, beschreibung, von_filiale, an_filiale, created_by)
-          VALUES
-            ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-          RETURNING
-            id, week_budget_id, datum, typ, betrag, lieferant, aktion_nr, beschreibung, von_filiale, an_filiale,
-            status, bestaetigt_von, bestaetigt_am, created_by, created_at
+          INSERT INTO budget.week_budgets (filiale, jahr, kw, umsatz_vorwoche_brutto, freigegeben, created_at, updated_at)
+          VALUES ($1, $2, $3, $4, COALESCE((SELECT freigegeben FROM budget.week_budgets WHERE filiale=$1 AND jahr=$2 AND kw=$3 LIMIT 1), false), NOW(), NOW())
+          ON CONFLICT (filiale, jahr, kw)
+          DO UPDATE SET
+            umsatz_vorwoche_brutto = EXCLUDED.umsatz_vorwoche_brutto,
+            updated_at = NOW()
+          RETURNING id, filiale, jahr, kw
         `,
-        [weekBudgetId, datum, typ, betrag, lieferant, aktion_nr, beschreibung, von_filiale, an_filiale, createdBy]
+        [filiale, jahr, kw, umsatz]
       );
+
+      const wb = upsert.rows[0];
 
       const weekSummaryRaw = await fetchWeekSummary(client, filiale, jahr, kw);
       const weekSummary = redactWeekSummaryForRole(weekSummaryRaw, role);
 
       await client.query('COMMIT');
-      return res.status(201).json({
-        booking: insertRes.rows[0],
+
+      return res.json({
+        message: 'Umsatz Vorwoche gespeichert.',
+        week_budget: wb,
         week_summary: weekSummary
       });
     } catch (e) {
       await client.query('ROLLBACK');
-
-      if (e.message === 'NO_WEEK_RULES') {
-        return res.status(404).json({
-          message: 'Keine week_rules gefunden für jahr/kw – Booking nicht möglich.',
-          jahr,
-          kw
-        });
-      }
-
-      console.error('Fehler POST /api/budget/:jahr/:kw/bookings:', e.message);
-      return res.status(500).json({ message: 'Serverfehler (Bookings CREATE).' });
+      console.error('Fehler PUT /api/budget/umsatz-vorwoche:', e.message);
+      return res.status(500).json({ message: 'Serverfehler (Umsatz Vorwoche).' });
     } finally {
       client.release();
     }
-  } catch (err) {
-    console.error('Fehler POST /api/budget/:jahr/:kw/bookings (connect):', err.message);
-    return res.status(500).json({ message: 'Serverfehler (Bookings CREATE).' });
+  } catch (e) {
+    console.error('Fehler PUT /api/budget/umsatz-vorwoche (connect):', e.message);
+    return res.status(500).json({ message: 'Serverfehler (Umsatz Vorwoche connect).' });
+  }
+});
+
+// =====================================================
+// Bookings (MS4)
+// =====================================================
+
+// GET /api/budget/bookings?jahr=2026&kw=2[&filiale=Münster]
+router.get('/bookings', verifyToken(), async (req, res) => {
+  const { role } = req.user || {};
+
+  // Zentral: Filiale muss gesetzt sein
+  if (!enforceFilialeForCentral(req, res)) return;
+
+  const filiale = resolveFiliale(req);
+  const jahr = parseIntSafe(req.query?.jahr);
+  const kw = parseIntSafe(req.query?.kw);
+
+  if (!filiale) return res.status(400).json({ message: 'Filiale konnte nicht ermittelt werden.' });
+  if (!jahr || !kw) return res.status(400).json({ message: 'jahr und kw sind erforderlich.' });
+
+  try {
+    const result = await pool.query(
+      `
+        SELECT b.*
+        FROM budget.bookings b
+        JOIN budget.week_budgets wb ON wb.id = b.week_budget_id
+        WHERE wb.filiale = $1 AND wb.jahr = $2 AND wb.kw = $3
+        ORDER BY b.created_at DESC
+      `,
+      [filiale, jahr, kw]
+    );
+
+    // Zusätzliche Typ-Filter (Sicherheit)
+    const safe = result.rows.filter((r) => canReadBookingType(role, r.typ));
+    return res.json(safe);
+  } catch (e) {
+    console.error('Fehler GET /api/budget/bookings:', e.message);
+    return res.status(500).json({ message: 'Serverfehler (Bookings GET).' });
+  }
+});
+
+// POST /api/budget/bookings
+router.post('/bookings', verifyToken(), async (req, res) => {
+  const { role, filiale: tokenFiliale } = req.user || {};
+
+  // Zentral: Filiale muss gesetzt sein
+  if (!enforceFilialeForCentral(req, res)) return;
+
+  const filiale = resolveFiliale(req);
+  const jahr = parseIntSafe(req.body?.jahr);
+  const kw = parseIntSafe(req.body?.kw);
+
+  const datum = req.body?.datum;
+  const typ = req.body?.typ;
+  const betrag = parseNumericSafe(req.body?.betrag);
+  const lieferant = req.body?.lieferant || null;
+  const aktion_nr = req.body?.aktion_nr || null;
+  const beschreibung = req.body?.beschreibung || null;
+  const von_filiale = req.body?.von_filiale || null;
+  const an_filiale = req.body?.an_filiale || null;
+  const status = req.body?.status || 'offen';
+
+  if (!filiale) return res.status(400).json({ message: 'Filiale konnte nicht ermittelt werden.' });
+  if (!jahr || !kw) return res.status(400).json({ message: 'jahr und kw sind erforderlich.' });
+  if (!typ || !BOOKING_TYPES.includes(typ)) return res.status(400).json({ message: 'typ ist ungültig.' });
+  if (betrag === null) return res.status(400).json({ message: 'betrag ist erforderlich.' });
+  if (!datum) return res.status(400).json({ message: 'datum ist erforderlich.' });
+
+  if (!canWriteBookingType(role, typ)) {
+    return res.status(403).json({ message: `Zugriff verweigert: Rolle darf typ='${typ}' nicht anlegen.` });
+  }
+
+  // Filiale darf nur für eigene Filiale "bestellung" schreiben
+  if (typ === 'bestellung' && isFilialeRole(role)) {
+    const tf = normalizeFiliale(tokenFiliale);
+    if (tf && filiale !== tf) {
+      return res.status(403).json({ message: 'Zugriff verweigert: Filialuser darf nur eigene Bestellungen anlegen.' });
+    }
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // week_budget sicherstellen (falls noch nicht vorhanden)
+    const wbRes = await client.query(
+      `
+        INSERT INTO budget.week_budgets (filiale, jahr, kw, freigegeben, created_at, updated_at)
+        VALUES ($1, $2, $3, false, NOW(), NOW())
+        ON CONFLICT (filiale, jahr, kw)
+        DO UPDATE SET updated_at = NOW()
+        RETURNING id
+      `,
+      [filiale, jahr, kw]
+    );
+    const week_budget_id = wbRes.rows[0].id;
+
+    const ins = await client.query(
+      `
+        INSERT INTO budget.bookings
+          (week_budget_id, datum, typ, betrag, lieferant, aktion_nr, beschreibung, von_filiale, an_filiale, status, created_by, created_at)
+        VALUES
+          ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+        RETURNING *
+      `,
+      [
+        week_budget_id,
+        datum,
+        typ,
+        betrag,
+        lieferant,
+        aktion_nr,
+        beschreibung,
+        von_filiale,
+        an_filiale,
+        status,
+        req.user?.name || 'unknown'
+      ]
+    );
+
+    const weekSummaryRaw = await fetchWeekSummary(client, filiale, jahr, kw);
+    const weekSummary = redactWeekSummaryForRole(weekSummaryRaw, role);
+
+    await client.query('COMMIT');
+
+    return res.json({
+      message: 'Booking angelegt.',
+      booking: ins.rows[0],
+      week_summary: weekSummary
+    });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('Fehler POST /api/budget/bookings:', e.message);
+    return res.status(500).json({ message: 'Serverfehler (Bookings POST).' });
+  } finally {
+    client.release();
   }
 });
 
 // PUT /api/budget/bookings/:id
 router.put('/bookings/:id', verifyToken(), async (req, res) => {
   const { role, filiale: tokenFiliale } = req.user || {};
-  const bookingId = typeof req.params.id === 'string' ? req.params.id.trim() : '';
+  const bookingId = req.params.id;
 
-  if (!bookingId) {
-    return res.status(400).json({ message: 'Ungültige Parameter: id fehlt.' });
-  }
+  // Zentral: Filiale muss gesetzt sein
+  if (!enforceFilialeForCentral(req, res)) return;
 
-  const betrag = parseNumericNonZero(req.body?.betrag);
-  if (betrag === null) {
-    return res.status(400).json({ message: 'Ungültiger Body: betrag muss eine Zahl sein und darf nicht 0 sein.' });
-  }
-
-  const beschreibung = parseTextRequired(req.body?.beschreibung);
-  if (!beschreibung) {
-    return res.status(400).json({ message: 'Ungültiger Body: beschreibung ist Pflicht.' });
-  }
-
-  const datum = parseDateOptional(req.body?.datum);
-  if (req.body?.datum !== undefined && req.body?.datum !== null && datum === null) {
-    return res.status(400).json({ message: 'Ungültiger Body: datum muss YYYY-MM-DD sein (oder weglassen).' });
-  }
-
-  const lieferant = parseTextOptional(req.body?.lieferant);
-  const aktion_nr = parseTextOptional(req.body?.aktion_nr);
-  const von_filiale = parseTextOptional(req.body?.von_filiale);
-  const an_filiale = parseTextOptional(req.body?.an_filiale);
-
+  // Wir holen erst die aktuelle Booking + Kontext, dann prüfen wir Rechte.
+  const client = await pool.connect();
   try {
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
+    await client.query('BEGIN');
 
-      const curRes = await client.query(
-        `
-          SELECT
-            b.id,
-            b.week_budget_id,
-            b.typ,
-            wb.filiale,
-            wb.jahr,
-            wb.kw
-          FROM budget.bookings b
-          JOIN budget.week_budgets wb ON wb.id = b.week_budget_id
-          WHERE b.id = $1
-          LIMIT 1
-        `,
-        [bookingId]
-      );
+    const curRes = await client.query(
+      `
+        SELECT
+          b.id,
+          b.week_budget_id,
+          b.typ,
+          wb.filiale,
+          wb.jahr,
+          wb.kw
+        FROM budget.bookings b
+        JOIN budget.week_budgets wb ON wb.id = b.week_budget_id
+        WHERE b.id = $1
+        LIMIT 1
+      `,
+      [bookingId]
+    );
 
-      if (curRes.rows.length === 0) {
-        await client.query('ROLLBACK');
-        return res.status(404).json({ message: 'Booking nicht gefunden.' });
-      }
-
-      const current = curRes.rows[0];
-
-      if (!canWriteBookingType(role, current.typ)) {
-        await client.query('ROLLBACK');
-        return res.status(403).json({ message: `Zugriff verweigert: Rolle darf typ='${current.typ}' nicht bearbeiten.` });
-      }
-
-      if (
-        current.typ === 'bestellung' &&
-        isFilialeRole(role) &&
-        normalizeFiliale(tokenFiliale) &&
-        current.filiale !== normalizeFiliale(tokenFiliale)
-      ) {
-        await client.query('ROLLBACK');
-        return res.status(403).json({ message: 'Zugriff verweigert: Filialuser darf nur eigene Bestellungen bearbeiten.' });
-      }
-
-      const updRes = await client.query(
-        `
-          UPDATE budget.bookings
-          SET
-            betrag = $2,
-            beschreibung = $3,
-            datum = $4,
-            lieferant = $5,
-            aktion_nr = $6,
-            von_filiale = $7,
-            an_filiale = $8
-          WHERE id = $1
-          RETURNING
-            id, week_budget_id, datum, typ, betrag, lieferant, aktion_nr, beschreibung, von_filiale, an_filiale,
-            status, bestaetigt_von, bestaetigt_am, created_by, created_at
-        `,
-        [bookingId, betrag, beschreibung, datum, lieferant, aktion_nr, von_filiale, an_filiale]
-      );
-
-      const weekSummaryRaw = await fetchWeekSummary(client, current.filiale, current.jahr, current.kw);
-      const weekSummary = redactWeekSummaryForRole(weekSummaryRaw, role);
-
-      await client.query('COMMIT');
-      return res.json({
-        booking: updRes.rows[0],
-        week_summary: weekSummary
-      });
-    } catch (e) {
+    if (curRes.rows.length === 0) {
       await client.query('ROLLBACK');
-      console.error('Fehler PUT /api/budget/bookings/:id:', e.message);
-      return res.status(500).json({ message: 'Serverfehler (Bookings UPDATE).' });
-    } finally {
-      client.release();
+      return res.status(404).json({ message: 'Booking nicht gefunden.' });
     }
-  } catch (err) {
-    console.error('Fehler PUT /api/budget/bookings/:id (connect):', err.message);
-    return res.status(500).json({ message: 'Serverfehler (Bookings UPDATE).' });
+
+    const current = curRes.rows[0];
+
+    if (!canWriteBookingType(role, current.typ)) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ message: `Zugriff verweigert: Rolle darf typ='${current.typ}' nicht ändern.` });
+    }
+
+    if (
+      current.typ === 'bestellung' &&
+      isFilialeRole(role) &&
+      normalizeFiliale(tokenFiliale) &&
+      current.filiale !== normalizeFiliale(tokenFiliale)
+    ) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ message: 'Zugriff verweigert: Filialuser darf nur eigene Bestellungen ändern.' });
+    }
+
+    const fields = ['datum', 'betrag', 'lieferant', 'aktion_nr', 'beschreibung', 'von_filiale', 'an_filiale', 'status'];
+    const updates = [];
+    const values = [];
+    let idx = 1;
+
+    for (const f of fields) {
+      if (req.body[f] !== undefined) {
+        updates.push(`${f} = $${idx++}`);
+        values.push(req.body[f]);
+      }
+    }
+
+    if (updates.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'Keine Felder zum Aktualisieren übergeben.' });
+    }
+
+    values.push(bookingId);
+
+    const upd = await client.query(
+      `
+        UPDATE budget.bookings
+        SET ${updates.join(', ')}
+        WHERE id = $${idx}
+        RETURNING *
+      `,
+      values
+    );
+
+    const weekSummaryRaw = await fetchWeekSummary(client, current.filiale, current.jahr, current.kw);
+    const weekSummary = redactWeekSummaryForRole(weekSummaryRaw, role);
+
+    await client.query('COMMIT');
+
+    return res.json({
+      message: 'Booking aktualisiert.',
+      booking: upd.rows[0],
+      week_summary: weekSummary
+    });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('Fehler PUT /api/budget/bookings/:id:', e.message);
+    return res.status(500).json({ message: 'Serverfehler (Bookings PUT).' });
+  } finally {
+    client.release();
   }
 });
 
 // DELETE /api/budget/bookings/:id
 router.delete('/bookings/:id', verifyToken(), async (req, res) => {
   const { role, filiale: tokenFiliale } = req.user || {};
-  const bookingId = typeof req.params.id === 'string' ? req.params.id.trim() : '';
+  const bookingId = req.params.id;
 
-  if (!bookingId) {
-    return res.status(400).json({ message: 'Ungültige Parameter: id fehlt.' });
-  }
+  // Zentral: Filiale muss gesetzt sein
+  if (!enforceFilialeForCentral(req, res)) return;
 
+  const client = await pool.connect();
   try {
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
+    await client.query('BEGIN');
 
-      const curRes = await client.query(
-        `
-          SELECT
-            b.id,
-            b.week_budget_id,
-            b.typ,
-            wb.filiale,
-            wb.jahr,
-            wb.kw
-          FROM budget.bookings b
-          JOIN budget.week_budgets wb ON wb.id = b.week_budget_id
-          WHERE b.id = $1
-          LIMIT 1
-        `,
-        [bookingId]
-      );
+    const curRes = await client.query(
+      `
+        SELECT
+          b.id,
+          b.week_budget_id,
+          b.typ,
+          wb.filiale,
+          wb.jahr,
+          wb.kw
+        FROM budget.bookings b
+        JOIN budget.week_budgets wb ON wb.id = b.week_budget_id
+        WHERE b.id = $1
+        LIMIT 1
+      `,
+      [bookingId]
+    );
 
-      if (curRes.rows.length === 0) {
-        await client.query('ROLLBACK');
-        return res.status(404).json({ message: 'Booking nicht gefunden.' });
-      }
-
-      const current = curRes.rows[0];
-
-      if (!canWriteBookingType(role, current.typ)) {
-        await client.query('ROLLBACK');
-        return res.status(403).json({ message: `Zugriff verweigert: Rolle darf typ='${current.typ}' nicht löschen.` });
-      }
-
-      if (
-        current.typ === 'bestellung' &&
-        isFilialeRole(role) &&
-        normalizeFiliale(tokenFiliale) &&
-        current.filiale !== normalizeFiliale(tokenFiliale)
-      ) {
-        await client.query('ROLLBACK');
-        return res.status(403).json({ message: 'Zugriff verweigert: Filialuser darf nur eigene Bestellungen löschen.' });
-      }
-
-      await client.query(`DELETE FROM budget.bookings WHERE id = $1`, [bookingId]);
-
-      const weekSummaryRaw = await fetchWeekSummary(client, current.filiale, current.jahr, current.kw);
-      const weekSummary = redactWeekSummaryForRole(weekSummaryRaw, role);
-
-      await client.query('COMMIT');
-      return res.json({
-        message: 'Booking gelöscht.',
-        week_summary: weekSummary
-      });
-    } catch (e) {
+    if (curRes.rows.length === 0) {
       await client.query('ROLLBACK');
-      console.error('Fehler DELETE /api/budget/bookings/:id:', e.message);
-      return res.status(500).json({ message: 'Serverfehler (Bookings DELETE).' });
-    } finally {
-      client.release();
+      return res.status(404).json({ message: 'Booking nicht gefunden.' });
     }
-  } catch (err) {
-    console.error('Fehler DELETE /api/budget/bookings/:id (connect):', err.message);
+
+    const current = curRes.rows[0];
+
+    if (!canWriteBookingType(role, current.typ)) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ message: `Zugriff verweigert: Rolle darf typ='${current.typ}' nicht löschen.` });
+    }
+
+    if (
+      current.typ === 'bestellung' &&
+      isFilialeRole(role) &&
+      normalizeFiliale(tokenFiliale) &&
+      current.filiale !== normalizeFiliale(tokenFiliale)
+    ) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ message: 'Zugriff verweigert: Filialuser darf nur eigene Bestellungen löschen.' });
+    }
+
+    await client.query(`DELETE FROM budget.bookings WHERE id = $1`, [bookingId]);
+
+    const weekSummaryRaw = await fetchWeekSummary(client, current.filiale, current.jahr, current.kw);
+    const weekSummary = redactWeekSummaryForRole(weekSummaryRaw, role);
+
+    await client.query('COMMIT');
+
+    return res.json({
+      message: 'Booking gelöscht.',
+      week_summary: weekSummary
+    });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('Fehler DELETE /api/budget/bookings/:id:', e.message);
     return res.status(500).json({ message: 'Serverfehler (Bookings DELETE).' });
+  } finally {
+    client.release();
   }
 });
 
