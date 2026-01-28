@@ -1,11 +1,10 @@
-// routes/reklamationen.js – V1.1.3 (SodaFixx-Regeln + Tracking-Unique + ReklaNr-Unique Handling)
+// routes/reklamationen.js – V1.1.2+ (SodaFixx-Regeln + XX Tracking-Unique Handling)
 // - lfd_nr Vergabe: pro Filiale + Jahr (Jahr aus Anlegedatum `datum`, nicht Serverjahr)
 // - Counter initialisiert/absichert sich automatisch aus MAX(lfd_nr) in der DB
 // - Transaktionssicher (SELECT ... FOR UPDATE)
 // - Edit-Fall B: bestehende lfd_nr bleiben, neue Positionen bekommen neue
 // - Notiz-Feld (notiz) via PATCH, inkl. notiz_von + notiz_am automatisch
-// - SodaFixx-Regeln (Regel 1/3) + Duplicate Tracking (Regel 2 via DB Unique Index)
-// - Duplicate Reklamationsnummer (rekla_nr) via DB UNIQUE CONSTRAINT -> 409 mit Filiale im Text
+// - Neu: SodaFixx-Regeln (Regel 1/3) + Duplicate Tracking (Regel 2 via DB Unique Index)
 
 const express = require('express');
 const router = express.Router();
@@ -97,55 +96,15 @@ function validateSodaFixxCartonMax18(positionen) {
   return { ok: true };
 }
 
-function isUniqueViolation(err) {
-  return !!err && err.code === '23505';
-}
-
-function looksLikeReklaNrUnique(err) {
-  // Constraint-Name:
-  // ALTER TABLE reklamationen ADD CONSTRAINT reklamationen_rekla_nr_unique UNIQUE (rekla_nr);
-  if (!err) return false;
-  if (err.constraint === 'reklamationen_rekla_nr_unique') return true;
-
-  const detail = normText(err.detail).toLowerCase();
-  return detail.includes('key (rekla_nr)=') || detail.includes('(rekla_nr)');
-}
-
-function looksLikeTrackingUnique(err) {
-  if (!err) return false;
-  const detail = normText(err.detail).toLowerCase();
-  return detail.includes('key (tracking_id)=') || detail.includes('(tracking_id)');
-}
-
-async function fetchExistingByReklaNr(reklaNr) {
-  const nr = normText(reklaNr);
-  if (!nr) return null;
-
-  const r = await pool.query(
-    `
-    SELECT id, filiale, rekla_nr
-    FROM reklamationen
-    WHERE rekla_nr = $1
-    LIMIT 1;
-    `,
-    [nr]
-  );
-
-  return r.rows[0] || null;
-}
-
-function buildReklaNrExistsMessage(reklaNr, filiale) {
-  const nr = normText(reklaNr) || '—';
-  const f = normText(filiale) || 'Unbekannt';
-  return `Reklamation mit der Nummer: ${nr} gibt es bereits in der Tabelle "Filiale ${f}"! Bitte wende dich an den Supervisor oder an den Admin. Danke!`;
-}
-
 /**
  * Vergibt lfd_nr blockweise, transaktionssicher (Row-Lock) pro Filiale + Jahr.
+ * - Stellt sicher, dass der Counter mindestens MAX(lfd_nr) der DB ist.
+ * - Liefert Startwert (inkl.) für `count` neue Nummern.
  */
 async function allocateLfdNrBlock(client, filiale, jahr, count) {
   if (!count || count <= 0) return null;
 
+  // 1) Counter-Zeile locken/holen
   await client.query(
     `
     INSERT INTO lfd_nr_counter (filiale, jahr, current_value)
@@ -167,6 +126,7 @@ async function allocateLfdNrBlock(client, filiale, jahr, count) {
 
   const currentVal = Number(lockRes.rows[0]?.current_value ?? 0);
 
+  // 2) MAX(lfd_nr) aus DB prüfen (Sicherheitsnetz)
   const maxRes = await client.query(
     `
     SELECT COALESCE(MAX(lfd_nr), 0) AS max_lfd
@@ -183,6 +143,8 @@ async function allocateLfdNrBlock(client, filiale, jahr, count) {
   const maxLfd = Number(maxRes.rows[0]?.max_lfd ?? 0);
 
   const base = Math.max(currentVal, maxLfd);
+
+  // 3) Counter erhöhen
   const newVal = base + count;
 
   await client.query(
@@ -194,11 +156,15 @@ async function allocateLfdNrBlock(client, filiale, jahr, count) {
     [filiale, jahr, newVal]
   );
 
+  // Startwert für Vergabe
   return base + 1;
 }
 
 /**
- * GET /api/reklamationen
+ * GET /api/reklamationen – Liste nach Rolle/Filiale
+ * Liefert zusätzliche Felder:
+ * - min_lfd_nr: kleinste laufende Nummer je Reklamation
+ * - position_count: Anzahl Positionen je Reklamation
  */
 router.get('/', verifyToken(), async (req, res) => {
   const { role, filiale } = req.user;
@@ -229,7 +195,7 @@ router.get('/', verifyToken(), async (req, res) => {
 });
 
 /**
- * GET /api/reklamationen/:id
+ * GET /api/reklamationen/:id – Detail (Reklamation + Positionen)
  */
 router.get('/:id', verifyToken(), async (req, res) => {
   const { id } = req.params;
@@ -276,6 +242,7 @@ router.get('/:id', verifyToken(), async (req, res) => {
 
 /**
  * POST /api/reklamationen
+ * Neu anlegen (Reklamation + Positionen)
  */
 router.post('/', verifyToken(), async (req, res) => {
   const user = req.user;
@@ -285,6 +252,9 @@ router.post('/', verifyToken(), async (req, res) => {
     return res.status(403).json({ message: 'Nur eigene Filiale anlegbar' });
   }
 
+  // --- SodaFixx Sonderregeln (Backend-hart) ---
+  // Regel 1: SodaFixx => versand immer true + tracking_id Pflicht
+  // Regel 3: SodaFixx => 1 Reklamation = 1 Karton = max 18 Zylinder (Summe aller Positionen)
   const supplierIncoming = data?.lieferant;
   const sodaFixx = isSodaFixx(supplierIncoming);
 
@@ -303,6 +273,7 @@ router.post('/', verifyToken(), async (req, res) => {
       return res.status(400).json({ message: v.message });
     }
   } else {
+    // Non-SodaFixx: tracking_id sauber trimmen (optional), aber nicht erzwingen
     data.tracking_id = normalizeTrackingId(data.tracking_id);
   }
 
@@ -341,13 +312,11 @@ router.post('/', verifyToken(), async (req, res) => {
     const reklamationId = reklaResult.rows[0].id;
 
     const storedDatum = reklaResult.rows[0].datum;
-    const jahr =
-      getYearFromDateValue(storedDatum) ||
-      getYearFromDateValue(data.datum) ||
-      getCurrentYear();
+    const jahr = getYearFromDateValue(storedDatum) || getYearFromDateValue(data.datum) || getCurrentYear();
 
     const positionen = Array.isArray(data.positionen) ? data.positionen : [];
 
+    // lfd_nr Vergabe nur, wenn Positionen vorhanden
     if (positionen.length > 0) {
       const startLfd = await allocateLfdNrBlock(client, filialeFinal, jahr, positionen.length);
 
@@ -392,36 +361,10 @@ router.post('/', verifyToken(), async (req, res) => {
     await client.query('ROLLBACK');
     console.error('Fehler beim Anlegen:', err);
 
-    if (isUniqueViolation(err)) {
-      if (looksLikeReklaNrUnique(err)) {
-        const nr = data?.rekla_nr;
-        try {
-          const existing = await fetchExistingByReklaNr(nr);
-          const msg = buildReklaNrExistsMessage(nr, existing?.filiale);
-          return res.status(409).json({
-            code: 'REKLA_NR_EXISTS',
-            message: msg,
-            existing: existing ? { id: existing.id, filiale: existing.filiale, rekla_nr: existing.rekla_nr } : null,
-          });
-        } catch (lookupErr) {
-          console.error('Fehler beim Lookup bestehender Rekla-Nr:', lookupErr);
-          return res.status(409).json({
-            code: 'REKLA_NR_EXISTS',
-            message: buildReklaNrExistsMessage(data?.rekla_nr, null),
-          });
-        }
-      }
-
-      if (looksLikeTrackingUnique(err)) {
-        return res.status(409).json({
-          code: 'TRACKING_ID_EXISTS',
-          message: 'Tracking-ID bereits vorhanden (muss global eindeutig sein).',
-        });
-      }
-
+    // Unique Tracking-ID (Regel 2) – DB wirft 23505
+    if (err && err.code === '23505') {
       return res.status(409).json({
-        code: 'UNIQUE_VIOLATION',
-        message: 'Datensatz existiert bereits (Unique-Regel verletzt).',
+        message: 'Tracking-ID bereits vorhanden (muss global eindeutig sein).',
       });
     }
 
@@ -433,6 +376,10 @@ router.post('/', verifyToken(), async (req, res) => {
 
 /**
  * PUT /api/reklamationen/:id
+ * Komplett bearbeiten (Reklamation + Positionen ersetzen)
+ * Nur Admin/Supervisor
+ *
+ * Fall B: lfd_nr bleibt stabil.
  */
 router.put('/:id', verifyToken(), async (req, res) => {
   const { id } = req.params;
@@ -450,6 +397,9 @@ router.put('/:id', verifyToken(), async (req, res) => {
   try {
     await client.query('BEGIN');
 
+    // --- SodaFixx Sonderregeln (Backend-hart) ---
+    // Regel 1: SodaFixx => versand immer true + tracking_id Pflicht
+    // Regel 3: SodaFixx => 1 Reklamation = 1 Karton = max 18 Zylinder (Summe aller Positionen)
     const existingReklaRes = await client.query(
       'SELECT lieferant, tracking_id FROM reklamationen WHERE id = $1',
       [id]
@@ -615,34 +565,10 @@ router.put('/:id', verifyToken(), async (req, res) => {
     await client.query('ROLLBACK');
     console.error('Fehler beim Bearbeiten:', err);
 
-    if (isUniqueViolation(err)) {
-      if (looksLikeReklaNrUnique(err)) {
-        try {
-          const existing = await fetchExistingByReklaNr(data?.rekla_nr);
-          return res.status(409).json({
-            code: 'REKLA_NR_EXISTS',
-            message: buildReklaNrExistsMessage(data?.rekla_nr, existing?.filiale),
-            existing: existing ? { id: existing.id, filiale: existing.filiale, rekla_nr: existing.rekla_nr } : null,
-          });
-        } catch (lookupErr) {
-          console.error('Fehler beim Lookup bestehender Rekla-Nr:', lookupErr);
-          return res.status(409).json({
-            code: 'REKLA_NR_EXISTS',
-            message: buildReklaNrExistsMessage(data?.rekla_nr, null),
-          });
-        }
-      }
-
-      if (looksLikeTrackingUnique(err)) {
-        return res.status(409).json({
-          code: 'TRACKING_ID_EXISTS',
-          message: 'Tracking-ID bereits vorhanden (muss global eindeutig sein).',
-        });
-      }
-
+    // Unique Tracking-ID (Regel 2) – DB wirft 23505
+    if (err && err.code === '23505') {
       return res.status(409).json({
-        code: 'UNIQUE_VIOLATION',
-        message: 'Datensatz existiert bereits (Unique-Regel verletzt).',
+        message: 'Tracking-ID bereits vorhanden (muss global eindeutig sein).',
       });
     }
 
@@ -654,6 +580,8 @@ router.put('/:id', verifyToken(), async (req, res) => {
 
 /**
  * PATCH /api/reklamationen/:id
+ * Teil-Update: status, versand, tracking_id, ls_nummer_grund, notiz
+ * Nur Admin/Supervisor
  */
 router.patch('/:id', verifyToken(), async (req, res) => {
   const { id } = req.params;
@@ -681,6 +609,7 @@ router.patch('/:id', verifyToken(), async (req, res) => {
     const sodaFixx = isSodaFixx(existing?.lieferant);
     const existingTrackingNorm = normalizeTrackingId(existing?.tracking_id);
 
+    // SodaFixx: tracking_id darf nie leer sein (Regel 1)
     if (sodaFixx && updates.tracking_id === undefined && !existingTrackingNorm) {
       await client.query('ROLLBACK');
       return res.status(400).json({
@@ -688,10 +617,12 @@ router.patch('/:id', verifyToken(), async (req, res) => {
       });
     }
 
+    // SodaFixx: versand ist immer true (Regel 1)
     if (sodaFixx && updates.versand !== undefined) {
       updates.versand = true;
     }
 
+    // Normalize tracking id (trim) und SodaFixx-Pflicht prüfen
     if (updates.tracking_id !== undefined) {
       const norm = normalizeTrackingId(updates.tracking_id);
 
@@ -710,9 +641,12 @@ router.patch('/:id', verifyToken(), async (req, res) => {
     const values = [];
     let paramIndex = 1;
 
+    let touchedNote = false;
+
     for (const field of allowedFields) {
       if (updates[field] !== undefined) {
         if (field === 'notiz') {
+          touchedNote = true;
           const trimmed = normText(updates.notiz);
           const finalNote = trimmed.length > 0 ? trimmed : null;
 
@@ -738,7 +672,9 @@ router.patch('/:id', verifyToken(), async (req, res) => {
       return res.status(400).json({ message: 'Keine gültigen Felder zum Updaten' });
     }
 
+    // Audit + letzte_aenderung immer setzen
     setClauses.push(`letzte_aenderung = CURRENT_DATE`);
+
     values.push(id);
 
     const query = `
@@ -748,7 +684,7 @@ router.patch('/:id', verifyToken(), async (req, res) => {
       RETURNING id;
     `;
 
-    await client.query(query, values);
+    const updRes = await client.query(query, values);
 
     await client.query('COMMIT');
 
@@ -761,17 +697,10 @@ router.patch('/:id', verifyToken(), async (req, res) => {
     await client.query('ROLLBACK');
     console.error('Fehler beim PATCH:', err);
 
-    if (isUniqueViolation(err)) {
-      if (looksLikeTrackingUnique(err)) {
-        return res.status(409).json({
-          code: 'TRACKING_ID_EXISTS',
-          message: 'Tracking-ID bereits vorhanden (muss global eindeutig sein).',
-        });
-      }
-
+    // Unique Tracking-ID (Regel 2) – DB wirft 23505
+    if (err && err.code === '23505') {
       return res.status(409).json({
-        code: 'UNIQUE_VIOLATION',
-        message: 'Datensatz existiert bereits (Unique-Regel verletzt).',
+        message: 'Tracking-ID bereits vorhanden (muss global eindeutig sein).',
       });
     }
 
@@ -783,6 +712,7 @@ router.patch('/:id', verifyToken(), async (req, res) => {
 
 /**
  * DELETE /api/reklamationen/:id
+ * Nur Admin/Supervisor
  */
 router.delete('/:id', verifyToken(), async (req, res) => {
   const { id } = req.params;
