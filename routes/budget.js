@@ -55,35 +55,50 @@ function normalizeFiliale(value) {
   if (!t) return null;
   return t;
 }
+// Zentral-User können die Filiale übergeben via:
+// - Query:   ?filiale=XYZ
+// - Header:  x-filiale: XYZ
+// - Body:    { filiale: "XYZ" }
+function getRequestedFiliale(req) {
+  const q = normalizeFiliale(req.query?.filiale);
+  if (q) return q;
+
+  const h = normalizeFiliale(req.headers?.['x-filiale']);
+  if (h) return h;
+
+  const b = normalizeFiliale(req.body?.filiale);
+  if (b) return b;
+
+  return null;
+}
+
 
 function resolveFiliale(req) {
   // Sonderregel:
   // - Filiale-User: Filiale aus JWT
-  // - Zentral-User: Filiale MUSS via ?filiale=XYZ kommen
+  // - Zentral-User: Filiale MUSS explizit übergeben werden (Query/Header/Body)
   const { role, filiale: tokenFiliale } = req.user || {};
-  const queryFiliale = normalizeFiliale(req.query?.filiale);
 
   if (isFilialeRole(role)) {
     return normalizeFiliale(tokenFiliale);
   }
 
-  // Zentral: zwingend Query
-  return queryFiliale;
+  return getRequestedFiliale(req);
 }
 
 function enforceFilialeForCentral(req, res) {
   const { role } = req.user || {};
   if (isCentralRole(role)) {
-    const f = normalizeFiliale(req.query?.filiale);
+    const f = getRequestedFiliale(req);
     if (!f) {
       res.status(400).json({
-        message: 'Filiale fehlt: Für zentrale Rollen muss ?filiale=XYZ gesetzt sein.'
+        message: 'Filiale fehlt: Für zentrale Rollen muss eine Filiale explizit gesetzt sein (?filiale=XYZ oder Header x-filiale oder Body filiale).'
       });
       return false;
     }
     if (f.toLowerCase() === 'alle') {
       res.status(400).json({
-        message: 'Ungültige Filiale: "Alle" ist im Budget-Kontext nicht erlaubt. Bitte ?filiale=XYZ setzen.'
+        message: 'Ungültige Filiale: "Alle" ist im Budget-Kontext nicht erlaubt. Bitte eine echte Filiale setzen.'
       });
       return false;
     }
@@ -250,28 +265,44 @@ router.put('/rules', verifyToken(), async (req, res) => {
       [jahr, kw, prozentsatz, mwst_faktor]
     );
 
+    let ruleRow = null;
+    let message = 'Rule aktualisiert.';
+
     if (upd.rows.length > 0) {
-      await client.query('COMMIT');
-      return res.json({
-        message: 'Rule aktualisiert.',
-        rule: upd.rows[0]
-      });
+      ruleRow = upd.rows[0];
+    } else {
+      // 2) Insert falls noch nicht vorhanden
+      const ins = await client.query(
+        `
+          INSERT INTO budget.week_rules (jahr, kw, prozentsatz, mwst_faktor, gueltig_ab, gueltig_bis, updated_at)
+          VALUES ($1, $2, $3, COALESCE($4, 1.19), NULL, NULL, NOW())
+          RETURNING jahr, kw, prozentsatz, mwst_faktor, gueltig_ab, gueltig_bis, updated_at
+        `,
+        [jahr, kw, prozentsatz, mwst_faktor]
+      );
+      ruleRow = ins.rows[0];
+      message = 'Rule angelegt.';
     }
 
-    // 2) Insert falls noch nicht vorhanden
-    const ins = await client.query(
+    // V1: Wenn week_budgets für diese Woche bereits existieren, aber nur mit Platzhalter-Snapshot (0),
+    // ziehen wir den Snapshot automatisch nach (nur solange NICHT freigegeben).
+    await client.query(
       `
-        INSERT INTO budget.week_rules (jahr, kw, prozentsatz, mwst_faktor, gueltig_ab, gueltig_bis, updated_at)
-        VALUES ($1, $2, $3, COALESCE($4, 1.19), NULL, NULL, NOW())
-        RETURNING jahr, kw, prozentsatz, mwst_faktor, gueltig_ab, gueltig_bis, updated_at
+        UPDATE budget.week_budgets
+        SET prozentsatz_snapshot = $3,
+            updated_at = NOW()
+        WHERE jahr = $1
+          AND kw = $2
+          AND freigegeben = false
+          AND prozentsatz_snapshot = 0
       `,
-      [jahr, kw, prozentsatz, mwst_faktor]
+      [jahr, kw, prozentsatz]
     );
 
     await client.query('COMMIT');
     return res.json({
-      message: 'Rule angelegt.',
-      rule: ins.rows[0]
+      message,
+      rule: ruleRow
     });
   } catch (e) {
     await client.query('ROLLBACK');
@@ -349,11 +380,20 @@ router.put('/umsatz-vorwoche', verifyToken(), async (req, res) => {
       // week_budget upsert (umsatz + timestamp)
       const upsert = await client.query(
         `
-          INSERT INTO budget.week_budgets (filiale, jahr, kw, umsatz_vorwoche_brutto, freigegeben, created_at, updated_at)
-          VALUES ($1, $2, $3, $4, COALESCE((SELECT freigegeben FROM budget.week_budgets WHERE filiale=$1 AND jahr=$2 AND kw=$3 LIMIT 1), false), NOW(), NOW())
+          INSERT INTO budget.week_budgets (filiale, jahr, kw, umsatz_vorwoche_brutto, prozentsatz_snapshot, freigegeben, created_at, updated_at)
+          VALUES (
+            $1, $2, $3, $4,
+            COALESCE((SELECT prozentsatz FROM budget.week_rules WHERE jahr = $2 AND kw = $3 LIMIT 1), 0),
+            COALESCE((SELECT freigegeben FROM budget.week_budgets WHERE filiale=$1 AND jahr=$2 AND kw=$3 LIMIT 1), false),
+            NOW(), NOW()
+          )
           ON CONFLICT (filiale, jahr, kw)
           DO UPDATE SET
             umsatz_vorwoche_brutto = EXCLUDED.umsatz_vorwoche_brutto,
+            prozentsatz_snapshot = CASE
+              WHEN budget.week_budgets.prozentsatz_snapshot = 0 THEN EXCLUDED.prozentsatz_snapshot
+              ELSE budget.week_budgets.prozentsatz_snapshot
+            END,
             updated_at = NOW()
           RETURNING id, filiale, jahr, kw
         `,
@@ -470,10 +510,19 @@ router.post('/bookings', verifyToken(), async (req, res) => {
     // week_budget sicherstellen (falls noch nicht vorhanden)
     const wbRes = await client.query(
       `
-        INSERT INTO budget.week_budgets (filiale, jahr, kw, freigegeben, created_at, updated_at)
-        VALUES ($1, $2, $3, false, NOW(), NOW())
+        INSERT INTO budget.week_budgets (filiale, jahr, kw, prozentsatz_snapshot, freigegeben, created_at, updated_at)
+        VALUES (
+          $1, $2, $3,
+          COALESCE((SELECT prozentsatz FROM budget.week_rules WHERE jahr = $2 AND kw = $3 LIMIT 1), 0),
+          false, NOW(), NOW()
+        )
         ON CONFLICT (filiale, jahr, kw)
-        DO UPDATE SET updated_at = NOW()
+        DO UPDATE SET
+          prozentsatz_snapshot = CASE
+            WHEN budget.week_budgets.prozentsatz_snapshot = 0 THEN EXCLUDED.prozentsatz_snapshot
+            ELSE budget.week_budgets.prozentsatz_snapshot
+          END,
+          updated_at = NOW()
         RETURNING id
       `,
       [filiale, jahr, kw]
