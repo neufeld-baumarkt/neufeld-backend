@@ -11,7 +11,7 @@
 // - View wird NICHT beschrieben
 //
 // Sonderregel (verbindlich):
-// - Wenn role !== "Filiale": dann MUSS eine Filiale explizit per ?filiale=XYZ angegeben werden.
+// - Wenn role !== "Filiale": dann MUSS eine Filiale explizit gesetzt sein.
 //   (Damit verhindern wir, dass Zentral-User versehentlich in "Alle" schreiben/lesen.)
 //
 // Sicherheitsregel (verbindlich):
@@ -55,6 +55,7 @@ function normalizeFiliale(value) {
   if (!t) return null;
   return t;
 }
+
 // Zentral-User können die Filiale übergeben via:
 // - Query:   ?filiale=XYZ
 // - Header:  x-filiale: XYZ
@@ -71,7 +72,6 @@ function getRequestedFiliale(req) {
 
   return null;
 }
-
 
 function resolveFiliale(req) {
   // Sonderregel:
@@ -92,7 +92,8 @@ function enforceFilialeForCentral(req, res) {
     const f = getRequestedFiliale(req);
     if (!f) {
       res.status(400).json({
-        message: 'Filiale fehlt: Für zentrale Rollen muss eine Filiale explizit gesetzt sein (?filiale=XYZ oder Header x-filiale oder Body filiale).'
+        message:
+          'Filiale fehlt: Für zentrale Rollen muss eine Filiale explizit gesetzt sein (?filiale=XYZ oder Header x-filiale oder Body filiale).'
       });
       return false;
     }
@@ -137,7 +138,6 @@ function redactWeekSummaryForRole(row, role) {
   if (!row) return row;
   if (!isFilialeRole(role)) return row;
 
-  // Clone & remove sensitive rule fields
   const clean = { ...row };
 
   // View-Felder (effektiv / snapshot / global)
@@ -159,7 +159,6 @@ function redactWeekSummaryForRole(row, role) {
 // =====================================================
 
 async function fetchWeekSummary(client, filiale, jahr, kw) {
-  // ✅ NEU: Option 1 View mit Global-Regeln + YTD
   const viewRes = await client.query(
     `
       SELECT *
@@ -252,7 +251,6 @@ router.put('/rules', verifyToken(), async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // 1) Update versuchen
     const upd = await client.query(
       `
         UPDATE budget.week_rules
@@ -271,7 +269,6 @@ router.put('/rules', verifyToken(), async (req, res) => {
     if (upd.rows.length > 0) {
       ruleRow = upd.rows[0];
     } else {
-      // 2) Insert falls noch nicht vorhanden
       const ins = await client.query(
         `
           INSERT INTO budget.week_rules (jahr, kw, prozentsatz, mwst_faktor, gueltig_ab, gueltig_bis, updated_at)
@@ -284,8 +281,7 @@ router.put('/rules', verifyToken(), async (req, res) => {
       message = 'Rule angelegt.';
     }
 
-    // V1: Wenn week_budgets für diese Woche bereits existieren, aber nur mit Platzhalter-Snapshot (0),
-    // ziehen wir den Snapshot automatisch nach (nur solange NICHT freigegeben).
+    // V1: Snapshot nachziehen, falls nur Platzhalter (0) vorhanden ist und noch nicht freigegeben
     await client.query(
       `
         UPDATE budget.week_budgets
@@ -321,7 +317,6 @@ router.put('/rules', verifyToken(), async (req, res) => {
 router.get('/week-summary', verifyToken(), async (req, res) => {
   const { role } = req.user || {};
 
-  // Zentral: Filiale muss gesetzt sein
   if (!enforceFilialeForCentral(req, res)) return;
 
   const filiale = resolveFiliale(req);
@@ -353,14 +348,12 @@ router.get('/week-summary', verifyToken(), async (req, res) => {
 // PUT /api/budget/umsatz-vorwoche
 // Body: { jahr, kw, umsatz_vorwoche_brutto }
 router.put('/umsatz-vorwoche', verifyToken(), async (req, res) => {
-  const { role, filiale: tokenFiliale } = req.user || {};
+  const { role } = req.user || {};
 
-  // Nur Admin/Supervisor dürfen Umsatz Vorwoche setzen (wie bisher)
   if (!isAdminOrSupervisor(role)) {
     return res.status(403).json({ message: 'Zugriff verweigert: Nur Admin/Supervisor dürfen Umsatz Vorwoche setzen.' });
   }
 
-  // Zentral: Filiale muss gesetzt sein (verbindlich)
   if (!enforceFilialeForCentral(req, res)) return;
 
   const filiale = resolveFiliale(req);
@@ -377,7 +370,6 @@ router.put('/umsatz-vorwoche', verifyToken(), async (req, res) => {
     try {
       await client.query('BEGIN');
 
-      // week_budget upsert (umsatz + timestamp)
       const upsert = await client.query(
         `
           INSERT INTO budget.week_budgets (filiale, jahr, kw, umsatz_vorwoche_brutto, prozentsatz_snapshot, freigegeben, created_at, updated_at)
@@ -433,7 +425,6 @@ router.put('/umsatz-vorwoche', verifyToken(), async (req, res) => {
 router.get('/bookings', verifyToken(), async (req, res) => {
   const { role } = req.user || {};
 
-  // Zentral: Filiale muss gesetzt sein
   if (!enforceFilialeForCentral(req, res)) return;
 
   const filiale = resolveFiliale(req);
@@ -450,12 +441,14 @@ router.get('/bookings', verifyToken(), async (req, res) => {
         FROM budget.bookings b
         JOIN budget.week_budgets wb ON wb.id = b.week_budget_id
         WHERE wb.filiale = $1 AND wb.jahr = $2 AND wb.kw = $3
-        ORDER BY b.created_at DESC
+        ORDER BY
+          b.datum DESC,
+          b.created_at DESC,
+          b.id DESC
       `,
       [filiale, jahr, kw]
     );
 
-    // Zusätzliche Typ-Filter (Sicherheit)
     const safe = result.rows.filter((r) => canReadBookingType(role, r.typ));
     return res.json(safe);
   } catch (e) {
@@ -468,7 +461,6 @@ router.get('/bookings', verifyToken(), async (req, res) => {
 router.post('/bookings', verifyToken(), async (req, res) => {
   const { role, filiale: tokenFiliale } = req.user || {};
 
-  // Zentral: Filiale muss gesetzt sein
   if (!enforceFilialeForCentral(req, res)) return;
 
   const filiale = resolveFiliale(req);
@@ -495,7 +487,6 @@ router.post('/bookings', verifyToken(), async (req, res) => {
     return res.status(403).json({ message: `Zugriff verweigert: Rolle darf typ='${typ}' nicht anlegen.` });
   }
 
-  // Filiale darf nur für eigene Filiale "bestellung" schreiben
   if (typ === 'bestellung' && isFilialeRole(role)) {
     const tf = normalizeFiliale(tokenFiliale);
     if (tf && filiale !== tf) {
@@ -507,7 +498,6 @@ router.post('/bookings', verifyToken(), async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // week_budget sicherstellen (falls noch nicht vorhanden)
     const wbRes = await client.query(
       `
         INSERT INTO budget.week_budgets (filiale, jahr, kw, prozentsatz_snapshot, freigegeben, created_at, updated_at)
@@ -576,10 +566,8 @@ router.put('/bookings/:id', verifyToken(), async (req, res) => {
   const { role, filiale: tokenFiliale } = req.user || {};
   const bookingId = req.params.id;
 
-  // Zentral: Filiale muss gesetzt sein
   if (!enforceFilialeForCentral(req, res)) return;
 
-  // Wir holen erst die aktuelle Booking + Kontext, dann prüfen wir Rechte.
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -676,7 +664,6 @@ router.delete('/bookings/:id', verifyToken(), async (req, res) => {
   const { role, filiale: tokenFiliale } = req.user || {};
   const bookingId = req.params.id;
 
-  // Zentral: Filiale muss gesetzt sein
   if (!enforceFilialeForCentral(req, res)) return;
 
   const client = await pool.connect();
