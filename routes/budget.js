@@ -37,6 +37,9 @@ const ROLE_FILIALE = 'Filiale';
 
 const BOOKING_TYPES = ['bestellung', 'aktionsvorab', 'abgabe', 'korrektur'];
 
+const SOURCE_BESTELLUNG = 'BESTELLUNG';
+const SOURCE_AKTION = 'AKTION';
+
 function isFilialeRole(role) {
   return role === ROLE_FILIALE;
 }
@@ -54,6 +57,19 @@ function normalizeFiliale(value) {
   const t = value.trim();
   if (!t) return null;
   return t;
+}
+
+function normalizeTextOrNull(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'string') return null;
+  const t = value.trim();
+  return t ? t : null;
+}
+
+// source wird strikt aus aktion_nr abgeleitet (DB-Constraint ist aktiv)
+function deriveSourceFromAktionNr(aktionNr) {
+  const a = normalizeTextOrNull(aktionNr);
+  return a ? SOURCE_AKTION : SOURCE_BESTELLUNG;
 }
 
 // Zentral-User können die Filiale übergeben via:
@@ -490,12 +506,22 @@ router.post('/bookings', verifyToken(), async (req, res) => {
     return res.status(403).json({ message: `Zugriff verweigert: Rolle darf typ='${typ}' nicht anlegen.` });
   }
 
+  // Fachlogik: Aktionsvorab MUSS eine aktion_nr haben, Bestellung DARF keine haben
+  if (typ === 'aktionsvorab' && !normalizeTextOrNull(aktion_nr)) {
+    return res.status(400).json({ message: "aktion_nr ist erforderlich für typ='aktionsvorab'." });
+  }
+  if (typ === 'bestellung' && normalizeTextOrNull(aktion_nr)) {
+    return res.status(400).json({ message: "aktion_nr ist unzulässig für typ='bestellung'." });
+  }
+
   if (typ === 'bestellung' && isFilialeRole(role)) {
     const tf = normalizeFiliale(tokenFiliale);
     if (tf && filiale !== tf) {
       return res.status(403).json({ message: 'Zugriff verweigert: Filialuser darf nur eigene Bestellungen anlegen.' });
     }
   }
+
+  const source = deriveSourceFromAktionNr(aktion_nr);
 
   const client = await pool.connect();
   try {
@@ -525,9 +551,9 @@ router.post('/bookings', verifyToken(), async (req, res) => {
     const ins = await client.query(
       `
         INSERT INTO budget.bookings
-          (week_budget_id, datum, typ, betrag, lieferant, aktion_nr, beschreibung, von_filiale, an_filiale, status, created_by, created_at)
+          (week_budget_id, datum, typ, betrag, lieferant, aktion_nr, beschreibung, von_filiale, an_filiale, status, created_by, created_at, source)
         VALUES
-          ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+          ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), $12)
         RETURNING *
       `,
       [
@@ -541,7 +567,8 @@ router.post('/bookings', verifyToken(), async (req, res) => {
         von_filiale,
         an_filiale,
         status,
-        req.user?.name || 'unknown'
+        req.user?.name || 'unknown',
+        source
       ]
     );
 
@@ -581,6 +608,7 @@ router.put('/bookings/:id', verifyToken(), async (req, res) => {
           b.id,
           b.week_budget_id,
           b.typ,
+          b.aktion_nr,
           wb.filiale,
           wb.jahr,
           wb.kw
@@ -614,7 +642,13 @@ router.put('/bookings/:id', verifyToken(), async (req, res) => {
       return res.status(403).json({ message: 'Zugriff verweigert: Filialuser darf nur eigene Bestellungen ändern.' });
     }
 
-    const fields = ['datum', 'betrag', 'lieferant', 'aktion_nr', 'beschreibung', 'von_filiale', 'an_filiale', 'status'];
+    // "source" ist nicht direkt editierbar (wird aus aktion_nr abgeleitet)
+    if (req.body?.source !== undefined) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: "source kann nicht direkt gesetzt werden (wird aus aktion_nr abgeleitet)." });
+    }
+
+    const fields = ['datum', 'betrag', 'lieferant', 'beschreibung', 'von_filiale', 'an_filiale', 'status'];
     const updates = [];
     const values = [];
     let idx = 1;
@@ -626,7 +660,33 @@ router.put('/bookings/:id', verifyToken(), async (req, res) => {
       }
     }
 
-    if (updates.length === 0) {
+    // aktion_nr ist special: wenn gesetzt/geändert → source automatisch nachziehen + typ-Regeln prüfen
+    let aktionNrFinal = current.aktion_nr;
+    let aktionNrTouched = false;
+
+    if (req.body.aktion_nr !== undefined) {
+      aktionNrTouched = true;
+      aktionNrFinal = req.body.aktion_nr || null;
+
+      // typ-Regeln
+      if (current.typ === 'aktionsvorab' && !normalizeTextOrNull(aktionNrFinal)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: "aktion_nr ist erforderlich für typ='aktionsvorab'." });
+      }
+      if (current.typ === 'bestellung' && normalizeTextOrNull(aktionNrFinal)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: "aktion_nr ist unzulässig für typ='bestellung'." });
+      }
+
+      updates.push(`aktion_nr = $${idx++}`);
+      values.push(aktionNrFinal);
+
+      const sourceFinal = deriveSourceFromAktionNr(aktionNrFinal);
+      updates.push(`source = $${idx++}`);
+      values.push(sourceFinal);
+    }
+
+    if (updates.length === 0 && !aktionNrTouched) {
       await client.query('ROLLBACK');
       return res.status(400).json({ message: 'Keine Felder zum Aktualisieren übergeben.' });
     }
