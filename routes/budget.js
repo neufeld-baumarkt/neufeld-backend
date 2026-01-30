@@ -151,6 +151,9 @@ function redactWeekSummaryForRole(row, role) {
   // YTD-Felder, die indirekt den Satz verraten würden
   delete clean.budget_satz_ytd_prozent;
 
+  // ✅ NEU: Ist-Verbrauchsquote YTD ist intern (nicht für Filiale)
+  delete clean.ist_verbrauch_satz_ytd_prozent;
+
   return clean;
 }
 
@@ -317,6 +320,7 @@ router.put('/rules', verifyToken(), async (req, res) => {
 router.get('/week-summary', verifyToken(), async (req, res) => {
   const { role } = req.user || {};
 
+  if (!enforceFilialeForCentral(req, res)) return;
 
   const filiale = resolveFiliale(req);
   const jahr = parseIntSafe(req.query?.jahr);
@@ -353,6 +357,7 @@ router.put('/umsatz-vorwoche', verifyToken(), async (req, res) => {
     return res.status(403).json({ message: 'Zugriff verweigert: Nur Admin/Supervisor dürfen Umsatz Vorwoche setzen.' });
   }
 
+  if (!enforceFilialeForCentral(req, res)) return;
 
   const filiale = resolveFiliale(req);
   const jahr = parseIntSafe(req.body?.jahr);
@@ -423,6 +428,7 @@ router.put('/umsatz-vorwoche', verifyToken(), async (req, res) => {
 router.get('/bookings', verifyToken(), async (req, res) => {
   const { role } = req.user || {};
 
+  if (!enforceFilialeForCentral(req, res)) return;
 
   const filiale = resolveFiliale(req);
   const jahr = parseIntSafe(req.query?.jahr);
@@ -458,6 +464,7 @@ router.get('/bookings', verifyToken(), async (req, res) => {
 router.post('/bookings', verifyToken(), async (req, res) => {
   const { role, filiale: tokenFiliale } = req.user || {};
 
+  if (!enforceFilialeForCentral(req, res)) return;
 
   const filiale = resolveFiliale(req);
   const jahr = parseIntSafe(req.body?.jahr);
@@ -562,6 +569,7 @@ router.put('/bookings/:id', verifyToken(), async (req, res) => {
   const { role, filiale: tokenFiliale } = req.user || {};
   const bookingId = req.params.id;
 
+  if (!enforceFilialeForCentral(req, res)) return;
 
   const client = await pool.connect();
   try {
@@ -659,6 +667,7 @@ router.delete('/bookings/:id', verifyToken(), async (req, res) => {
   const { role, filiale: tokenFiliale } = req.user || {};
   const bookingId = req.params.id;
 
+  if (!enforceFilialeForCentral(req, res)) return;
 
   const client = await pool.connect();
   try {
