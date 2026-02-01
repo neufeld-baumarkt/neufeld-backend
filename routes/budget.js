@@ -531,9 +531,12 @@ router.post('/bookings/split', verifyToken(), async (req, res) => {
   const beschreibung = req.body?.beschreibung || null;
   const status = req.body?.status || 'offen';
 
-  // Split-Felder sind im normalen CRUD verboten
-  if (req.body?.gesamtbetrag !== undefined || req.body?.parent_booking_id !== undefined || req.body?.split_group_id !== undefined) {
-    return res.status(400).json({ message: 'Split-Felder (gesamtbetrag/parent_booking_id/split_group_id) sind hier unzulässig. Nutze /bookings/split.' });
+  // ✅ FIX: Im Split-Endpoint ist "gesamtbetrag" Pflicht und DARF NICHT geblockt werden.
+  //        Nur serverseitige Split-Systemfelder bleiben unzulässig.
+  if (req.body?.parent_booking_id !== undefined || req.body?.split_group_id !== undefined) {
+    return res.status(400).json({
+      message: 'Felder (parent_booking_id/split_group_id) sind hier unzulässig. Diese werden serverseitig gesetzt.'
+    });
   }
 
   if (!datum) return res.status(400).json({ message: 'datum ist erforderlich.' });
