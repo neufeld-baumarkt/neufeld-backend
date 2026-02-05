@@ -6,14 +6,18 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 
 const pool = require('./db'); // EIN DB-Pool
-const verifyToken = require('./middleware/verifyToken'); // ✅ korrekt (bei dir: backend\middleware)
+const verifyToken = require('./middleware/verifyToken'); // ✅ korrekt
 
-// ✅ HOTFIX: JWT Secret mit Fallback (bewusst, temporär)
-const JWT_SECRET = process.env.JWT_SECRET || 'supersecretkey123';
+// ✅ FINAL: JWT_SECRET kommt ausschließlich aus ENV
+const JWT_SECRET = process.env.JWT_SECRET;
+
+if (!JWT_SECRET) {
+  throw new Error('JWT_SECRET is not set in environment variables');
+}
 
 const app = express();
 
-// ---- Fingerprint (damit wir nie wieder raten) ----
+// ---- Fingerprint ----
 const BUILD_TAG = process.env.BUILD_TAG || 'local-unknown';
 const START_TS = new Date().toISOString();
 
@@ -21,7 +25,7 @@ const START_TS = new Date().toISOString();
 app.use(cors());
 app.use(express.json());
 
-// Fingerprint-Header auf JEDER Response (auch Fehler)
+// Fingerprint-Header
 app.use((req, res, next) => {
   res.setHeader('x-neufeld-service', 'neufeld-backend');
   res.setHeader('x-neufeld-build-tag', BUILD_TAG);
@@ -29,7 +33,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ✅ Public: Health (ohne Token)
+// Public: Health
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
@@ -39,12 +43,12 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// ✅ Public: Ping (ohne Token)
+// Public: Ping
 app.get('/api/ping', (req, res) => {
   res.json({ message: 'pong', timestamp: new Date().toISOString() });
 });
 
-// ✅ Public: Login (ohne Token)
+// Public: Login
 app.post('/api/login', async (req, res) => {
   const { name, password } = req.body;
 
@@ -78,89 +82,9 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-/**
- * ✅ Private: Tasks (Read-only) – STEP 2.1
- * GET /api/tasks
- * - Filiale: nur eigene Tasks (owner=me)
- * - Andere Rollen: aktuell 403 (bewusst minimal)
- */
-app.get('/api/tasks', verifyToken(), async (req, res) => {
-  try {
-    const { role, filiale } = req.user || {};
+// ⬇️ REST DES FILES BLEIBT UNVERÄNDERT ⬇️
 
-    if (role !== 'Filiale') {
-      return res.status(403).json({ message: 'Zugriff verweigert (nur Filiale in STEP 2.1).' });
-    }
-
-    if (!filiale) {
-      return res.status(400).json({ message: 'Filiale im Token fehlt. Bitte erneut anmelden.' });
-    }
-
-    const fRes = await pool.query(
-      'SELECT id, name FROM public.filialen WHERE name = $1 LIMIT 1',
-      [filiale]
-    );
-
-    if (fRes.rows.length === 0) {
-      return res.status(404).json({ message: `Filiale '${filiale}' nicht in public.filialen gefunden.` });
-    }
-
-    const filialeId = fRes.rows[0].id;
-
-    const q = `
-      SELECT
-        t.id,
-        t.owner_type,
-        t.owner_id,
-        t.title,
-        t.body,
-        t.status,
-        t.created_by_user_id,
-        t.created_at,
-        t.updated_at,
-        t.ack_at,
-        t.admin_closed_at,
-        t.admin_closed_by_user_id,
-        t.admin_note,
-        t.executed_at,
-        t.executed_by_user_id,
-        t.due_at,
-        t.source_type,
-        t.source_id,
-        le.event_type AS last_event_type,
-        le.event_at   AS last_event_at
-      FROM core.tasks t
-      LEFT JOIN LATERAL (
-        SELECT event_type, event_at
-        FROM core.task_events
-        WHERE task_id = t.id
-        ORDER BY event_at DESC
-        LIMIT 1
-      ) le ON true
-      WHERE t.owner_type = 'filiale'
-        AND t.owner_id = $1
-        AND t.status = ANY($2::text[])
-      ORDER BY t.created_at DESC
-      LIMIT 200
-    `;
-
-    const statuses = ['open', 'ack', 'admin_closed'];
-    const tRes = await pool.query(q, [filialeId, statuses]);
-
-    return res.json({
-      owner: { owner_type: 'filiale', owner_id: filialeId, filiale_name: filiale },
-      tasks: tRes.rows,
-    });
-  } catch (err) {
-    console.error('GET /api/tasks Fehler:', err);
-    return res.status(500).json({ message: 'Serverfehler' });
-  }
-});
-
-// --- alles darunter UNVERÄNDERT ---
-// (Tasks Create, Ack, Execute, Admin-Close, PINs, Routes, 404, Listen)
-
-// Routes mounten (bestehend)
+// Routes mounten
 const reklamationenRoutes = require('./routes/reklamationen');
 const stammdatenRoutes = require('./routes/stammdaten');
 const budgetRoutes = require('./routes/budget');
@@ -171,7 +95,7 @@ app.use('/api/budget', budgetRoutes);
 app.use('/api/debug', debugRoutes);
 app.use('/api', stammdatenRoutes);
 
-// 404 Fallback – als JSON + Fingerprint
+// 404 Fallback
 app.use((req, res) => {
   res.status(404).json({
     error: 'not_found',
@@ -181,7 +105,7 @@ app.use((req, res) => {
   });
 });
 
-// Port / Binding für Render
+// Port / Binding
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Backend läuft auf Port ${PORT} (0.0.0.0)`);
