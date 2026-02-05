@@ -2,3 +2,7 @@
 .env
 .env.*
 
+
+# local backups
+_local_secrets/
+
