@@ -20,8 +20,33 @@ const app = express();
 const BUILD_TAG = process.env.BUILD_TAG || 'local-unknown';
 const START_TS = new Date().toISOString();
 
+// -----------------------------
+// CORS (HARDENED: Whitelist)
+// -----------------------------
+const ALLOWED_ORIGINS = new Set([
+  'https://app.neufeldbaumarkt.de',
+  'http://localhost:3000',
+]);
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    // Requests ohne Origin (z.B. curl/Postman/Server-to-Server) zulassen
+    if (!origin) return callback(null, true);
+
+    if (ALLOWED_ORIGINS.has(origin)) return callback(null, true);
+
+    // Nicht erlaubte Origins: CORS Header werden nicht gesetzt -> Browser blockt
+    return callback(null, false);
+  },
+  methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: false,
+  optionsSuccessStatus: 204,
+};
+
 // Middleware
-app.use(cors());
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions)); // Preflight sauber beantworten
 app.use(express.json());
 
 // Fingerprint-Header auf JEDER Response (auch Fehler)
