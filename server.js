@@ -46,7 +46,7 @@ const corsOptions = {
 
 // Middleware
 app.use(cors(corsOptions));
-app.options('*', cors(corsOptions)); // Preflight sauber beantworten
+app.options(/.*/, cors(corsOptions)); // Preflight sauber beantworten
 app.use(express.json());
 
 // Fingerprint-Header auf JEDER Response (auch Fehler)
