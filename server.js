@@ -39,7 +39,7 @@ const corsOptions = {
     return callback(null, false);
   },
   methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-filiale'],
   credentials: false,
   optionsSuccessStatus: 204,
 };
