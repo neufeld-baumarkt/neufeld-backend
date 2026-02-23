@@ -106,6 +106,77 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
+// ──────────────────────────────────────────────────────────────────────────────
+// USERS (PRIVATE) – aus Backup übernommen (robust umgesetzt)
+// ──────────────────────────────────────────────────────────────────────────────
+// Passwort ändern (z. B. Erstlogin bei force_password_change=true)
+app.post('/api/users/me/change-password', verifyToken(), async (req, res) => {
+  const { oldPassword, newPassword } = req.body || {};
+
+  if (!oldPassword || !newPassword) {
+    return res.status(400).json({ message: 'oldPassword und newPassword sind erforderlich' });
+  }
+
+  if (String(newPassword).length < 8) {
+    return res.status(400).json({ message: 'Neues Passwort muss mindestens 8 Zeichen haben' });
+  }
+
+  try {
+    // Aktuellen User laden
+    const userResult = await pool.query('SELECT * FROM users WHERE id = $1', [req.user.id]);
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ message: 'Benutzer nicht gefunden' });
+    }
+
+    const user = userResult.rows[0];
+
+    // Altes Passwort prüfen
+    const isMatch = await bcrypt.compare(String(oldPassword), user.password);
+    if (!isMatch) {
+      return res.status(401).json({ message: 'Altes Passwort ist falsch' });
+    }
+
+    // Neues Passwort hashen
+    const hashed = await bcrypt.hash(String(newPassword), 10);
+
+    // Versuch 1: inkl. force_password_change (wenn Spalte existiert)
+    try {
+      await pool.query(
+        `
+        UPDATE users
+        SET password = $1,
+            force_password_change = false
+        WHERE id = $2
+      `,
+        [hashed, req.user.id]
+      );
+    } catch (e) {
+      // Fallback: wenn force_password_change-Spalte nicht existiert
+      const msg = String(e?.message || '');
+      const code = String(e?.code || '');
+
+      // Postgres: undefined_column => 42703
+      if (code === '42703' || msg.toLowerCase().includes('force_password_change')) {
+        await pool.query(
+          `
+          UPDATE users
+          SET password = $1
+          WHERE id = $2
+        `,
+          [hashed, req.user.id]
+        );
+      } else {
+        throw e;
+      }
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('Change-Password-Fehler:', err);
+    return res.status(500).json({ message: 'Serverfehler' });
+  }
+});
+
 // --- Helpers ---
 function isCentralRole(role) {
   return ['Admin', 'Supervisor', 'Geschäftsführer', 'Manager-1'].includes(role);
