@@ -902,7 +902,13 @@ router.get('/bookings', verifyToken(), async (req, res) => {
   try {
     const result = await pool.query(
       `
-        SELECT b.*
+        SELECT
+          b.*,
+          EXISTS (
+            SELECT 1
+            FROM budget.booking_splits bs
+            WHERE bs.parent_booking_id = b.id
+          ) AS has_splits
         FROM budget.bookings b
         JOIN budget.week_budgets wb ON wb.id = b.week_budget_id
         WHERE wb.filiale = $1 AND wb.jahr = $2 AND wb.kw = $3
