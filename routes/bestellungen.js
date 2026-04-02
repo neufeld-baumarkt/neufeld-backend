@@ -7,11 +7,9 @@ const verifyToken = require('../middleware/verifyToken');
 /**
  * GET /api/bestellungen
  * Zweck:
- * - Erstes Test-Endpoint für Bestellungen
- * - Verifiziert:
- *   - Routing
- *   - Auth
- *   - Backend-Anbindung
+ * - Erster echter Read-Endpunkt für das Bestellmodul
+ * - Liefert eine stabile Grundstruktur für das Frontend
+ * - Noch bewusst ohne Datenbankzugriff
  */
 router.get('/', verifyToken(), async (req, res) => {
   try {
@@ -19,14 +17,43 @@ router.get('/', verifyToken(), async (req, res) => {
 
     return res.json({
       status: 'ok',
+      module: 'bestellungen',
       message: 'Bestellungen API erreichbar',
+      stage: 'phase-2-read-base',
       user: {
-        id,
-        name,
-        role,
-        filiale,
+        id: id ?? null,
+        name: name ?? null,
+        role: role ?? null,
+        filiale: filiale ?? null,
       },
-      data: [],
+      permissions: {
+        authenticated: true,
+        canRead: true,
+        canWrite: false,
+      },
+      filters: {
+        jahr: null,
+        kw: null,
+        filiale: filiale ?? null,
+      },
+      form: {
+        kopf: {
+          bestellung_id: null,
+          filiale: filiale ?? null,
+          jahr: null,
+          kw: null,
+          lieferant: null,
+          bestelldatum: null,
+          bemerkung: null,
+          status: 'neu',
+        },
+        positionen: [],
+      },
+      meta: {
+        dbConnected: false,
+        source: 'static-read-base',
+        nextStep: 'read-from-db',
+      },
     });
   } catch (err) {
     console.error('GET /api/bestellungen Fehler:', err);
