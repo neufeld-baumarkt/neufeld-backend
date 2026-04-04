@@ -35,9 +35,10 @@ const ROLE_MANAGER_1 = 'Manager-1';
 const ROLE_GF = 'Geschäftsführer';
 const ROLE_FILIALE = 'Filiale';
 
-const BOOKING_TYPES = ['bestellung', 'aktionsvorab', 'abgabe', 'korrektur'];
+const BOOKING_TYPES = ['bestellung', 'sonderbestellung', 'aktionsvorab', 'abgabe', 'korrektur'];
 
 const SOURCE_BESTELLUNG = 'BESTELLUNG';
+const SOURCE_SONDERBESTELLUNG = 'SONDERBESTELLUNG';
 const SOURCE_AKTION = 'AKTION';
 
 function isFilialeRole(role) {
@@ -66,10 +67,18 @@ function normalizeTextOrNull(value) {
   return t ? t : null;
 }
 
-// source wird strikt aus aktion_nr abgeleitet (DB-Constraint ist aktiv)
-function deriveSourceFromAktionNr(aktionNr) {
+function deriveSourceFromBookingType(bookingType, aktionNr) {
   const a = normalizeTextOrNull(aktionNr);
-  return a ? SOURCE_AKTION : SOURCE_BESTELLUNG;
+
+  if (bookingType === 'aktionsvorab') {
+    return SOURCE_AKTION;
+  }
+
+  if (bookingType === 'sonderbestellung') {
+    return SOURCE_SONDERBESTELLUNG;
+  }
+
+  return SOURCE_BESTELLUNG;
 }
 
 // Zentral-User können die Filiale übergeben via:
@@ -129,6 +138,11 @@ function canWriteBookingType(role, bookingType) {
   if (bookingType === 'bestellung') {
     // Filiale (eigene), Supervisor, Admin dürfen schreiben
     return role === ROLE_FILIALE || role === ROLE_SUPERVISOR || role === ROLE_ADMIN;
+  }
+
+  if (bookingType === 'sonderbestellung') {
+    // Jeder User darf Sonderbestellungen anlegen
+    return true;
   }
 
   if (bookingType === 'aktionsvorab') {
@@ -510,7 +524,7 @@ async function fetchAffectedWeekSummaries(client, role, jahr, kw, filialen) {
 
 // POST /api/budget/bookings/split
 router.post('/bookings/split', verifyToken(), async (req, res) => {
-  const { role, name, filiale: tokenFiliale } = req.user || {};
+  const { role, name } = req.user || {};
 
   if (!enforceFilialeForCentral(req, res)) return;
 
@@ -551,8 +565,8 @@ router.post('/bookings/split', verifyToken(), async (req, res) => {
   if (typ === 'aktionsvorab' && !normalizeTextOrNull(aktion_nr)) {
     return res.status(400).json({ message: "aktion_nr ist erforderlich für typ='aktionsvorab'." });
   }
-  if (typ === 'bestellung' && normalizeTextOrNull(aktion_nr)) {
-    return res.status(400).json({ message: "aktion_nr ist unzulässig für typ='bestellung'." });
+  if ((typ === 'bestellung' || typ === 'sonderbestellung') && normalizeTextOrNull(aktion_nr)) {
+    return res.status(400).json({ message: `aktion_nr ist unzulässig für typ='${typ}'.` });
   }
 
   const client = await pool.connect();
@@ -601,7 +615,7 @@ router.post('/bookings/split', verifyToken(), async (req, res) => {
       });
     }
 
-    const sourceFinal = deriveSourceFromAktionNr(aktion_nr);
+    const sourceFinal = deriveSourceFromBookingType(typ, aktion_nr);
 
     const payload = {
       source_week_budget_id: sourceWeekBudgetId,
@@ -963,12 +977,12 @@ router.post('/bookings', verifyToken(), async (req, res) => {
     return res.status(403).json({ message: `Zugriff verweigert: Rolle darf typ='${typ}' nicht anlegen.` });
   }
 
-  // Fachlogik: Aktionsvorab MUSS eine aktion_nr haben, Bestellung DARF keine haben
+  // Fachlogik: Aktionsvorab MUSS eine aktion_nr haben, Bestellung/Sonderbestellung DÜRFEN keine haben
   if (typ === 'aktionsvorab' && !normalizeTextOrNull(aktion_nr)) {
     return res.status(400).json({ message: "aktion_nr ist erforderlich für typ='aktionsvorab'." });
   }
-  if (typ === 'bestellung' && normalizeTextOrNull(aktion_nr)) {
-    return res.status(400).json({ message: "aktion_nr ist unzulässig für typ='bestellung'." });
+  if ((typ === 'bestellung' || typ === 'sonderbestellung') && normalizeTextOrNull(aktion_nr)) {
+    return res.status(400).json({ message: `aktion_nr ist unzulässig für typ='${typ}'.` });
   }
 
   if (typ === 'bestellung' && isFilialeRole(role)) {
@@ -978,7 +992,7 @@ router.post('/bookings', verifyToken(), async (req, res) => {
     }
   }
 
-  const source = deriveSourceFromAktionNr(aktion_nr);
+  const source = deriveSourceFromBookingType(typ, aktion_nr);
 
   const client = await pool.connect();
   try {
@@ -1086,7 +1100,6 @@ router.put('/bookings/:id', verifyToken(), async (req, res) => {
 
     const current = curRes.rows[0];
 
-
     // Split-Schutz: Childs/Parents mit Splits dürfen NICHT über normalen CRUD geändert werden
     if (current.parent_booking_id) {
       await client.query('ROLLBACK');
@@ -1112,10 +1125,10 @@ router.put('/bookings/:id', verifyToken(), async (req, res) => {
       return res.status(403).json({ message: 'Zugriff verweigert: Filialuser darf nur eigene Bestellungen ändern.' });
     }
 
-    // "source" ist nicht direkt editierbar (wird aus aktion_nr abgeleitet)
+    // "source" ist nicht direkt editierbar (wird aus typ + aktion_nr abgeleitet)
     if (req.body?.source !== undefined) {
       await client.query('ROLLBACK');
-      return res.status(400).json({ message: "source kann nicht direkt gesetzt werden (wird aus aktion_nr abgeleitet)." });
+      return res.status(400).json({ message: "source kann nicht direkt gesetzt werden (wird aus typ + aktion_nr abgeleitet)." });
     }
 
     const fields = ['datum', 'betrag', 'lieferant', 'beschreibung', 'von_filiale', 'an_filiale', 'status'];
@@ -1143,15 +1156,15 @@ router.put('/bookings/:id', verifyToken(), async (req, res) => {
         await client.query('ROLLBACK');
         return res.status(400).json({ message: "aktion_nr ist erforderlich für typ='aktionsvorab'." });
       }
-      if (current.typ === 'bestellung' && normalizeTextOrNull(aktionNrFinal)) {
+      if ((current.typ === 'bestellung' || current.typ === 'sonderbestellung') && normalizeTextOrNull(aktionNrFinal)) {
         await client.query('ROLLBACK');
-        return res.status(400).json({ message: "aktion_nr ist unzulässig für typ='bestellung'." });
+        return res.status(400).json({ message: `aktion_nr ist unzulässig für typ='${current.typ}'.` });
       }
 
       updates.push(`aktion_nr = $${idx++}`);
       values.push(aktionNrFinal);
 
-      const sourceFinal = deriveSourceFromAktionNr(aktionNrFinal);
+      const sourceFinal = deriveSourceFromBookingType(current.typ, aktionNrFinal);
       updates.push(`source = $${idx++}`);
       values.push(sourceFinal);
     }
