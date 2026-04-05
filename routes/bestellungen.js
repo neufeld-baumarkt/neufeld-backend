@@ -247,8 +247,7 @@ router.get('/', verifyToken(), async (req, res) => {
         ON p.order_id = o.id
       ${whereSql}
       ORDER BY o.bestelldatum DESC, o.created_at DESC
-      `
-      ,
+      `,
       params
     );
 
@@ -340,6 +339,78 @@ router.get('/lieferanten', verifyToken(), async (req, res) => {
     });
   } catch (err) {
     console.error('GET /api/bestellungen/lieferanten Fehler:', err);
+    return res.status(500).json({ message: 'Serverfehler' });
+  }
+});
+
+/**
+ * GET /api/bestellungen/filialprofil?supplier=<code>
+ * Zweck:
+ * - liefert aktive Filialprofile eines aktiven Lieferanten
+ * - Frontend gibt supplier-code mit
+ * - Backend mappt code -> supplier_id -> Filialprofile
+ */
+router.get('/filialprofil', verifyToken(), async (req, res) => {
+  try {
+    const { supplier } = req.query || {};
+
+    if (!supplier) {
+      return res.status(400).json({ message: 'supplier fehlt' });
+    }
+
+    const supplierResult = await db.query(
+      `
+      SELECT
+        id,
+        name,
+        code,
+        formular_typ
+      FROM "order".order_suppliers
+      WHERE code = $1
+        AND aktiv = true
+      LIMIT 1
+      `,
+      [supplier]
+    );
+
+    if (supplierResult.rows.length === 0) {
+      return res.status(404).json({ message: 'Lieferant nicht gefunden' });
+    }
+
+    const supplierData = supplierResult.rows[0];
+
+    const result = await db.query(
+      `
+      SELECT
+        filiale,
+        firma,
+        strasse,
+        ort,
+        kunden_nr,
+        auftrags_nr,
+        gespraechspartner
+      FROM "order".order_supplier_branch_profiles
+      WHERE supplier_id = $1
+        AND aktiv = true
+      ORDER BY filiale ASC
+      `,
+      [supplierData.id]
+    );
+
+    return res.json({
+      status: 'ok',
+      module: 'bestellungen',
+      message: 'Filialprofile erfolgreich geladen',
+      stage: 'phase-3-filialprofil-read',
+      supplier: supplierData,
+      count: result.rows.length,
+      items: result.rows,
+      meta: {
+        source: 'db-read-order-supplier-branch-profiles',
+      },
+    });
+  } catch (err) {
+    console.error('GET /api/bestellungen/filialprofil Fehler:', err);
     return res.status(500).json({ message: 'Serverfehler' });
   }
 });
