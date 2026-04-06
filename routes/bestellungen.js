@@ -584,6 +584,12 @@ router.get('/artikel-mit-ek', verifyToken(), async (req, res) => {
  * - berechnet Summen DB-seitig innerhalb einer Transaktion
  * - erzeugt zusätzlich die Budgetbuchung (normal oder split)
  *
+ * WICHTIGER FACHSTAND:
+ * - Order und Budget sind zwei getrennte Datensätze
+ * - Order bleibt Nachweis / read-only
+ * - Budget bleibt eigenständig bearbeitbar
+ * - deshalb wird KEINE harte Rückverknüpfung order.order_orders.budget_booking_id gesetzt
+ *
  * Erwarteter Payload:
  * {
  *   "order": {
@@ -751,6 +757,34 @@ router.post('/', verifyToken(), async (req, res) => {
 
     const supplierData = supplierResult.rows[0];
 
+    const profileResult = await client.query(
+      `
+      SELECT
+        filiale,
+        firma,
+        strasse,
+        ort,
+        kunden_nr,
+        auftrags_nr,
+        gespraechspartner
+      FROM "order".order_supplier_branch_profiles
+      WHERE supplier_id = $1
+        AND filiale = $2
+        AND aktiv = true
+      LIMIT 1
+      `,
+      [supplierData.id, effectiveFiliale]
+    );
+
+    if (profileResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({
+        message: `Kein aktives Filialprofil für Lieferant ${supplierData.code} und Filiale ${effectiveFiliale} gefunden`,
+      });
+    }
+
+    const profileData = profileResult.rows[0];
+
     const orderInsertResult = await client.query(
       `
       INSERT INTO "order".order_orders (
@@ -770,7 +804,7 @@ router.post('/', verifyToken(), async (req, res) => {
         gespraechspartner_snapshot
       )
       VALUES (
-        $1, $2, $3, $4::date, $5, 0, NULL, $6, NULL, NULL, NULL, NULL, NULL, NULL
+        $1, $2, $3, $4::date, $5, 0, NULL, $6, $7, $8, $9, $10, $11, $12
       )
       RETURNING
         id,
@@ -792,6 +826,12 @@ router.post('/', verifyToken(), async (req, res) => {
         bestelldatum,
         orderStatus,
         supplierData.formular_typ,
+        profileData.firma,
+        profileData.kunden_nr,
+        profileData.strasse,
+        profileData.ort,
+        profileData.auftrags_nr,
+        profileData.gespraechspartner,
       ]
     );
 
@@ -1019,31 +1059,6 @@ router.post('/', verifyToken(), async (req, res) => {
       budgetBookingId = bookingInsertResult.rows[0].id;
     }
 
-    const finalOrderWithBudgetResult = await client.query(
-      `
-      UPDATE "order".order_orders
-      SET
-        budget_booking_id = $2,
-        updated_at = now()
-      WHERE id = $1
-      RETURNING
-        id,
-        supplier_id,
-        filiale,
-        ordered_by_name,
-        bestelldatum,
-        status,
-        gesamtsumme_netto,
-        budget_booking_id,
-        supplier_formular_typ_snapshot,
-        created_at,
-        updated_at
-      `,
-      [orderRow.id, budgetBookingId]
-    );
-
-    const finalOrderWithBudget = finalOrderWithBudgetResult.rows[0];
-
     await client.query('COMMIT');
 
     return res.status(201).json({
@@ -1051,7 +1066,7 @@ router.post('/', verifyToken(), async (req, res) => {
       module: 'bestellungen',
       message: 'Bestellung erfolgreich gespeichert',
       stage: 'phase-2-write-order-save',
-      order: finalOrderWithBudget,
+      order: finalOrder,
       supplier: {
         id: supplierData.id,
         name: supplierData.name,
@@ -1065,6 +1080,7 @@ router.post('/', verifyToken(), async (req, res) => {
         budgetBookingCreated: true,
         budgetBookingId: budgetBookingId,
         budgetBookingKind: normalizedSplits.length > 0 ? 'split-parent' : 'booking',
+        orderBudgetLinked: false,
       },
     });
   } catch (err) {
