@@ -81,6 +81,60 @@ function deriveSourceFromBookingType(bookingType, aktionNr) {
   return SOURCE_BESTELLUNG;
 }
 
+function parseAktionsvorabTargetFromAktionNr(aktionNrRaw) {
+  const aktionNr = normalizeTextOrNull(aktionNrRaw);
+
+  if (!aktionNr) {
+    return {
+      ok: false,
+      message: "aktion_nr ist erforderlich für typ='aktionsvorab'."
+    };
+  }
+
+  if (aktionNr.length !== 6) {
+    return {
+      ok: false,
+      message:
+        "aktion_nr ist ungültig: Erwartet werden exakt 6 Zeichen (z. B. A02645 oder S02645)."
+    };
+  }
+
+  const yearPart = aktionNr.slice(2, 4);
+  const kwPart = aktionNr.slice(4, 6);
+
+  if (!/^\d{2}$/.test(yearPart) || !/^\d{2}$/.test(kwPart)) {
+    return {
+      ok: false,
+      message:
+        "aktion_nr ist ungültig: Stellen 3-4 müssen das Jahr und Stellen 5-6 die KW enthalten."
+    };
+  }
+
+  const jahr = 2000 + Number(yearPart);
+  const kw = Number(kwPart);
+
+  if (!Number.isInteger(jahr) || jahr < 2000 || jahr > 2099) {
+    return {
+      ok: false,
+      message: 'aktion_nr ist ungültig: Jahr konnte nicht fachlich abgeleitet werden.'
+    };
+  }
+
+  if (!Number.isInteger(kw) || kw < 1 || kw > 53) {
+    return {
+      ok: false,
+      message: 'aktion_nr ist ungültig: KW muss zwischen 01 und 53 liegen.'
+    };
+  }
+
+  return {
+    ok: true,
+    jahr,
+    kw,
+    aktion_nr: aktionNr
+  };
+}
+
 // Zentral-User können die Filiale übergeben via:
 // - Query:   ?filiale=XYZ
 // - Header:  x-filiale: XYZ
@@ -528,8 +582,8 @@ router.post('/bookings/split', verifyToken(), async (req, res) => {
 
   if (!enforceFilialeForCentral(req, res)) return;
 
-  const jahr = parseIntSafe(req.body?.jahr);
-  const kw = parseIntSafe(req.body?.kw);
+  let jahr = parseIntSafe(req.body?.jahr);
+  let kw = parseIntSafe(req.body?.kw);
   if (!jahr || !kw) return res.status(400).json({ message: 'jahr und kw sind erforderlich.' });
 
   // Zentral: filiale muss im Body stehen; Filiale: kommt aus Token
@@ -541,7 +595,7 @@ router.post('/bookings/split', verifyToken(), async (req, res) => {
   const typ = req.body?.typ || 'bestellung';
   const gesamtbetrag = parseNumericSafe(req.body?.gesamtbetrag);
   const lieferant = req.body?.lieferant || null;
-  const aktion_nr = req.body?.aktion_nr || null;
+  let aktion_nr = req.body?.aktion_nr || null;
   const beschreibung = req.body?.beschreibung || null;
   const status = req.body?.status || 'offen';
 
@@ -562,9 +616,17 @@ router.post('/bookings/split', verifyToken(), async (req, res) => {
   }
 
   // Typ-Regeln
-  if (typ === 'aktionsvorab' && !normalizeTextOrNull(aktion_nr)) {
-    return res.status(400).json({ message: "aktion_nr ist erforderlich für typ='aktionsvorab'." });
+  if (typ === 'aktionsvorab') {
+    const parsedTarget = parseAktionsvorabTargetFromAktionNr(aktion_nr);
+    if (!parsedTarget.ok) {
+      return res.status(400).json({ message: parsedTarget.message });
+    }
+
+    aktion_nr = parsedTarget.aktion_nr;
+    jahr = parsedTarget.jahr;
+    kw = parsedTarget.kw;
   }
+
   if ((typ === 'bestellung' || typ === 'sonderbestellung') && normalizeTextOrNull(aktion_nr)) {
     return res.status(400).json({ message: `aktion_nr ist unzulässig für typ='${typ}'.` });
   }
@@ -949,14 +1011,14 @@ router.post('/bookings', verifyToken(), async (req, res) => {
   if (!enforceFilialeForCentral(req, res)) return;
 
   const filiale = resolveFiliale(req);
-  const jahr = parseIntSafe(req.body?.jahr);
-  const kw = parseIntSafe(req.body?.kw);
+  let jahr = parseIntSafe(req.body?.jahr);
+  let kw = parseIntSafe(req.body?.kw);
 
   const datum = req.body?.datum;
   const typ = req.body?.typ;
   const betrag = parseNumericSafe(req.body?.betrag);
   const lieferant = req.body?.lieferant || null;
-  const aktion_nr = req.body?.aktion_nr || null;
+  let aktion_nr = req.body?.aktion_nr || null;
   const beschreibung = req.body?.beschreibung || null;
   const von_filiale = req.body?.von_filiale || null;
   const an_filiale = req.body?.an_filiale || null;
@@ -978,9 +1040,17 @@ router.post('/bookings', verifyToken(), async (req, res) => {
   }
 
   // Fachlogik: Aktionsvorab MUSS eine aktion_nr haben, Bestellung/Sonderbestellung DÜRFEN keine haben
-  if (typ === 'aktionsvorab' && !normalizeTextOrNull(aktion_nr)) {
-    return res.status(400).json({ message: "aktion_nr ist erforderlich für typ='aktionsvorab'." });
+  if (typ === 'aktionsvorab') {
+    const parsedTarget = parseAktionsvorabTargetFromAktionNr(aktion_nr);
+    if (!parsedTarget.ok) {
+      return res.status(400).json({ message: parsedTarget.message });
+    }
+
+    aktion_nr = parsedTarget.aktion_nr;
+    jahr = parsedTarget.jahr;
+    kw = parsedTarget.kw;
   }
+
   if ((typ === 'bestellung' || typ === 'sonderbestellung') && normalizeTextOrNull(aktion_nr)) {
     return res.status(400).json({ message: `aktion_nr ist unzulässig für typ='${typ}'.` });
   }
