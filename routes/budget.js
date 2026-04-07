@@ -50,7 +50,7 @@ function isCentralRole(role) {
 }
 
 function isAdminOrSupervisor(role) {
-  return role === ROLE_ADMIN || role === ROLE_SUPERVISOR;
+  return role === ROLE_ADMIN || role === ROLE_SUPERVISOR || role === ROLE_MANAGER_1;
 }
 
 function normalizeFiliale(value) {
@@ -136,8 +136,8 @@ function canWriteBookingType(role, bookingType) {
   if (!BOOKING_TYPES.includes(bookingType)) return false;
 
   if (bookingType === 'bestellung') {
-    // Filiale (eigene), Supervisor, Admin dürfen schreiben
-    return role === ROLE_FILIALE || role === ROLE_SUPERVISOR || role === ROLE_ADMIN;
+    // Filiale (eigene), Manager-1, Supervisor, Admin dürfen schreiben
+    return role === ROLE_FILIALE || role === ROLE_MANAGER_1 || role === ROLE_SUPERVISOR || role === ROLE_ADMIN;
   }
 
   if (bookingType === 'sonderbestellung') {
@@ -146,12 +146,12 @@ function canWriteBookingType(role, bookingType) {
   }
 
   if (bookingType === 'aktionsvorab') {
-    // Schreiben: BZL (Manager-1), GL, Supervisor, Admin
+    // Schreiben: Manager-1, GL, Supervisor, Admin
     return role === ROLE_ADMIN || role === ROLE_SUPERVISOR || role === ROLE_MANAGER_1 || role === ROLE_GF;
   }
 
-  // abgabe / korrektur: Schreiben: Supervisor, Admin
-  return role === ROLE_ADMIN || role === ROLE_SUPERVISOR;
+  // abgabe / korrektur: Schreiben: Manager-1, Supervisor, Admin
+  return role === ROLE_ADMIN || role === ROLE_SUPERVISOR || role === ROLE_MANAGER_1;
 }
 
 function canReadBookingType(role, bookingType) {
@@ -261,7 +261,7 @@ function parseSplitsArray(input) {
 router.get('/rules', verifyToken(), async (req, res) => {
   const { role } = req.user || {};
   if (!isAdminOrSupervisor(role)) {
-    return res.status(403).json({ message: 'Zugriff verweigert: Nur Admin/Supervisor dürfen Rules sehen.' });
+    return res.status(403).json({ message: 'Zugriff verweigert: Nur Admin/Supervisor/Manager-1 dürfen Rules sehen.' });
   }
 
   const jahr = parseIntSafe(req.query?.jahr);
@@ -297,7 +297,7 @@ router.get('/rules', verifyToken(), async (req, res) => {
 router.put('/rules', verifyToken(), async (req, res) => {
   const { role } = req.user || {};
   if (!isAdminOrSupervisor(role)) {
-    return res.status(403).json({ message: 'Zugriff verweigert: Nur Admin/Supervisor dürfen Rules ändern.' });
+    return res.status(403).json({ message: 'Zugriff verweigert: Nur Admin/Supervisor/Manager-1 dürfen Rules ändern.' });
   }
 
   const jahr = parseIntSafe(req.body?.jahr);
@@ -422,7 +422,7 @@ router.put('/umsatz-vorwoche', verifyToken(), async (req, res) => {
   const { role } = req.user || {};
 
   if (!isAdminOrSupervisor(role)) {
-    return res.status(403).json({ message: 'Zugriff verweigert: Nur Admin/Supervisor dürfen Umsatz Vorwoche setzen.' });
+    return res.status(403).json({ message: 'Zugriff verweigert: Nur Admin/Supervisor/Manager-1 dürfen Umsatz Vorwoche setzen.' });
   }
 
   if (!enforceFilialeForCentral(req, res)) return;
