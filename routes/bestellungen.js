@@ -4,6 +4,7 @@ const router = express.Router();
 
 const verifyToken = require('../middleware/verifyToken');
 const db = require('../db');
+const { sendOrderMail } = require('../services/mailer');
 
 /**
  * Hilfsfunktion:
@@ -32,8 +33,233 @@ function parseOptionalInt(value) {
   return Number.isInteger(n) ? n : NaN;
 }
 
+function parsePositiveInt(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const n = Number(value);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+function parseNonNegativeInt(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 0 ? n : null;
+}
+
+function roundMoney(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Math.round(n * 100) / 100;
+}
+
 function canReadAllOrders(role) {
   return ['Admin', 'Supervisor', 'Geschäftsführer', 'Manager-1'].includes(role);
+}
+
+function sanitizeSplitDetails(rawSplitDetails, orderedArticleMap, sourceFiliale) {
+  if (rawSplitDetails === undefined || rawSplitDetails === null) {
+    return {};
+  }
+
+  if (typeof rawSplitDetails !== 'object' || Array.isArray(rawSplitDetails)) {
+    throw new Error('order.split_details ist ungültig');
+  }
+
+  const normalizedSourceFiliale = normalizeFiliale(sourceFiliale);
+  const sanitized = {};
+
+  for (const [articleId, rawBlock] of Object.entries(rawSplitDetails)) {
+    if (!orderedArticleMap.has(articleId)) {
+      throw new Error(`order.split_details enthält unbekannten Artikel: ${articleId}`);
+    }
+
+    if (!rawBlock || typeof rawBlock !== 'object' || Array.isArray(rawBlock)) {
+      throw new Error(`order.split_details.${articleId} ist ungültig`);
+    }
+
+    const expectedKartons = orderedArticleMap.get(articleId);
+    const bestellteKartons = parsePositiveInt(rawBlock.bestellte_kartons);
+    const veGroesse = parsePositiveInt(rawBlock.ve_groesse);
+    const gesamtStueck = parsePositiveInt(rawBlock.gesamt_stueck);
+
+    if (bestellteKartons === null || bestellteKartons !== expectedKartons) {
+      throw new Error(`order.split_details.${articleId}.bestellte_kartons ist ungültig`);
+    }
+
+    if (veGroesse === null) {
+      throw new Error(`order.split_details.${articleId}.ve_groesse ist ungültig`);
+    }
+
+    if (gesamtStueck === null || gesamtStueck !== bestellteKartons * veGroesse) {
+      throw new Error(`order.split_details.${articleId}.gesamt_stueck ist ungültig`);
+    }
+
+    const ekEinzel = parseNumericSafe(rawBlock.ek_einzel);
+    const ekProKarton = parseNumericSafe(rawBlock.ek_pro_karton);
+
+    const rawRows = Array.isArray(rawBlock.zeilen) ? rawBlock.zeilen : [];
+    if (rawRows.length === 0) {
+      throw new Error(`order.split_details.${articleId}.zeilen fehlen oder sind leer`);
+    }
+
+    const seenTargets = new Set();
+    const sanitizedRows = rawRows.map((rawRow, index) => {
+      if (!rawRow || typeof rawRow !== 'object' || Array.isArray(rawRow)) {
+        throw new Error(`order.split_details.${articleId}.zeilen[${index}] ist ungültig`);
+      }
+
+      const targetFiliale = normalizeFiliale(rawRow.target_filiale);
+      const einheit = rawRow.einheit === 'karton' ? 'karton' : rawRow.einheit === 'stueck' ? 'stueck' : null;
+      const menge = parsePositiveInt(rawRow.menge);
+      const mengeStueckBerechnet = parsePositiveInt(rawRow.menge_stueck_berechnet);
+      const betragNettoBerechnet = parseNumericSafe(rawRow.betrag_netto_berechnet);
+
+      if (!targetFiliale) {
+        throw new Error(`order.split_details.${articleId}.zeilen[${index}].target_filiale fehlt oder ist ungültig`);
+      }
+
+      if (targetFiliale.toLowerCase() === 'alle') {
+        throw new Error(`order.split_details.${articleId}.zeilen[${index}].target_filiale darf nicht "Alle" sein`);
+      }
+
+      if (targetFiliale === normalizedSourceFiliale) {
+        throw new Error(`order.split_details.${articleId}.zeilen[${index}].target_filiale darf nicht die Quellfiliale sein`);
+      }
+
+      if (seenTargets.has(targetFiliale)) {
+        throw new Error(`order.split_details.${articleId} enthält doppelte Ziel-Filiale: ${targetFiliale}`);
+      }
+      seenTargets.add(targetFiliale);
+
+      if (!einheit) {
+        throw new Error(`order.split_details.${articleId}.zeilen[${index}].einheit ist ungültig`);
+      }
+
+      if (menge === null) {
+        throw new Error(`order.split_details.${articleId}.zeilen[${index}].menge ist ungültig`);
+      }
+
+      const expectedMengeStueck = einheit === 'karton' ? menge * veGroesse : menge;
+      if (mengeStueckBerechnet === null || mengeStueckBerechnet !== expectedMengeStueck) {
+        throw new Error(`order.split_details.${articleId}.zeilen[${index}].menge_stueck_berechnet ist ungültig`);
+      }
+
+      if (betragNettoBerechnet === null || betragNettoBerechnet <= 0) {
+        throw new Error(`order.split_details.${articleId}.zeilen[${index}].betrag_netto_berechnet ist ungültig`);
+      }
+
+      return {
+        target_filiale: targetFiliale,
+        einheit,
+        menge,
+        menge_stueck_berechnet: mengeStueckBerechnet,
+        betrag_netto_berechnet: roundMoney(betragNettoBerechnet),
+      };
+    });
+
+    const rawRest = rawBlock.rest;
+    if (!rawRest || typeof rawRest !== 'object' || Array.isArray(rawRest)) {
+      throw new Error(`order.split_details.${articleId}.rest ist ungültig`);
+    }
+
+    const restFiliale = normalizeFiliale(rawRest.filiale);
+    const restMengeStueck = parseNonNegativeInt(rawRest.menge_stueck);
+    const restBetragNetto = parseNumericSafe(rawRest.betrag_netto);
+
+    if (restFiliale !== normalizedSourceFiliale) {
+      throw new Error(`order.split_details.${articleId}.rest.filiale ist ungültig`);
+    }
+
+    if (restMengeStueck === null) {
+      throw new Error(`order.split_details.${articleId}.rest.menge_stueck ist ungültig`);
+    }
+
+    if (restBetragNetto === null || restBetragNetto < 0) {
+      throw new Error(`order.split_details.${articleId}.rest.betrag_netto ist ungültig`);
+    }
+
+    const sumSplitStueck = sanitizedRows.reduce((sum, row) => sum + row.menge_stueck_berechnet, 0);
+    if (sumSplitStueck + restMengeStueck !== gesamtStueck) {
+      throw new Error(`order.split_details.${articleId} ist inkonsistent (Split + Rest != Gesamtstückzahl)`);
+    }
+
+    sanitized[articleId] = {
+      active: true,
+      source_filiale: normalizedSourceFiliale,
+      bestellte_kartons: bestellteKartons,
+      ve_groesse: veGroesse,
+      gesamt_stueck: gesamtStueck,
+      ek_einzel: ekEinzel !== null ? roundMoney(ekEinzel) : null,
+      ek_pro_karton: ekProKarton !== null ? roundMoney(ekProKarton) : null,
+      zeilen: sanitizedRows,
+      rest: {
+        filiale: restFiliale,
+        menge_stueck: restMengeStueck,
+        betrag_netto: roundMoney(restBetragNetto),
+      },
+    };
+  }
+
+  return sanitized;
+}
+
+function aggregateSplitDetailsByFiliale(splitDetails) {
+  const sums = new Map();
+
+  for (const block of Object.values(splitDetails)) {
+    const rows = Array.isArray(block?.zeilen) ? block.zeilen : [];
+    for (const row of rows) {
+      const filiale = normalizeFiliale(row?.target_filiale);
+      const betrag = parseNumericSafe(row?.betrag_netto_berechnet);
+
+      if (!filiale || betrag === null || betrag <= 0) continue;
+
+      const current = sums.get(filiale) || 0;
+      sums.set(filiale, roundMoney(current + betrag));
+    }
+  }
+
+  return Object.fromEntries(sums.entries());
+}
+
+function aggregateBudgetSplitsByFiliale(normalizedSplits) {
+  const sums = new Map();
+
+  for (const item of normalizedSplits) {
+    const filiale = normalizeFiliale(item?.filiale);
+    const betrag = parseNumericSafe(item?.betrag);
+
+    if (!filiale || betrag === null || betrag <= 0) continue;
+
+    const current = sums.get(filiale) || 0;
+    sums.set(filiale, roundMoney(current + betrag));
+  }
+
+  return Object.fromEntries(sums.entries());
+}
+
+function compareAggregatedSplitMaps(detailsMap, budgetMap) {
+  const detailKeys = Object.keys(detailsMap).sort();
+  const budgetKeys = Object.keys(budgetMap).sort();
+
+  if (detailKeys.length !== budgetKeys.length) {
+    return false;
+  }
+
+  for (let i = 0; i < detailKeys.length; i += 1) {
+    if (detailKeys[i] !== budgetKeys[i]) {
+      return false;
+    }
+  }
+
+  for (const key of detailKeys) {
+    const a = roundMoney(detailsMap[key] || 0);
+    const b = roundMoney(budgetMap[key] || 0);
+    if (Math.abs(a - b) > 0.01) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 async function resolveBudgetYearWeek(client, dateStr) {
@@ -226,6 +452,7 @@ router.get('/', verifyToken(), async (req, res) => {
         o.status,
         o.gesamtsumme_netto,
         o.budget_booking_id,
+        o.split_snapshot,
         o.supplier_formular_typ_snapshot,
         o.created_at,
         o.updated_at,
@@ -284,6 +511,7 @@ router.get('/', verifyToken(), async (req, res) => {
         status: row.status,
         gesamtsumme_netto: row.gesamtsumme_netto,
         budget_booking_id: row.budget_booking_id,
+        split_snapshot: row.split_snapshot || null,
         supplier: {
           id: row.supplier_id,
           name: row.supplier_name,
@@ -599,7 +827,12 @@ router.get('/artikel-mit-ek', verifyToken(), async (req, res) => {
  *     "status": "saved",
  *     "positionen": [
  *       { "articleId": "uuid", "menge_kartons": 2 }
- *     ]
+ *     ],
+ *     "split_details": {
+ *       "<articleId>": {
+ *         ...
+ *       }
+ *     }
  *   },
  *   "budget": {
  *     "typ": "bestellung",
@@ -629,6 +862,7 @@ router.post('/', verifyToken(), async (req, res) => {
       bestelldatum,
       status,
       positionen,
+      split_details,
     } = order;
 
     const userName = req.user?.name ?? null;
@@ -690,6 +924,17 @@ router.post('/', verifyToken(), async (req, res) => {
       }
     }
 
+    const orderedArticleMap = new Map(
+      normalizedPositions.map((item) => [item.articleId, item.menge_kartons])
+    );
+
+    let sanitizedSplitDetails = {};
+    try {
+      sanitizedSplitDetails = sanitizeSplitDetails(split_details, orderedArticleMap, effectiveFiliale);
+    } catch (validationError) {
+      return res.status(400).json({ message: validationError.message });
+    }
+
     const rawSplits = Array.isArray(budget.splits) ? budget.splits : [];
     const normalizedSplits = rawSplits.map((item, index) => ({
       index,
@@ -731,6 +976,31 @@ router.post('/', verifyToken(), async (req, res) => {
       }
 
       seenSplitFilialen.add(item.filiale);
+    }
+
+    const splitDetailsCount = Object.keys(sanitizedSplitDetails).length;
+
+    if (normalizedSplits.length > 0 && splitDetailsCount === 0) {
+      return res.status(400).json({
+        message: 'Bei Split-Bestellungen fehlt order.split_details',
+      });
+    }
+
+    if (normalizedSplits.length === 0 && splitDetailsCount > 0) {
+      return res.status(400).json({
+        message: 'order.split_details ist gesetzt, aber budget.splits ist leer',
+      });
+    }
+
+    if (normalizedSplits.length > 0 && splitDetailsCount > 0) {
+      const splitDetailsByFiliale = aggregateSplitDetailsByFiliale(sanitizedSplitDetails);
+      const budgetSplitsByFiliale = aggregateBudgetSplitsByFiliale(normalizedSplits);
+
+      if (!compareAggregatedSplitMaps(splitDetailsByFiliale, budgetSplitsByFiliale)) {
+        return res.status(400).json({
+          message: 'order.split_details und budget.splits passen fachlich nicht zusammen',
+        });
+      }
     }
 
     await client.query('BEGIN');
@@ -795,6 +1065,7 @@ router.post('/', verifyToken(), async (req, res) => {
         status,
         gesamtsumme_netto,
         budget_booking_id,
+        split_snapshot,
         supplier_formular_typ_snapshot,
         firma_snapshot,
         kunden_nr_snapshot,
@@ -804,7 +1075,7 @@ router.post('/', verifyToken(), async (req, res) => {
         gespraechspartner_snapshot
       )
       VALUES (
-        $1, $2, $3, $4::date, $5, 0, NULL, $6, $7, $8, $9, $10, $11, $12
+        $1, $2, $3, $4::date, $5, 0, NULL, NULL, $6, $7, $8, $9, $10, $11, $12
       )
       RETURNING
         id,
@@ -815,6 +1086,7 @@ router.post('/', verifyToken(), async (req, res) => {
         status,
         gesamtsumme_netto,
         budget_booking_id,
+        split_snapshot,
         supplier_formular_typ_snapshot,
         created_at,
         updated_at
@@ -968,6 +1240,7 @@ router.post('/', verifyToken(), async (req, res) => {
         o.status,
         o.gesamtsumme_netto,
         o.budget_booking_id,
+        o.split_snapshot,
         o.supplier_formular_typ_snapshot,
         o.created_at,
         o.updated_at
@@ -976,6 +1249,33 @@ router.post('/', verifyToken(), async (req, res) => {
     );
 
     const finalOrder = sumUpdateResult.rows[0] || orderRow;
+
+    let splitSnapshot = null;
+
+    if (normalizedSplits.length > 0) {
+      const childSum = normalizedSplits.reduce((sum, item) => sum + item.betrag, 0);
+
+      splitSnapshot = {
+        mode: 'split',
+        source_filiale: effectiveFiliale,
+        gesamtbetrag: Number(finalOrder.gesamtsumme_netto),
+        artikel: sanitizedSplitDetails,
+        targets: normalizedSplits.map((item) => ({
+          filiale: item.filiale,
+          betrag: item.betrag,
+        })),
+        rest: {
+          filiale: effectiveFiliale,
+          betrag: Number(finalOrder.gesamtsumme_netto) - childSum,
+        },
+      };
+    } else {
+      splitSnapshot = {
+        mode: 'single',
+        filiale: effectiveFiliale,
+        betrag: Number(finalOrder.gesamtsumme_netto),
+      };
+    }
 
     const { jahr, kw } = await resolveBudgetYearWeek(client, bestelldatum);
 
@@ -1059,14 +1359,77 @@ router.post('/', verifyToken(), async (req, res) => {
       budgetBookingId = bookingInsertResult.rows[0].id;
     }
 
+    await client.query(
+      `
+      UPDATE "order".order_orders
+      SET
+        split_snapshot = $1::jsonb,
+        updated_at = NOW()
+      WHERE id = $2
+      `,
+      [JSON.stringify(splitSnapshot), finalOrder.id]
+    );
+
+    const finalOrderWithSnapshotResult = await client.query(
+      `
+      SELECT
+        o.id,
+        o.supplier_id,
+        o.filiale,
+        o.ordered_by_name,
+        o.bestelldatum,
+        o.status,
+        o.gesamtsumme_netto,
+        o.budget_booking_id,
+        o.split_snapshot,
+        o.supplier_formular_typ_snapshot,
+        o.created_at,
+        o.updated_at
+      FROM "order".order_orders o
+      WHERE o.id = $1
+      LIMIT 1
+      `,
+      [finalOrder.id]
+    );
+
+    const finalOrderWithSnapshot = finalOrderWithSnapshotResult.rows[0] || {
+      ...finalOrder,
+      split_snapshot: splitSnapshot,
+    };
+
     await client.query('COMMIT');
+
+    const mailSubject = `Neue Bestellung - ${supplierData.name} - ${effectiveFiliale}`;
+    const mailText = `Neue Bestellung wurde erstellt
+
+Filiale: ${effectiveFiliale}
+Lieferant: ${supplierData.name}
+Bestelldatum: ${bestelldatum}
+Bestellsumme netto: ${finalOrderWithSnapshot.gesamtsumme_netto} EUR
+Bestellt von: ${userName}
+
+Bestell-ID: ${finalOrderWithSnapshot.id}
+Budget-Buchung-ID: ${budgetBookingId || 'nicht gesetzt'}
+Split-Modus: ${normalizedSplits.length > 0 ? 'Ja' : 'Nein'}
+
+Hinweis:
+Diese E-Mail wurde automatisch aus der Neufeld Baumarkt GmbH 3.0 App erzeugt.
+Aktueller Mailmodus wird ueber MAIL_MODE gesteuert.`;
+
+    setImmediate(() => {
+      sendOrderMail({
+        subject: mailSubject,
+        text: mailText,
+        to: process.env.MAIL_LIVE_RECIPIENT || process.env.MAIL_TEST_RECIPIENT || null,
+      });
+    });
 
     return res.status(201).json({
       status: 'ok',
       module: 'bestellungen',
       message: 'Bestellung erfolgreich gespeichert',
       stage: 'phase-2-write-order-save',
-      order: finalOrder,
+      order: finalOrderWithSnapshot,
       supplier: {
         id: supplierData.id,
         name: supplierData.name,
