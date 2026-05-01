@@ -5,6 +5,7 @@ const router = express.Router();
 const verifyToken = require('../middleware/verifyToken');
 const db = require('../db');
 const { sendOrderMail } = require('../services/mailer');
+const { generateMellerudOrderPdf } = require('../services/pdf/mellerudPdfService');
 
 /**
  * Hilfsfunktion:
@@ -1399,6 +1400,15 @@ router.post('/', verifyToken(), async (req, res) => {
 
     await client.query('COMMIT');
 
+    let pdfBuffer = null;
+
+    try {
+      pdfBuffer = await generateMellerudOrderPdf(finalOrderWithSnapshot.id);
+    } catch (pdfError) {
+      console.error('PDF ERROR:', pdfError);
+      pdfBuffer = null;
+    }
+
     const mailSubject = `Neue Bestellung - ${supplierData.name} - ${effectiveFiliale}`;
     const mailText = `Neue Bestellung wurde erstellt
 
@@ -1416,13 +1426,21 @@ Hinweis:
 Diese E-Mail wurde automatisch aus der Neufeld Baumarkt GmbH 3.0 App erzeugt.
 Aktueller Mailmodus wird ueber MAIL_MODE gesteuert.`;
 
-    setImmediate(() => {
-      sendOrderMail({
+    if (pdfBuffer) {
+      await sendOrderMail({
         subject: mailSubject,
         text: mailText,
         to: process.env.MAIL_LIVE_RECIPIENT || process.env.MAIL_TEST_RECIPIENT || null,
+        attachments: [
+          {
+            filename: `Bestellung_${finalOrderWithSnapshot.id}.pdf`,
+            content: pdfBuffer,
+          },
+        ],
       });
-    });
+    } else {
+      console.warn('MAIL WIRD NICHT VERSENDET – PDF FEHLT');
+    }
 
     return res.status(201).json({
       status: 'ok',

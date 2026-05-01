@@ -22,7 +22,7 @@ function getMailConfig() {
   return config;
 }
 
-async function sendOrderMail({ subject, text, to }) {
+async function sendOrderMail({ subject, text, to, attachments = [] }) {
   try {
     const config = getMailConfig();
 
@@ -60,6 +60,7 @@ async function sendOrderMail({ subject, text, to }) {
       to: finalRecipient,
       subject,
       text,
+      attachments,
     });
 
     console.log(`MAIL: erfolgreich gesendet an ${finalRecipient}`);
