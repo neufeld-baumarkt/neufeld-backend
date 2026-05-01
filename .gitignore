@@ -6,3 +6,5 @@
 # local backups
 _local_secrets/
 
+
+node_modules/
