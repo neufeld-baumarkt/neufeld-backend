@@ -227,78 +227,79 @@ function buildMellerudHtml({ order, articles, orderedMap }) {
 
     .page-header {
       width: 100%;
-      margin-bottom: 8mm;
+      margin-bottom: 7mm;
     }
 
     .header-inner {
       display: grid;
-      grid-template-columns: 38mm 1fr;
-      align-items: start;
-      min-height: 18mm;
+      grid-template-columns: 42mm 1fr 42mm;
+      align-items: center;
+      min-height: 22mm;
     }
 
     .logo-box {
-  width: 35mm;
-  height: 18mm;
-  position: relative;
-  margin-left: 0.5mm;
-}
+      width: 35mm;
+      height: 19mm;
+      position: relative;
+      margin-left: 0.5mm;
+      margin-top: 1.5mm;
+    }
 
-.logo-red {
-  position: relative;
-  width: 35mm;
-  height: 14mm;
-  background: #e30613;
-  overflow: hidden;
-}
+    .logo-red {
+      position: relative;
+      width: 35mm;
+      height: 14.5mm;
+      background: #e30613;
+      overflow: hidden;
+    }
 
-.logo-main {
-  position: absolute;
-  top: 4.1mm;
-  left: 3.2mm;
-  color: #fff;
-  font-size: 14.2px;
-  line-height: 1;
-  font-weight: 900;
-  letter-spacing: 0.35px;
-}
+    .logo-main {
+      position: absolute;
+      top: 4.2mm;
+      left: 3.1mm;
+      color: #fff;
+      font-size: 14.4px;
+      line-height: 1;
+      font-weight: 900;
+      letter-spacing: 0.25px;
+    }
 
-.logo-cut {
-  position: absolute;
-  left: -1mm;
-  right: -1mm;
-  bottom: -0.2mm;
-  height: 4.2mm;
-  background: #fff;
-  clip-path: polygon(0 100%, 50% 20%, 100% 100%, 100% 100%, 0 100%);
-}
+    .logo-cut {
+      position: absolute;
+      left: -1mm;
+      right: -1mm;
+      bottom: -0.1mm;
+      height: 4.6mm;
+      background: #fff;
+      clip-path: polygon(0 100%, 50% 22%, 100% 100%);
+    }
 
-.logo-sub {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0.1mm;
-  text-align: center;
-  color: #004a83;
-  font-size: 7.3px;
-  line-height: 1;
-  font-weight: 900;
-  letter-spacing: 0.65px;
-}
+    .logo-sub {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0.2mm;
+      text-align: center;
+      color: #004a83;
+      font-size: 6.6px;
+      line-height: 1;
+      font-weight: 900;
+      letter-spacing: 0.55px;
+    }
 
     .header-title {
       color: #004a83;
-      font-size: 25px;
-      font-weight: bold;
-      padding-top: 3mm;
+      font-size: 24px;
+      font-weight: 700;
       text-align: center;
-      padding-right: 22mm;
+      line-height: 1;
+      padding-top: 0.5mm;
     }
 
     .red-line {
-      height: 0.35mm;
+      height: 0.45mm;
       background: #d11f2a;
-      margin-top: 6mm;
+      margin-top: 4.5mm;
       margin-left: -14mm;
       margin-right: -14mm;
     }
@@ -306,8 +307,8 @@ function buildMellerudHtml({ order, articles, orderedMap }) {
     .meta-grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
-      column-gap: 9mm;
-      row-gap: 4mm;
+      column-gap: 12mm;
+      row-gap: 3.6mm;
       margin: 0 0 6mm 0;
       color: #004a83;
       font-size: 12px;
@@ -327,11 +328,11 @@ function buildMellerudHtml({ order, articles, orderedMap }) {
 
     .meta-line {
       min-height: 5mm;
-      border-bottom: 0.35mm solid #004a83;
+      border-bottom: 0.32mm solid #004a83;
       color: #000;
-      font-size: 10px;
+      font-size: 9.6px;
       font-weight: normal;
-      padding-left: 1mm;
+      padding-left: 1.2mm;
       line-height: 5mm;
       overflow: hidden;
       white-space: nowrap;
@@ -342,7 +343,7 @@ function buildMellerudHtml({ order, articles, orderedMap }) {
       grid-template-columns: 1fr 1fr;
       gap: 1.5mm 6mm;
       margin-bottom: 5mm;
-      font-size: 8px;
+      font-size: 7.6px;
       color: #000;
     }
 
@@ -350,7 +351,7 @@ function buildMellerudHtml({ order, articles, orderedMap }) {
       width: 100%;
       border-collapse: collapse;
       table-layout: fixed;
-      font-size: 6.2px;
+      font-size: 6.1px;
     }
 
     .article-table th {
@@ -359,16 +360,16 @@ function buildMellerudHtml({ order, articles, orderedMap }) {
       font-weight: bold;
       text-align: center;
       border: 0.25mm solid #8aa9c0;
-      padding: 1.8mm 1mm;
+      padding: 1.7mm 1mm;
       line-height: 1.05;
       vertical-align: middle;
     }
 
     .article-table td {
       border: 0.25mm solid #a9a9a9;
-      padding: 1mm 1mm;
+      padding: 0.95mm 1mm;
       line-height: 1.05;
-      height: 5.05mm;
+      height: 5.0mm;
       vertical-align: middle;
       overflow: hidden;
     }
