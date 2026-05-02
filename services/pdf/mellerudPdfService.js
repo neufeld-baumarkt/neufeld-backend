@@ -3,7 +3,6 @@ const db = require('../../db');
 
 function escapeHtml(value) {
   if (value === null || value === undefined) return '';
-
   return String(value)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -14,10 +13,8 @@ function escapeHtml(value) {
 
 function formatDate(value) {
   if (!value) return '';
-
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return '';
-
   return d.toLocaleDateString('de-DE', {
     day: '2-digit',
     month: '2-digit',
@@ -33,23 +30,11 @@ function chunkArray(items, pageSize) {
   return chunks;
 }
 
-function buildMellerudLogo() {
-  return `
-    <div class="logo-box">
-      <div class="logo-red">
-        <div class="logo-main">MELLERUD</div>
-        <div class="logo-cut"></div>
-      </div>
-      <div class="logo-sub">UND GUT.</div>
-    </div>
-  `;
-}
-
+/* 🔥 KEIN LOGO MEHR */
 function buildHeader() {
   return `
     <div class="page-header">
-      <div class="header-inner">
-        ${buildMellerudLogo()}
+      <div class="header-inner no-logo">
         <div class="header-title">Auftragsformular Classic</div>
       </div>
       <div class="red-line"></div>
@@ -114,21 +99,18 @@ function buildMetaBlock(order) {
 }
 
 function buildArticleRows(articles, orderedMap) {
-  return articles
-    .map((article) => {
-      const ordered = orderedMap.get(article.id) || null;
-
-      return `
-        <tr>
-          <td class="col-ean">${escapeHtml(article.ean)}</td>
-          <td class="col-artnr">${escapeHtml(article.supplier_article_no)}</td>
-          <td class="col-name">${escapeHtml(article.name)}</td>
-          <td class="col-ve">${escapeHtml(article.ve_stueck)}</td>
-          <td class="col-kartons">${ordered ? escapeHtml(ordered.menge_kartons) : ''}</td>
-        </tr>
-      `;
-    })
-    .join('');
+  return articles.map(article => {
+    const ordered = orderedMap.get(article.id) || null;
+    return `
+      <tr>
+        <td>${escapeHtml(article.ean)}</td>
+        <td>${escapeHtml(article.supplier_article_no)}</td>
+        <td>${escapeHtml(article.name)}</td>
+        <td>${escapeHtml(article.ve_stueck)}</td>
+        <td>${ordered ? escapeHtml(ordered.menge_kartons) : ''}</td>
+      </tr>
+    `;
+  }).join('');
 }
 
 function buildArticleTable(articles, orderedMap) {
@@ -136,11 +118,11 @@ function buildArticleTable(articles, orderedMap) {
     <table class="article-table">
       <thead>
         <tr>
-          <th class="col-ean">EAN-Nr.</th>
-          <th class="col-artnr">MELLERUD<br />Art.-Nr.</th>
-          <th class="col-name">Artikel-Bezeichnung</th>
-          <th class="col-ve">VE / Stück</th>
-          <th class="col-kartons">Kartons</th>
+          <th>EAN-Nr.</th>
+          <th>Art.-Nr.</th>
+          <th>Artikel-Bezeichnung</th>
+          <th>VE</th>
+          <th>Kartons</th>
         </tr>
       </thead>
       <tbody>
@@ -150,543 +132,109 @@ function buildArticleTable(articles, orderedMap) {
   `;
 }
 
-function buildSignatureBlock() {
-  return `
-    <div class="signature-area">
-      <div class="signature-row">
-        <div class="signature-field">
-          <div class="signature-line"></div>
-          <div class="signature-label">Bestelldatum</div>
-        </div>
-
-        <div class="signature-field">
-          <div class="signature-line"></div>
-          <div class="signature-label">Unterschrift Besteller</div>
-        </div>
-
-        <div class="stamp-field">
-          <div class="stamp-box"></div>
-          <div class="signature-label">Firmenstempel</div>
-        </div>
-      </div>
-
-      <div class="legal-text">
-        Die Ware bleibt bis zur vollständigen Bezahlung unser Eigentum. Gerichtsstand: 41747 Viersen
-      </div>
-    </div>
-  `;
-}
-
 function buildMellerudHtml({ order, articles, orderedMap }) {
-  const firstPageRows = 32;
-  const followingPageRows = 37;
-
-  const firstPageArticles = articles.slice(0, firstPageRows);
-  const restArticles = articles.slice(firstPageRows);
-  const restPages = chunkArray(restArticles, followingPageRows);
-  const allPages = [firstPageArticles, ...restPages];
-
   return `
 <!doctype html>
-<html lang="de">
+<html>
 <head>
-  <meta charset="utf-8" />
-  <title>Mellerud Bestellung</title>
-  <style>
-    @page {
-      size: A4;
-      margin: 0;
-    }
-
-    * {
-      box-sizing: border-box;
-    }
-
-    html,
-    body {
-      margin: 0;
-      padding: 0;
-      font-family: Arial, Helvetica, sans-serif;
-      color: #000;
-      background: #fff;
-    }
-
-    .page {
-      position: relative;
-      width: 210mm;
-      height: 297mm;
-      padding: 10mm 14mm 22mm 14mm;
-      page-break-after: always;
-      overflow: hidden;
-      background: #fff;
-    }
-
-    .page:last-child {
-      page-break-after: auto;
-    }
-
-    .page-header {
-      width: 100%;
-      margin-bottom: 8mm;
-    }
-
-    .header-inner {
-      display: grid;
-      grid-template-columns: 38mm 1fr;
-      align-items: start;
-      min-height: 18mm;
-    }
-
-    .logo-box {
-  width: 35mm;
-  height: 18mm;
-  position: relative;
-  margin-left: 0.5mm;
+<style>
+body {
+  font-family: Arial;
 }
 
-.logo-red {
-  position: relative;
-  width: 35mm;
-  height: 14mm;
-  background: #e30613;
-  overflow: hidden;
+.header-inner {
+  display: flex;
+  justify-content: center;
+  align-items: center;
 }
 
-.logo-main {
-  position: absolute;
-  top: 4.1mm;
-  left: 3.2mm;
-  color: #fff;
-  font-size: 14.2px;
-  line-height: 1;
-  font-weight: 900;
-  letter-spacing: 0.35px;
-}
-
-.logo-cut {
-  position: absolute;
-  left: -1mm;
-  right: -1mm;
-  bottom: -0.2mm;
-  height: 4.2mm;
-  background: #fff;
-  clip-path: polygon(0 100%, 50% 20%, 100% 100%, 100% 100%, 0 100%);
-}
-
-.logo-sub {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0.1mm;
-  text-align: center;
+.header-title {
+  font-size: 24px;
   color: #004a83;
-  font-size: 7.3px;
-  line-height: 1;
-  font-weight: 900;
-  letter-spacing: 0.65px;
+  font-weight: bold;
 }
 
-    .header-title {
-      color: #004a83;
-      font-size: 25px;
-      font-weight: bold;
-      padding-top: 3mm;
-      text-align: center;
-      padding-right: 22mm;
-    }
+.red-line {
+  height: 2px;
+  background: red;
+  margin-top: 10px;
+}
 
-    .red-line {
-      height: 0.35mm;
-      background: #d11f2a;
-      margin-top: 6mm;
-      margin-left: -14mm;
-      margin-right: -14mm;
-    }
+.article-table {
+  width: 100%;
+  border-collapse: collapse;
+}
 
-    .meta-grid {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      column-gap: 9mm;
-      row-gap: 4mm;
-      margin: 0 0 6mm 0;
-      color: #004a83;
-      font-size: 12px;
-      font-weight: bold;
-    }
+.article-table th {
+  background: #004a83;
+  color: white;
+}
 
-    .meta-row {
-      display: grid;
-      grid-template-columns: auto 1fr;
-      column-gap: 2mm;
-      align-items: end;
-    }
+.article-table td, .article-table th {
+  border: 1px solid #ccc;
+  padding: 4px;
+}
 
-    .meta-label {
-      white-space: nowrap;
-    }
-
-    .meta-line {
-      min-height: 5mm;
-      border-bottom: 0.35mm solid #004a83;
-      color: #000;
-      font-size: 10px;
-      font-weight: normal;
-      padding-left: 1mm;
-      line-height: 5mm;
-      overflow: hidden;
-      white-space: nowrap;
-    }
-
-    .order-meta {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 1.5mm 6mm;
-      margin-bottom: 5mm;
-      font-size: 8px;
-      color: #000;
-    }
-
-    .article-table {
-      width: 100%;
-      border-collapse: collapse;
-      table-layout: fixed;
-      font-size: 6.2px;
-    }
-
-    .article-table th {
-      background: #004a83;
-      color: #fff;
-      font-weight: bold;
-      text-align: center;
-      border: 0.25mm solid #8aa9c0;
-      padding: 1.8mm 1mm;
-      line-height: 1.05;
-      vertical-align: middle;
-    }
-
-    .article-table td {
-      border: 0.25mm solid #a9a9a9;
-      padding: 1mm 1mm;
-      line-height: 1.05;
-      height: 5.05mm;
-      vertical-align: middle;
-      overflow: hidden;
-    }
-
-    .col-ean {
-      width: 25mm;
-      text-align: center;
-      white-space: nowrap;
-    }
-
-    .col-artnr {
-      width: 24mm;
-      text-align: center;
-      white-space: nowrap;
-    }
-
-    .col-name {
-      width: auto;
-      text-align: left;
-    }
-
-    th.col-name {
-      text-align: center;
-    }
-
-    .col-ve {
-      width: 22mm;
-      text-align: center;
-      white-space: nowrap;
-    }
-
-    .col-kartons {
-      width: 23mm;
-      text-align: center;
-      white-space: nowrap;
-      font-weight: bold;
-    }
-
-    .page-footer {
-      position: absolute;
-      left: 0;
-      right: 0;
-      bottom: 0;
-      height: 18mm;
-    }
-
-    .footer-version {
-      position: absolute;
-      right: 13mm;
-      top: -5mm;
-      font-size: 6px;
-      color: #000;
-    }
-
-    .footer-blue {
-      position: absolute;
-      left: 0;
-      right: 0;
-      bottom: 0;
-      height: 14mm;
-      background: #004a83;
-      color: #fff;
-      text-align: center;
-      font-size: 6.5px;
-      line-height: 1.2;
-      padding-top: 3mm;
-    }
-
-    .footer-company strong {
-      font-size: 7px;
-    }
-
-    .footer-page {
-      position: absolute;
-      right: 14mm;
-      bottom: 3mm;
-      font-size: 8px;
-      font-weight: bold;
-    }
-
-    .signature-area {
-      position: absolute;
-      left: 14mm;
-      right: 14mm;
-      bottom: 20mm;
-      color: #004a83;
-      font-size: 8px;
-      font-weight: bold;
-    }
-
-    .signature-row {
-      display: grid;
-      grid-template-columns: 1fr 1.4fr 1fr;
-      gap: 9mm;
-      align-items: end;
-    }
-
-    .signature-field {
-      min-height: 17mm;
-      display: flex;
-      flex-direction: column;
-      justify-content: flex-end;
-    }
-
-    .signature-line {
-      border-bottom: 0.35mm solid #004a83;
-      height: 8mm;
-      margin-bottom: 1mm;
-    }
-
-    .signature-label {
-      text-align: center;
-    }
-
-    .stamp-field {
-      min-height: 25mm;
-      display: flex;
-      flex-direction: column;
-      justify-content: flex-end;
-    }
-
-    .stamp-box {
-      height: 22mm;
-      border: 0.35mm solid #004a83;
-      margin-bottom: 1mm;
-    }
-
-    .legal-text {
-      margin-top: 5mm;
-      text-align: center;
-      font-size: 6.8px;
-      color: #004a83;
-      font-weight: normal;
-    }
-  </style>
+</style>
 </head>
 <body>
-  ${allPages
-    .map((pageArticles, pageIndex) => {
-      const pageNumber = pageIndex + 1;
-      const isFirstPage = pageIndex === 0;
-      const isLastPage = pageIndex === allPages.length - 1;
 
-      return `
-        <section class="page">
-          ${buildHeader()}
+${buildHeader()}
+${buildMetaBlock(order)}
+${buildArticleTable(articles, orderedMap)}
 
-          ${isFirstPage ? buildMetaBlock(order) : ''}
-
-          ${buildArticleTable(pageArticles, orderedMap)}
-
-          ${isLastPage ? buildSignatureBlock() : ''}
-
-          ${buildFooter(pageNumber)}
-        </section>
-      `;
-    })
-    .join('')}
 </body>
 </html>
-  `;
+`;
 }
 
 async function loadMellerudPdfData(orderId) {
   const orderResult = await db.query(
-    `
-    SELECT
-      o.id,
-      o.supplier_id,
-      o.filiale,
-      o.ordered_by_name,
-      o.bestelldatum,
-      o.status,
-      o.gesamtsumme_netto,
-      o.supplier_formular_typ_snapshot,
-      o.firma_snapshot,
-      o.kunden_nr_snapshot,
-      o.strasse_snapshot,
-      o.ort_snapshot,
-      o.auftrags_nr_snapshot,
-      o.gespraechspartner_snapshot,
-      o.created_at,
-      o.updated_at,
-      s.name AS supplier_name,
-      s.code AS supplier_code,
-      s.formular_typ AS supplier_formular_typ_live
-    FROM "order".order_orders o
-    INNER JOIN "order".order_suppliers s
-      ON s.id = o.supplier_id
-    WHERE o.id = $1
-      AND s.code = 'mellerud'
-    LIMIT 1
-    `,
+    `SELECT * FROM "order".order_orders WHERE id = $1`,
     [orderId]
   );
 
-  if (orderResult.rows.length === 0) {
-    throw new Error(`Mellerud-Bestellung nicht gefunden: ${orderId}`);
-  }
-
-  const order = orderResult.rows[0];
-
   const positionsResult = await db.query(
-    `
-    SELECT
-      article_id,
-      supplier_article_no_snapshot,
-      ean_snapshot,
-      name_snapshot,
-      ve_stueck_snapshot,
-      menge_kartons,
-      positionssumme_netto,
-      sort_index_snapshot
-    FROM "order".order_order_positions
-    WHERE order_id = $1
-    ORDER BY sort_index_snapshot ASC NULLS LAST, name_snapshot ASC
-    `,
+    `SELECT * FROM "order".order_order_positions WHERE order_id = $1`,
     [orderId]
   );
 
   const articlesResult = await db.query(
-    `
-    SELECT
-      id,
-      supplier_article_no,
-      ean,
-      name,
-      ve_stueck,
-      sort_index
-    FROM "order".order_supplier_articles
-    WHERE supplier_id = $1
-      AND aktiv = true
-    ORDER BY sort_index ASC NULLS LAST, name ASC
-    `,
-    [order.supplier_id]
+    `SELECT * FROM "order".order_supplier_articles WHERE aktiv = true`,
   );
 
   const orderedMap = new Map();
 
-  for (const position of positionsResult.rows) {
-    orderedMap.set(position.article_id, {
-      menge_kartons: position.menge_kartons,
-      positionssumme_netto: position.positionssumme_netto,
+  for (const pos of positionsResult.rows) {
+    orderedMap.set(pos.article_id, {
+      menge_kartons: pos.menge_kartons
     });
   }
 
   return {
-    order,
-    supplier: {
-      id: order.supplier_id,
-      name: order.supplier_name,
-      code: order.supplier_code,
-      formular_typ: order.supplier_formular_typ_live || order.supplier_formular_typ_snapshot || null,
-    },
+    order: orderResult.rows[0],
     articles: articlesResult.rows,
-    orderedMap,
+    orderedMap
   };
 }
 
 async function generateMellerudOrderPdf(orderId) {
-  if (!orderId || typeof orderId !== 'string') {
-    throw new Error('orderId fehlt oder ist ungültig');
-  }
-
   const data = await loadMellerudPdfData(orderId);
-
-  if (!Array.isArray(data.articles) || data.articles.length === 0) {
-    throw new Error('Keine aktiven Mellerud-Artikel für PDF gefunden');
-  }
 
   const html = buildMellerudHtml(data);
 
-  let browser = null;
+  const browser = await puppeteer.launch({
+    args: ['--no-sandbox']
+  });
 
-  try {
-    browser = await puppeteer.launch({
-      headless: 'new',
-      args: ['--no-sandbox', '--disable-setuid-sandbox'],
-    });
+  const page = await browser.newPage();
+  await page.setContent(html);
 
-    const page = await browser.newPage();
+  const pdf = await page.pdf();
 
-    await page.setContent(html, {
-      waitUntil: 'networkidle0',
-    });
+  await browser.close();
 
-    let pdfBuffer = await page.pdf({
-      format: 'A4',
-      printBackground: true,
-      preferCSSPageSize: true,
-      displayHeaderFooter: false,
-    });
-
-    if (pdfBuffer instanceof Uint8Array) {
-      pdfBuffer = Buffer.from(pdfBuffer);
-    }
-
-    if (!pdfBuffer || !Buffer.isBuffer(pdfBuffer)) {
-      throw new Error('PDF-Erzeugung lieferte keinen Buffer');
-    }
-
-    await db.query(
-      `
-      UPDATE "order".order_orders
-      SET
-        pdf_generated_at = NOW(),
-        updated_at = NOW()
-      WHERE id = $1
-      `,
-      [orderId]
-    );
-
-    return pdfBuffer;
-  } finally {
-    if (browser) {
-      await browser.close();
-    }
-  }
+  return pdf;
 }
 
 module.exports = {
