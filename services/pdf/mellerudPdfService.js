@@ -36,7 +36,10 @@ function chunkArray(items, pageSize) {
 function buildMellerudLogo() {
   return `
     <div class="logo-box">
-      <div class="logo-main">MELLERUD</div>
+      <div class="logo-red">
+        <div class="logo-main">MELLERUD</div>
+        <div class="logo-cut"></div>
+      </div>
       <div class="logo-sub">UND GUT.</div>
     </div>
   `;
@@ -235,30 +238,53 @@ function buildMellerudHtml({ order, articles, orderedMap }) {
     }
 
     .logo-box {
-      width: 35mm;
-      height: 16mm;
-      background: #e30613;
-      color: #fff;
-      display: flex;
-      flex-direction: column;
-      justify-content: center;
-      align-items: center;
-      font-weight: bold;
-      margin-left: 0.5mm;
-    }
+  width: 35mm;
+  height: 18mm;
+  position: relative;
+  margin-left: 0.5mm;
+}
 
-    .logo-main {
-      font-size: 15px;
-      line-height: 1;
-      letter-spacing: 0.4px;
-    }
+.logo-red {
+  position: relative;
+  width: 35mm;
+  height: 14mm;
+  background: #e30613;
+  overflow: hidden;
+}
 
-    .logo-sub {
-      font-size: 7px;
-      line-height: 1;
-      margin-top: 3px;
-      letter-spacing: 0.6px;
-    }
+.logo-main {
+  position: absolute;
+  top: 4.1mm;
+  left: 3.2mm;
+  color: #fff;
+  font-size: 14.2px;
+  line-height: 1;
+  font-weight: 900;
+  letter-spacing: 0.35px;
+}
+
+.logo-cut {
+  position: absolute;
+  left: -1mm;
+  right: -1mm;
+  bottom: -0.2mm;
+  height: 4.2mm;
+  background: #fff;
+  clip-path: polygon(0 100%, 50% 20%, 100% 100%, 100% 100%, 0 100%);
+}
+
+.logo-sub {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0.1mm;
+  text-align: center;
+  color: #004a83;
+  font-size: 7.3px;
+  line-height: 1;
+  font-weight: 900;
+  letter-spacing: 0.65px;
+}
 
     .header-title {
       color: #004a83;
