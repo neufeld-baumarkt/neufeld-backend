@@ -1,3 +1,5 @@
+const fs = require('fs');
+const path = require('path');
 const puppeteer = require('puppeteer');
 const db = require('../../db');
 
@@ -25,12 +27,46 @@ function formatDate(value) {
   });
 }
 
+function formatToday() {
+  return new Date().toLocaleDateString('de-DE', {
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+  });
+}
+
 function chunkArray(items, pageSize) {
   const chunks = [];
   for (let i = 0; i < items.length; i += pageSize) {
     chunks.push(items.slice(i, i + pageSize));
   }
   return chunks;
+}
+
+function imageToDataUri(filePath) {
+  if (!fs.existsSync(filePath)) return '';
+
+  const ext = path.extname(filePath).toLowerCase();
+  const mimeType = ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : 'image/png';
+  const base64 = fs.readFileSync(filePath).toString('base64');
+
+  return `data:${mimeType};base64,${base64}`;
+}
+
+function loadTestAssets() {
+  if (process.env.PDF_TEST_ASSETS !== 'true') {
+    return {
+      signatureDataUri: '',
+      stampDataUri: '',
+    };
+  }
+
+  const imageDir = path.join(__dirname, 'images');
+
+  return {
+    signatureDataUri: imageToDataUri(path.join(imageDir, 'signature_peter.png')),
+    stampDataUri: imageToDataUri(path.join(imageDir, 'stamp_neufeld.png')),
+  };
 }
 
 function buildMellerudLogo() {
@@ -150,22 +186,30 @@ function buildArticleTable(articles, orderedMap) {
   `;
 }
 
-function buildSignatureBlock() {
+function buildSignatureBlock({ signatureDataUri, stampDataUri }) {
   return `
     <div class="signature-area">
       <div class="signature-row">
         <div class="signature-field">
-          <div class="signature-line"></div>
+          <div class="signature-line date-line">${escapeHtml(formatToday())}</div>
           <div class="signature-label">Bestelldatum</div>
         </div>
 
         <div class="signature-field">
-          <div class="signature-line"></div>
+          <div class="signature-line signature-line-filled">
+            ${
+              signatureDataUri
+                ? `<img class="signature-image" src="${signatureDataUri}" alt="Unterschrift" />`
+                : ''
+            }
+          </div>
           <div class="signature-label">Unterschrift Besteller</div>
         </div>
 
         <div class="stamp-field">
-          <div class="stamp-box"></div>
+          <div class="stamp-box">
+            ${stampDataUri ? `<img class="stamp-image" src="${stampDataUri}" alt="Firmenstempel" />` : ''}
+          </div>
           <div class="signature-label">Firmenstempel</div>
         </div>
       </div>
@@ -185,6 +229,8 @@ function buildMellerudHtml({ order, articles, orderedMap }) {
   const restArticles = articles.slice(firstPageRows);
   const restPages = chunkArray(restArticles, followingPageRows);
   const allPages = [firstPageArticles, ...restPages];
+
+  const testAssets = loadTestAssets();
 
   return `
 <!doctype html>
@@ -227,22 +273,23 @@ function buildMellerudHtml({ order, articles, orderedMap }) {
 
     .page-header {
       width: 100%;
-      margin-bottom: 7mm;
+      margin-bottom: 5mm;
     }
 
     .header-inner {
+      position: relative;
       display: grid;
       grid-template-columns: 42mm 1fr 42mm;
       align-items: center;
-      min-height: 22mm;
+      min-height: 20mm;
     }
 
     .logo-box {
       width: 35mm;
       height: 19mm;
       position: relative;
-      margin-left: 0.5mm;
-      margin-top: 1.5mm;
+      margin-left: 1.5mm;
+      margin-top: 2.2mm;
     }
 
     .logo-red {
@@ -288,18 +335,22 @@ function buildMellerudHtml({ order, articles, orderedMap }) {
     }
 
     .header-title {
+      position: absolute;
+      left: 50%;
+      transform: translateX(-50%);
       color: #004a83;
       font-size: 24px;
       font-weight: 700;
       text-align: center;
       line-height: 1;
       padding-top: 0.5mm;
+      white-space: nowrap;
     }
 
     .red-line {
-      height: 0.45mm;
+      height: 0.35mm;
       background: #d11f2a;
-      margin-top: 4.5mm;
+      margin-top: 3.2mm;
       margin-left: -14mm;
       margin-right: -14mm;
     }
@@ -351,7 +402,7 @@ function buildMellerudHtml({ order, articles, orderedMap }) {
       width: 100%;
       border-collapse: collapse;
       table-layout: fixed;
-      font-size: 6.1px;
+      font-size: 6.6px;
     }
 
     .article-table th {
@@ -367,7 +418,7 @@ function buildMellerudHtml({ order, articles, orderedMap }) {
 
     .article-table td {
       border: 0.25mm solid #a9a9a9;
-      padding: 0.95mm 1mm;
+      padding: 0.9mm 1mm;
       line-height: 1.05;
       height: 5.0mm;
       vertical-align: middle;
@@ -475,9 +526,32 @@ function buildMellerudHtml({ order, articles, orderedMap }) {
     }
 
     .signature-line {
+      position: relative;
       border-bottom: 0.35mm solid #004a83;
       height: 8mm;
       margin-bottom: 1mm;
+    }
+
+    .date-line {
+      color: #000;
+      font-size: 9px;
+      font-weight: normal;
+      text-align: center;
+      line-height: 8mm;
+    }
+
+    .signature-line-filled {
+      overflow: visible;
+    }
+
+    .signature-image {
+      position: absolute;
+      left: 50%;
+      bottom: 0.3mm;
+      transform: translateX(-50%);
+      max-width: 34mm;
+      max-height: 14mm;
+      object-fit: contain;
     }
 
     .signature-label {
@@ -492,9 +566,22 @@ function buildMellerudHtml({ order, articles, orderedMap }) {
     }
 
     .stamp-box {
+      position: relative;
       height: 22mm;
       border: 0.35mm solid #004a83;
       margin-bottom: 1mm;
+      overflow: hidden;
+      background: #fff;
+    }
+
+    .stamp-image {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      max-width: 48mm;
+      max-height: 20mm;
+      object-fit: contain;
     }
 
     .legal-text {
@@ -521,7 +608,7 @@ function buildMellerudHtml({ order, articles, orderedMap }) {
 
           ${buildArticleTable(pageArticles, orderedMap)}
 
-          ${isLastPage ? buildSignatureBlock() : ''}
+          ${isLastPage ? buildSignatureBlock(testAssets) : ''}
 
           ${buildFooter(pageNumber)}
         </section>
