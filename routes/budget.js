@@ -50,7 +50,7 @@ function isCentralRole(role) {
 }
 
 function isAdminOrSupervisor(role) {
-  return role === ROLE_ADMIN || role === ROLE_SUPERVISOR || role === ROLE_MANAGER_1;
+  return role === ROLE_ADMIN || role === ROLE_SUPERVISOR || role === ROLE_MANAGER_1 || role === ROLE_GF;
 }
 
 function normalizeFiliale(value) {
