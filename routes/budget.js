@@ -1356,5 +1356,308 @@ router.delete('/bookings/:id', verifyToken(), async (req, res) => {
     client.release();
   }
 });
+// =====================================================
+// Budget Analyse Dashboard (Read-Only)
+// =====================================================
+//
+// GET /api/budget/analyse?jahr=2026&filiale=Ahaus
+// GET /api/budget/analyse?jahr=2026&filiale=Alle
+//
+// Fachlogik:
+// - "Alle" ist KEIN DB-Datensatz.
+// - "Alle" = Aggregation aus Ahaus + Münster + Telgte + Vreden.
+// - Keine Schreiboperation.
+// - Keine Nutzung von enforceFilialeForCentral(), weil "Alle" dort bewusst verboten ist.
+//
 
+const ANALYSE_FILIALEN = ['Ahaus', 'Münster', 'Telgte', 'Vreden'];
+
+function round2(value) {
+  if (value === null || value === undefined) return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return Math.round(n * 100) / 100;
+}
+
+function addNumeric(a, b) {
+  return Number(a || 0) + Number(b || 0);
+}
+
+function getMonthFromIsoWeek(jahr, kw) {
+  const jan4 = new Date(Date.UTC(jahr, 0, 4));
+  const jan4Day = jan4.getUTCDay() || 7;
+
+  const week1Monday = new Date(jan4);
+  week1Monday.setUTCDate(jan4.getUTCDate() - jan4Day + 1);
+
+  const targetMonday = new Date(week1Monday);
+  targetMonday.setUTCDate(week1Monday.getUTCDate() + (kw - 1) * 7);
+
+  const targetThursday = new Date(targetMonday);
+  targetThursday.setUTCDate(targetMonday.getUTCDate() + 3);
+
+  return targetThursday.getUTCMonth() + 1;
+}
+
+function getDynamicQuoteByMonth(month) {
+  if (month === 1) return 0.48;
+  if (month === 2) return 0.50;
+  if (month === 3) return 0.58;
+  if (month === 4) return 0.72;
+  if (month === 5) return 0.78;
+  if (month === 6) return 0.62;
+  if (month >= 7 && month <= 9) return 0.54;
+  if (month === 10) return 0.56;
+  if (month === 11 || month === 12) return 0.52;
+  return null;
+}
+
+function buildAnalyseWeek(row) {
+  const monat = getMonthFromIsoWeek(Number(row.jahr), Number(row.kw));
+  const quoteDynamisch = getDynamicQuoteByMonth(monat);
+
+  const umsatzNetto = Number(row.umsatz_vorwoche_netto || 0);
+
+  return {
+    jahr: Number(row.jahr),
+    kw: Number(row.kw),
+    monat_iso_kw: monat,
+
+    quote_alt_prozent: 57,
+    quote_dynamisch_prozent: quoteDynamisch === null ? null : round2(quoteDynamisch * 100),
+    quote_tatsaechlich_prozent: round2(Number(row.prozentsatz_effektiv || 0) * 100),
+
+    umsatz_vorwoche_netto: round2(row.umsatz_vorwoche_netto),
+
+    budget_alt_57_netto: round2(umsatzNetto * 0.57),
+    budget_dynamisch_netto: quoteDynamisch === null ? null : round2(umsatzNetto * quoteDynamisch),
+    budget_freigegeben_netto: round2(row.budget_freigegeben_netto),
+
+    verbraucht_bestellung: round2(row.verbraucht),
+    verbraucht_aktion: round2(row.verbraucht_aktion),
+    verbraucht_gesamt: round2(row.verbraucht_gesamt),
+
+    umsatz_ytd_netto: round2(row.umsatz_ytd_netto),
+    budget_ytd_netto: round2(row.budget_ytd_netto),
+    verbraucht_bestellung_ytd: round2(row.verbraucht_ytd),
+    verbraucht_aktion_ytd: round2(row.verbraucht_aktion_ytd),
+    verbraucht_gesamt_ytd: round2(row.verbraucht_gesamt_ytd),
+
+    budget_satz_ytd_prozent: round2(row.budget_satz_ytd_prozent),
+    verbrauch_satz_ytd_prozent: round2(row.ist_verbrauch_satz_ytd_prozent),
+    verbrauch_satz_ytd_inkl_aktionen_prozent: round2(row.ist_verbrauch_satz_ytd_prozent_inkl_aktionen_brutto)
+  };
+}
+
+function aggregateRowsToAlle(rows) {
+  const byKw = new Map();
+
+  for (const row of rows) {
+    const key = `${row.jahr}-${row.kw}`;
+
+    if (!byKw.has(key)) {
+      byKw.set(key, {
+        jahr: Number(row.jahr),
+        kw: Number(row.kw),
+        filialen_count: 0,
+
+        umsatz_vorwoche_netto: 0,
+        budget_freigegeben_netto: 0,
+        verbraucht: 0,
+        verbraucht_aktion: 0,
+        verbraucht_gesamt: 0,
+
+        umsatz_ytd_netto: 0,
+        budget_ytd_netto: 0,
+        verbraucht_ytd: 0,
+        verbraucht_aktion_ytd: 0,
+        verbraucht_gesamt_ytd: 0,
+
+        prozentsatz_effektiv_weighted_sum: 0,
+        prozentsatz_effektiv_weight: 0
+      });
+    }
+
+    const g = byKw.get(key);
+    const umsatzNetto = Number(row.umsatz_vorwoche_netto || 0);
+    const prozentsatzEffektiv = Number(row.prozentsatz_effektiv || 0);
+
+    g.filialen_count += 1;
+
+    g.umsatz_vorwoche_netto = addNumeric(g.umsatz_vorwoche_netto, row.umsatz_vorwoche_netto);
+    g.budget_freigegeben_netto = addNumeric(g.budget_freigegeben_netto, row.budget_freigegeben_netto);
+    g.verbraucht = addNumeric(g.verbraucht, row.verbraucht);
+    g.verbraucht_aktion = addNumeric(g.verbraucht_aktion, row.verbraucht_aktion);
+    g.verbraucht_gesamt = addNumeric(g.verbraucht_gesamt, row.verbraucht_gesamt);
+
+    g.umsatz_ytd_netto = addNumeric(g.umsatz_ytd_netto, row.umsatz_ytd_netto);
+    g.budget_ytd_netto = addNumeric(g.budget_ytd_netto, row.budget_ytd_netto);
+    g.verbraucht_ytd = addNumeric(g.verbraucht_ytd, row.verbraucht_ytd);
+    g.verbraucht_aktion_ytd = addNumeric(g.verbraucht_aktion_ytd, row.verbraucht_aktion_ytd);
+    g.verbraucht_gesamt_ytd = addNumeric(g.verbraucht_gesamt_ytd, row.verbraucht_gesamt_ytd);
+
+    g.prozentsatz_effektiv_weighted_sum += prozentsatzEffektiv * umsatzNetto;
+    g.prozentsatz_effektiv_weight += umsatzNetto;
+  }
+
+  return Array.from(byKw.values())
+    .sort((a, b) => a.kw - b.kw)
+    .map((g) => {
+      const budgetSatzYtd =
+        g.umsatz_ytd_netto === 0 ? null : round2((g.budget_ytd_netto * 100) / g.umsatz_ytd_netto);
+
+      const verbrauchSatzYtd =
+        g.umsatz_ytd_netto === 0 ? null : round2((g.verbraucht_ytd * 100) / g.umsatz_ytd_netto);
+
+      const verbrauchSatzInklAktionen =
+        g.umsatz_ytd_netto === 0 ? null : round2((g.verbraucht_gesamt_ytd * 100) / g.umsatz_ytd_netto);
+
+      const prozentsatzEffektiv =
+        g.prozentsatz_effektiv_weight === 0
+          ? null
+          : g.prozentsatz_effektiv_weighted_sum / g.prozentsatz_effektiv_weight;
+
+      return {
+        ...g,
+        prozentsatz_effektiv: prozentsatzEffektiv,
+        budget_satz_ytd_prozent: budgetSatzYtd,
+        ist_verbrauch_satz_ytd_prozent: verbrauchSatzYtd,
+        ist_verbrauch_satz_ytd_prozent_inkl_aktionen_brutto: verbrauchSatzInklAktionen
+      };
+    });
+}
+
+function buildAnalyseKpis(weeks) {
+  if (!weeks.length) return null;
+
+  const last = weeks[weeks.length - 1];
+
+  return {
+    kw_stand: last.kw,
+
+    budget_ytd_netto: last.budget_ytd_netto,
+    verbrauch_bestellung_ytd: last.verbraucht_bestellung_ytd,
+    verbrauch_aktion_ytd: last.verbraucht_aktion_ytd,
+    verbrauch_gesamt_ytd: last.verbraucht_gesamt_ytd,
+
+    budget_satz_ytd_prozent: last.budget_satz_ytd_prozent,
+    verbrauch_satz_ytd_prozent: last.verbrauch_satz_ytd_prozent,
+    verbrauch_satz_ytd_inkl_aktionen_prozent: last.verbrauch_satz_ytd_inkl_aktionen_prozent,
+
+    differenz_verbrauch_zu_budget_ytd_netto:
+      last.verbraucht_bestellung_ytd === null || last.budget_ytd_netto === null
+        ? null
+        : round2(last.verbraucht_bestellung_ytd - last.budget_ytd_netto)
+  };
+}
+
+router.get('/analyse', verifyToken(), async (req, res) => {
+  const { role, filiale: tokenFiliale } = req.user || {};
+
+  const jahr = parseIntSafe(req.query?.jahr);
+  const filialeRaw = normalizeFiliale(req.query?.filiale);
+  const bisKw = parseIntSafe(req.query?.bisKw);
+
+  if (!jahr) {
+    return res.status(400).json({ message: 'jahr ist erforderlich.' });
+  }
+
+  if (!filialeRaw) {
+    return res.status(400).json({ message: 'filiale ist erforderlich. Erlaubt: Alle, Ahaus, Münster, Telgte, Vreden.' });
+  }
+
+  const isAlle = filialeRaw.toLowerCase() === 'alle';
+
+  if (isFilialeRole(role)) {
+    const eigeneFiliale = normalizeFiliale(tokenFiliale);
+
+    if (!eigeneFiliale) {
+      return res.status(403).json({ message: 'Filiale konnte aus dem Token nicht ermittelt werden.' });
+    }
+
+    if (isAlle || normalizeFiliale(filialeRaw) !== eigeneFiliale) {
+      return res.status(403).json({ message: 'Zugriff verweigert: Filialuser dürfen nur die eigene Filiale analysieren.' });
+    }
+  }
+
+  if (!isAlle && !ANALYSE_FILIALEN.includes(filialeRaw)) {
+    return res.status(400).json({
+      message: 'Ungültige Filiale. Erlaubt: Alle, Ahaus, Münster, Telgte, Vreden.'
+    });
+  }
+
+  try {
+    let rawRows = [];
+
+    if (isAlle) {
+      const result = await pool.query(
+        `
+          SELECT *
+          FROM budget.v_week_summary_global_ytd
+          WHERE jahr = $1
+            AND filiale = ANY($2::text[])
+	    AND ($3::int IS NULL OR kw <= $3)
+          ORDER BY kw, filiale
+        `,
+        [jahr, ANALYSE_FILIALEN, bisKw]
+      );
+
+      const rows = result.rows || [];
+
+      const countCheck = await pool.query(
+        `
+          SELECT kw, COUNT(*)::int AS filialen
+          FROM budget.v_week_summary_global_ytd
+          WHERE jahr = $1
+            AND filiale = ANY($2::text[])
+          GROUP BY kw
+          HAVING COUNT(*) <> 4
+          ORDER BY kw
+        `,
+        [jahr, ANALYSE_FILIALEN]
+      );
+
+      if (countCheck.rows.length > 0) {
+        return res.status(409).json({
+          message: 'Analyse nicht möglich: Nicht jede KW enthält exakt 4 Filialen.',
+          problem_wochen: countCheck.rows
+        });
+      }
+
+      rawRows = aggregateRowsToAlle(rows);
+    } else {
+      const result = await pool.query(
+  `
+      SELECT *
+      FROM budget.v_week_summary_global_ytd
+      WHERE jahr = $1
+      AND filiale = $2
+      AND ($3::int IS NULL OR kw <= $3)
+      ORDER BY kw
+  `,
+  [jahr, filialeRaw, bisKw]
+);
+
+      rawRows = result.rows || [];
+    }
+
+    const weeks = rawRows.map(buildAnalyseWeek);
+    const kpis = buildAnalyseKpis(weeks);
+
+    return res.json({
+    meta: {
+        jahr,
+        bis_kw: bisKw || null,
+        filiale: isAlle ? 'Alle' : filialeRaw,
+        mode: isAlle ? 'aggregate' : 'single',
+        weeks_count: weeks.length
+      },
+      kpis,
+      weeks
+    });
+  } catch (e) {
+    console.error('Fehler GET /api/budget/analyse:', e.message);
+    return res.status(500).json({ message: 'Serverfehler (Budget Analyse).' });
+  }
+});
 module.exports = router;
