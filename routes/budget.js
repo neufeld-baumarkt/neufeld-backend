@@ -1532,25 +1532,67 @@ function buildAnalyseKpis(weeks) {
 
   const last = weeks[weeks.length - 1];
 
+  const budgetAlt57Ytd = round2(
+    weeks.reduce(
+      (sum, w) => sum + Number(w.budget_alt_57_netto || 0),
+      0
+    )
+  );
+
+  const budgetDynamischYtd = round2(
+    weeks.reduce(
+      (sum, w) => sum + Number(w.budget_dynamisch_netto || 0),
+      0
+    )
+  );
+
   return {
     kw_stand: last.kw,
 
     budget_ytd_netto: last.budget_ytd_netto,
     verbrauch_bestellung_ytd: last.verbraucht_bestellung_ytd,
-    verbrauch_aktion_ytd: last.verbraucht_aktion_ytd,
-    verbrauch_gesamt_ytd: last.verbraucht_gesamt_ytd,
+    verbrauch_aktion_ytd: last.verbrauch_aktion_ytd,
+    verbrauch_gesamt_ytd: last.verbrauch_gesamt_ytd,
 
     budget_satz_ytd_prozent: last.budget_satz_ytd_prozent,
     verbrauch_satz_ytd_prozent: last.verbrauch_satz_ytd_prozent,
-    verbrauch_satz_ytd_inkl_aktionen_prozent: last.verbrauch_satz_ytd_inkl_aktionen_prozent,
+    verbrauch_satz_ytd_inkl_aktionen_prozent:
+      last.verbrauch_satz_ytd_inkl_aktionen_prozent,
 
     differenz_verbrauch_zu_budget_ytd_netto:
-      last.verbraucht_bestellung_ytd === null || last.budget_ytd_netto === null
+      last.verbraucht_bestellung_ytd === null ||
+      last.budget_ytd_netto === null
         ? null
-        : round2(last.verbraucht_bestellung_ytd - last.budget_ytd_netto)
+        : round2(
+            last.verbraucht_bestellung_ytd -
+            last.budget_ytd_netto
+          ),
+
+    // ===============================
+    // Phase 3.1 – Modellvergleich
+    // ===============================
+
+    budget_alt_57_ytd_netto: budgetAlt57Ytd,
+
+    budget_dynamisch_ytd_netto: budgetDynamischYtd,
+
+    abweichung_zu_57_ytd_netto:
+      last.verbraucht_bestellung_ytd === null
+        ? null
+        : round2(
+            last.verbraucht_bestellung_ytd -
+            budgetAlt57Ytd
+          ),
+
+    abweichung_zu_dynamik_ytd_netto:
+      last.verbraucht_bestellung_ytd === null
+        ? null
+        : round2(
+            last.verbraucht_bestellung_ytd -
+            budgetDynamischYtd
+          )
   };
 }
-
 router.get('/analyse', verifyToken(), async (req, res) => {
   const { role, filiale: tokenFiliale } = req.user || {};
 

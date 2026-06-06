@@ -185,6 +185,7 @@ const debugRoutes = require('./routes/debug');
 const tasksRoutes = require('./routes/tasks');
 const filialePinsRoutes = require('./routes/filialePins');
 const bestellungenRoutes = require('./routes/bestellungen');
+const cashflowRoutes = require('./routes/cashflow');
 
 app.use('/api/reklamationen', reklamationenRoutes);
 app.use('/api/budget', budgetRoutes);
@@ -192,6 +193,7 @@ app.use('/api/debug', debugRoutes);
 app.use('/api/tasks', tasksRoutes);
 app.use('/api/filiale-pins', filialePinsRoutes);
 app.use('/api/bestellungen', bestellungenRoutes);
+app.use('/api/cashflow', cashflowRoutes);
 app.use('/api', stammdatenRoutes);
 
 // 404 Fallback – als JSON + Fingerprint
