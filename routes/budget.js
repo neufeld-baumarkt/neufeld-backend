@@ -1551,22 +1551,22 @@ function buildAnalyseKpis(weeks) {
 
     budget_ytd_netto: last.budget_ytd_netto,
     verbrauch_bestellung_ytd: last.verbraucht_bestellung_ytd,
-    verbrauch_aktion_ytd: last.verbrauch_aktion_ytd,
-    verbrauch_gesamt_ytd: last.verbrauch_gesamt_ytd,
+    verbrauch_aktion_ytd: last.verbraucht_aktion_ytd,
+    verbrauch_gesamt_ytd: last.verbraucht_gesamt_ytd,
 
     budget_satz_ytd_prozent: last.budget_satz_ytd_prozent,
     verbrauch_satz_ytd_prozent: last.verbrauch_satz_ytd_prozent,
     verbrauch_satz_ytd_inkl_aktionen_prozent:
-      last.verbrauch_satz_ytd_inkl_aktionen_prozent,
+    last.verbrauch_satz_ytd_inkl_aktionen_prozent,
 
-    differenz_verbrauch_zu_budget_ytd_netto:
-      last.verbraucht_bestellung_ytd === null ||
-      last.budget_ytd_netto === null
-        ? null
-        : round2(
-            last.verbraucht_bestellung_ytd -
-            last.budget_ytd_netto
-          ),
+differenz_verbrauch_zu_budget_ytd_netto:
+  last.verbraucht_bestellung_ytd === null ||
+  last.budget_ytd_netto === null
+    ? null
+    : round2(
+        last.verbraucht_bestellung_ytd -
+        last.budget_ytd_netto
+      ),
 
     // ===============================
     // Phase 3.1 – Modellvergleich
