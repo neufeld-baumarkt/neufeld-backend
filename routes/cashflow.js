@@ -118,6 +118,66 @@ router.get('/jahresuebersicht', verifyToken(), requireCashflowAccess, async (req
   }
 });
 
+// GET /api/cashflow/buchungen?jahr=2024
+// GET /api/cashflow/buchungen?jahr=2024&bisKw=18
+router.get('/buchungen', verifyToken(), requireCashflowAccess, async (req, res) => {
+  const jahr = parseJahrParam(req, res);
+  if (jahr === null) return;
+
+  const bisKw = parseBisKwParam(req, res);
+  if (bisKw === false) return;
+
+  try {
+    const params = [jahr];
+    const bisKwFilter = buildBisKwFilter(bisKw, params);
+
+    const result = await pool.query(
+      `
+      SELECT
+        b.id,
+        b.jahr,
+        b.kw,
+        b.datum,
+        b.tag,
+        b.kategorie_id,
+        k.name AS kategorie,
+        k.typ,
+        b.betrag,
+        b.quelle,
+        b.quelle_zeile,
+        b.erstellt_von,
+        b.erstellt_am,
+        b.geaendert_am
+      FROM cashflow.buchungen b
+      JOIN cashflow.kategorien k
+        ON k.id = b.kategorie_id
+      WHERE b.jahr = $1
+        AND k.aktiv = true
+        ${bisKwFilter}
+      ORDER BY
+        b.kw DESC,
+        b.datum DESC,
+        k.sortierung ASC,
+        b.id ASC
+      `,
+      params
+    );
+
+    return res.json({
+      jahr,
+      bisKw,
+      anzahl: result.rows.length,
+      buchungen: result.rows,
+    });
+  } catch (err) {
+    console.error('Fehler GET /api/cashflow/buchungen:', err);
+
+    return res.status(500).json({
+      message: 'Serverfehler beim Laden der Cashflow-Buchungen.',
+    });
+  }
+});
+
 // GET /api/cashflow/kategorien?jahr=2024
 // GET /api/cashflow/kategorien?jahr=2024&bisKw=18
 router.get('/kategorien', verifyToken(), requireCashflowAccess, async (req, res) => {
