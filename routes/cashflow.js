@@ -317,10 +317,30 @@ router.get('/jahresuebersicht', verifyToken(), requireCashflowAccess, async (req
       params
     );
 
+    const vorhandeneWochen = result.rows;
+
+    const alleWochen = Array.from({ length: 53 }, (_, index) => ({
+      kw: index + 1,
+      einnahmen: '0.00',
+      ausgaben: '0.00',
+      saldo: '0.00',
+    }));
+
+    const weekMap = new Map(
+      vorhandeneWochen.map((week) => [
+        Number(week.kw),
+        week,
+      ])
+    );
+
+    const mergedWeeks = alleWochen.map(
+      (week) => weekMap.get(week.kw) || week
+    );
+
     return res.json({
       jahr,
       bisKw,
-      weeks: result.rows,
+      weeks: mergedWeeks,
     });
   } catch (err) {
     console.error('Fehler GET /api/cashflow/jahresuebersicht:', err);
