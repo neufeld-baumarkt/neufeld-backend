@@ -1,11 +1,12 @@
-// routes/cashflow.js – Cashflow Read-Only Endpoints
+// routes/cashflow.js – Cashflow Endpoints
 // Zweck:
 // - Jahresübersicht für Cashflow-Dashboard bereitstellen
 // - Kategorieauswertung für Cashflow-Dashboard bereitstellen
 // - KPI-Auswertung für Cashflow-Dashboard bereitstellen
+// - Buchungsübersicht bereitstellen
+// - Fast-Booking-Buchungen speichern
 // - Optionaler bisKw-Filter für Zeitraumvergleiche
 // - Zugriff nur für Admin, Supervisor und Geschäftsführer
-// - Keine Schreiboperationen
 // - Saldo wird serverseitig über cashflow.kategorien.typ berechnet
 
 const express = require('express');
@@ -16,12 +17,25 @@ const verifyToken = require('../middleware/verifyToken');
 
 const ALLOWED_ROLES = new Set(['Admin', 'Supervisor', 'Geschäftsführer']);
 
+const ALLOWED_TAGS = new Set(['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So']);
+
+const ALLOWED_FAST_BOOKING_FILIALEN = new Set([
+  'Verwaltung',
+  'Ahaus',
+  'Münster',
+  'Telgte',
+  'Vreden',
+]);
+
+const ALLOWED_EINTRAG_TYPEN = new Set(['betrag', 'feiertag']);
+
 function requireCashflowAccess(req, res, next) {
   const role = req.user?.role;
 
   if (!ALLOWED_ROLES.has(role)) {
     return res.status(403).json({
-      message: 'Zugriff verweigert. Erforderliche Rolle: Admin, Supervisor oder Geschäftsführer.',
+      message:
+        'Zugriff verweigert. Erforderliche Rolle: Admin, Supervisor oder Geschäftsführer.',
     });
   }
 
@@ -42,7 +56,11 @@ function parseJahrParam(req, res) {
 }
 
 function parseBisKwParam(req, res) {
-  if (req.query?.bisKw === undefined || req.query?.bisKw === null || req.query?.bisKw === '') {
+  if (
+    req.query?.bisKw === undefined ||
+    req.query?.bisKw === null ||
+    req.query?.bisKw === ''
+  ) {
     return null;
   }
 
@@ -66,6 +84,200 @@ function buildBisKwFilter(bisKw, params) {
   params.push(bisKw);
   return `AND b.kw <= $${params.length}`;
 }
+
+function parseFastBookingPayload(req, res) {
+  const jahr = Number(req.body?.jahr);
+  const kw = Number(req.body?.kw);
+  const tag = String(req.body?.tag || '').trim();
+  const kategorieId = Number(req.body?.kategorie_id ?? req.body?.kategorieId);
+  const filiale = String(req.body?.filiale || '').trim();
+  const eintragTyp = String(req.body?.eintrag_typ || 'betrag').trim();
+  const notizRaw = req.body?.notiz;
+  const notiz =
+    notizRaw === undefined || notizRaw === null || String(notizRaw).trim() === ''
+      ? null
+      : String(notizRaw).trim();
+
+  if (!Number.isInteger(jahr) || jahr < 2000 || jahr > 2100) {
+    res.status(400).json({
+      message: 'Ungültiges Jahr.',
+    });
+    return null;
+  }
+
+  if (!Number.isInteger(kw) || kw < 1 || kw > 53) {
+    res.status(400).json({
+      message: 'Ungültige KW.',
+    });
+    return null;
+  }
+
+  if (!ALLOWED_TAGS.has(tag)) {
+    res.status(400).json({
+      message: 'Ungültiger Tag. Erlaubt sind Mo, Di, Mi, Do, Fr, Sa, So.',
+    });
+    return null;
+  }
+
+  if (!Number.isInteger(kategorieId) || kategorieId < 1) {
+    res.status(400).json({
+      message: 'Ungültige Kategorie.',
+    });
+    return null;
+  }
+
+  if (!ALLOWED_FAST_BOOKING_FILIALEN.has(filiale)) {
+    res.status(400).json({
+      message:
+        'Ungültige Filiale. Erlaubt sind Verwaltung, Ahaus, Münster, Telgte und Vreden.',
+    });
+    return null;
+  }
+
+  if (!ALLOWED_EINTRAG_TYPEN.has(eintragTyp)) {
+    res.status(400).json({
+      message: 'Ungültiger Eintragstyp. Erlaubt sind betrag und feiertag.',
+    });
+    return null;
+  }
+
+  let betrag = 0;
+
+  if (eintragTyp === 'betrag') {
+    betrag = Number(req.body?.betrag);
+
+    if (!Number.isFinite(betrag) || betrag <= 0) {
+      res.status(400).json({
+        message: 'Ungültiger Betrag. Erwartet wird eine Zahl größer 0.',
+      });
+      return null;
+    }
+  }
+
+  if (eintragTyp === 'feiertag') {
+    betrag = 0;
+  }
+
+  return {
+    jahr,
+    kw,
+    tag,
+    kategorieId,
+    filiale,
+    betrag,
+    eintragTyp,
+    notiz,
+  };
+}
+
+// POST /api/cashflow/buchungen
+router.post('/buchungen', verifyToken(), requireCashflowAccess, async (req, res) => {
+  const payload = parseFastBookingPayload(req, res);
+  if (payload === null) return;
+
+  try {
+    const kategorieCheck = await pool.query(
+      `
+      SELECT
+        id,
+        name,
+        typ
+      FROM cashflow.kategorien
+      WHERE id = $1
+        AND aktiv = true
+      `,
+      [payload.kategorieId]
+    );
+
+    if (kategorieCheck.rowCount === 0) {
+      return res.status(400).json({
+        message: 'Kategorie existiert nicht oder ist nicht aktiv.',
+      });
+    }
+
+    const erstelltVon = req.user?.name || req.user?.id || 'system';
+
+    const result = await pool.query(
+      `
+      INSERT INTO cashflow.buchungen (
+        jahr,
+        kw,
+        datum,
+        tag,
+        kategorie_id,
+        betrag,
+        quelle,
+        quelle_zeile,
+        erstellt_von,
+        filiale,
+        status,
+        notiz,
+        eintrag_typ
+      )
+      VALUES (
+        $1,
+        $2,
+        NULL,
+        $3,
+        $4,
+        $5,
+        'fast_booking',
+        NULL,
+        $6,
+        $7,
+        'angekuendigt',
+        $8,
+        $9
+      )
+      RETURNING
+        id,
+        jahr,
+        kw,
+        datum,
+        tag,
+        kategorie_id,
+        betrag,
+        quelle,
+        quelle_zeile,
+        erstellt_von,
+        erstellt_am,
+        geaendert_am,
+        filiale,
+        status,
+        notiz,
+        eintrag_typ
+      `,
+      [
+        payload.jahr,
+        payload.kw,
+        payload.tag,
+        payload.kategorieId,
+        payload.betrag,
+        erstelltVon,
+        payload.filiale,
+        payload.notiz,
+        payload.eintragTyp,
+      ]
+    );
+
+    const inserted = result.rows[0];
+
+    return res.status(201).json({
+      message: 'Cashflow-Buchung gespeichert.',
+      buchung: {
+        ...inserted,
+        kategorie: kategorieCheck.rows[0].name,
+        typ: kategorieCheck.rows[0].typ,
+      },
+    });
+  } catch (err) {
+    console.error('Fehler POST /api/cashflow/buchungen:', err);
+
+    return res.status(500).json({
+      message: 'Serverfehler beim Speichern der Cashflow-Buchung.',
+    });
+  }
+});
 
 // GET /api/cashflow/jahresuebersicht?jahr=2024
 // GET /api/cashflow/jahresuebersicht?jahr=2024&bisKw=18
@@ -147,7 +359,11 @@ router.get('/buchungen', verifyToken(), requireCashflowAccess, async (req, res) 
         b.quelle_zeile,
         b.erstellt_von,
         b.erstellt_am,
-        b.geaendert_am
+        b.geaendert_am,
+        b.filiale,
+        b.status,
+        b.notiz,
+        b.eintrag_typ
       FROM cashflow.buchungen b
       JOIN cashflow.kategorien k
         ON k.id = b.kategorie_id
