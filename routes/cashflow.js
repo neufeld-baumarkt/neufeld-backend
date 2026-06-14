@@ -317,9 +317,10 @@ router.get('/jahresuebersicht', verifyToken(), requireCashflowAccess, async (req
       params
     );
 
-    const vorhandeneWochen = result.rows;
+    const maxKw = bisKw || 53;
 
-    const alleWochen = Array.from({ length: 53 }, (_, index) => ({
+    const alleWochen = Array.from({ length: maxKw }, (_, index) => ({
+      jahr,
       kw: index + 1,
       einnahmen: '0.00',
       ausgaben: '0.00',
@@ -327,14 +328,17 @@ router.get('/jahresuebersicht', verifyToken(), requireCashflowAccess, async (req
     }));
 
     const weekMap = new Map(
-      vorhandeneWochen.map((week) => [
+      result.rows.map((week) => [
         Number(week.kw),
-        week,
+        {
+          jahr,
+          ...week,
+        },
       ])
     );
 
-    const mergedWeeks = alleWochen.map(
-      (week) => weekMap.get(week.kw) || week
+    const mergedWeeks = alleWochen.map((week) =>
+      weekMap.get(week.kw) || week
     );
 
     return res.json({
