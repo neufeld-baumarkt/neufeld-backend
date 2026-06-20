@@ -5,6 +5,7 @@
 // - KPI-Auswertung für Cashflow-Dashboard bereitstellen
 // - Buchungsübersicht bereitstellen
 // - Fast-Booking-Buchungen speichern
+// - Bestehende Buchungen aktualisieren (Status + Notiz)
 // - Optionaler bisKw-Filter für Zeitraumvergleiche
 // - Zugriff nur für Admin, Supervisor und Geschäftsführer
 // - Saldo wird serverseitig über cashflow.kategorien.typ berechnet
@@ -16,7 +17,6 @@ const pool = require('../db');
 const verifyToken = require('../middleware/verifyToken');
 
 const ALLOWED_ROLES = new Set(['Admin', 'Supervisor', 'Geschäftsführer']);
-
 const ALLOWED_TAGS = new Set(['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So']);
 
 const ALLOWED_FAST_BOOKING_FILIALEN = new Set([
@@ -28,6 +28,7 @@ const ALLOWED_FAST_BOOKING_FILIALEN = new Set([
 ]);
 
 const ALLOWED_EINTRAG_TYPEN = new Set(['betrag', 'feiertag']);
+const ALLOWED_STATUS = new Set(['angekuendigt', 'gebucht']);
 
 function requireCashflowAccess(req, res, next) {
   const role = req.user?.role;
@@ -99,16 +100,12 @@ function parseFastBookingPayload(req, res) {
       : String(notizRaw).trim();
 
   if (!Number.isInteger(jahr) || jahr < 2000 || jahr > 2100) {
-    res.status(400).json({
-      message: 'Ungültiges Jahr.',
-    });
+    res.status(400).json({ message: 'Ungültiges Jahr.' });
     return null;
   }
 
   if (!Number.isInteger(kw) || kw < 1 || kw > 53) {
-    res.status(400).json({
-      message: 'Ungültige KW.',
-    });
+    res.status(400).json({ message: 'Ungültige KW.' });
     return null;
   }
 
@@ -120,9 +117,7 @@ function parseFastBookingPayload(req, res) {
   }
 
   if (!Number.isInteger(kategorieId) || kategorieId < 1) {
-    res.status(400).json({
-      message: 'Ungültige Kategorie.',
-    });
+    res.status(400).json({ message: 'Ungültige Kategorie.' });
     return null;
   }
 
@@ -167,6 +162,39 @@ function parseFastBookingPayload(req, res) {
     betrag,
     eintragTyp,
     notiz,
+  };
+}
+
+function parseUpdateBuchungPayload(req, res) {
+  const status =
+    req.body?.status === undefined || req.body?.status === null
+      ? undefined
+      : String(req.body.status).trim();
+
+  const notiz =
+    req.body?.notiz === undefined || req.body?.notiz === null || String(req.body.notiz).trim() === ''
+      ? null
+      : String(req.body.notiz).trim();
+
+  if (status !== undefined && !ALLOWED_STATUS.has(status)) {
+    res.status(400).json({
+      message: 'Ungültiger Status. Erlaubt sind angekuendigt und gebucht.',
+    });
+    return null;
+  }
+
+  if (status === undefined && req.body?.notiz === undefined) {
+    res.status(400).json({
+      message: 'Keine gültigen Änderungsdaten übergeben.',
+    });
+    return null;
+  }
+
+  return {
+    status,
+    notiz,
+    updateStatus: status !== undefined,
+    updateNotiz: req.body?.notiz !== undefined,
   };
 }
 
@@ -275,6 +303,79 @@ router.post('/buchungen', verifyToken(), requireCashflowAccess, async (req, res)
 
     return res.status(500).json({
       message: 'Serverfehler beim Speichern der Cashflow-Buchung.',
+    });
+  }
+});
+
+// PATCH /api/cashflow/buchungen/:id
+router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req, res) => {
+  const id = String(req.params?.id || '').trim();
+
+  if (!id) {
+    return res.status(400).json({
+      message: 'Ungültige Buchungs-ID.',
+    });
+  }
+
+  const payload = parseUpdateBuchungPayload(req, res);
+  if (payload === null) return;
+
+  try {
+    const result = await pool.query(
+      `
+      UPDATE cashflow.buchungen b
+      SET
+        status = CASE WHEN $2::boolean THEN $3 ELSE b.status END,
+        notiz = CASE WHEN $4::boolean THEN $5 ELSE b.notiz END,
+        geaendert_am = NOW()
+      FROM cashflow.kategorien k
+      WHERE b.id = $1
+        AND k.id = b.kategorie_id
+        AND k.aktiv = true
+      RETURNING
+        b.id,
+        b.jahr,
+        b.kw,
+        b.datum,
+        b.tag,
+        b.kategorie_id,
+        k.name AS kategorie,
+        k.typ,
+        b.betrag,
+        b.quelle,
+        b.quelle_zeile,
+        b.erstellt_von,
+        b.erstellt_am,
+        b.geaendert_am,
+        b.filiale,
+        b.status,
+        b.notiz,
+        b.eintrag_typ
+      `,
+      [
+        id,
+        payload.updateStatus,
+        payload.status || null,
+        payload.updateNotiz,
+        payload.notiz,
+      ]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({
+        message: 'Cashflow-Buchung nicht gefunden.',
+      });
+    }
+
+    return res.json({
+      message: 'Cashflow-Buchung aktualisiert.',
+      buchung: result.rows[0],
+    });
+  } catch (err) {
+    console.error('Fehler PATCH /api/cashflow/buchungen/:id:', err);
+
+    return res.status(500).json({
+      message: 'Serverfehler beim Aktualisieren der Cashflow-Buchung.',
     });
   }
 });
