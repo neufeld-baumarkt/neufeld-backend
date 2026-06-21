@@ -172,7 +172,9 @@ function parseUpdateBuchungPayload(req, res) {
       : String(req.body.status).trim();
 
   const notiz =
-    req.body?.notiz === undefined || req.body?.notiz === null || String(req.body.notiz).trim() === ''
+    req.body?.notiz === undefined ||
+    req.body?.notiz === null ||
+    String(req.body.notiz).trim() === ''
       ? null
       : String(req.body.notiz).trim();
 
@@ -186,8 +188,22 @@ function parseUpdateBuchungPayload(req, res) {
       ? undefined
       : String(req.body.eintrag_typ).trim();
 
+  const jahrRaw = req.body?.jahr;
+  const jahrProvided = jahrRaw !== undefined && jahrRaw !== null && jahrRaw !== '';
+  const jahr = jahrProvided ? Number(jahrRaw) : undefined;
+
+  const kwRaw = req.body?.kw;
+  const kwProvided = kwRaw !== undefined && kwRaw !== null && kwRaw !== '';
+  const kw = kwProvided ? Number(kwRaw) : undefined;
+
+  const tag =
+    req.body?.tag === undefined || req.body?.tag === null
+      ? undefined
+      : String(req.body.tag).trim();
+
   const betragRaw = req.body?.betrag;
-  const betragProvided = betragRaw !== undefined && betragRaw !== null && betragRaw !== '';
+  const betragProvided =
+    betragRaw !== undefined && betragRaw !== null && betragRaw !== '';
   const betrag = betragProvided ? Number(betragRaw) : undefined;
 
   if (status !== undefined && !ALLOWED_STATUS.has(status)) {
@@ -212,6 +228,27 @@ function parseUpdateBuchungPayload(req, res) {
     return null;
   }
 
+  if (jahrProvided && (!Number.isInteger(jahr) || jahr < 2000 || jahr > 2100)) {
+    res.status(400).json({
+      message: 'Ungültiges Jahr.',
+    });
+    return null;
+  }
+
+  if (kwProvided && (!Number.isInteger(kw) || kw < 1 || kw > 53)) {
+    res.status(400).json({
+      message: 'Ungültige KW.',
+    });
+    return null;
+  }
+
+  if (tag !== undefined && !ALLOWED_TAGS.has(tag)) {
+    res.status(400).json({
+      message: 'Ungültiger Tag. Erlaubt sind Mo, Di, Mi, Do, Fr, Sa, So.',
+    });
+    return null;
+  }
+
   if (betragProvided && (!Number.isFinite(betrag) || betrag < 0)) {
     res.status(400).json({
       message: 'Ungültiger Betrag. Erwartet wird eine Zahl größer oder gleich 0.',
@@ -231,6 +268,9 @@ function parseUpdateBuchungPayload(req, res) {
     req.body?.notiz === undefined &&
     filiale === undefined &&
     eintragTyp === undefined &&
+    !jahrProvided &&
+    !kwProvided &&
+    tag === undefined &&
     !betragProvided
   ) {
     res.status(400).json({
@@ -244,11 +284,17 @@ function parseUpdateBuchungPayload(req, res) {
     notiz,
     filiale,
     eintragTyp,
+    jahr,
+    kw,
+    tag,
     betrag,
     updateStatus: status !== undefined,
     updateNotiz: req.body?.notiz !== undefined,
     updateFiliale: filiale !== undefined,
     updateEintragTyp: eintragTyp !== undefined,
+    updateJahr: jahrProvided,
+    updateKw: kwProvided,
+    updateTag: tag !== undefined,
     updateBetrag: betragProvided,
   };
 }
@@ -384,9 +430,12 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
         notiz = CASE WHEN $4::boolean THEN $5 ELSE b.notiz END,
         filiale = CASE WHEN $6::boolean THEN $7 ELSE b.filiale END,
         eintrag_typ = CASE WHEN $8::boolean THEN $9 ELSE b.eintrag_typ END,
+        jahr = CASE WHEN $10::boolean THEN $11 ELSE b.jahr END,
+        kw = CASE WHEN $12::boolean THEN $13 ELSE b.kw END,
+        tag = CASE WHEN $14::boolean THEN $15 ELSE b.tag END,
         betrag = CASE
           WHEN $8::boolean AND $9 = 'feiertag' THEN 0
-          WHEN $10::boolean THEN $11
+          WHEN $16::boolean THEN $17
           ELSE b.betrag
         END,
         geaendert_am = NOW()
@@ -424,6 +473,12 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
         payload.filiale || null,
         payload.updateEintragTyp,
         payload.eintragTyp || null,
+        payload.updateJahr,
+        payload.jahr ?? null,
+        payload.updateKw,
+        payload.kw ?? null,
+        payload.updateTag,
+        payload.tag || null,
         payload.updateBetrag,
         payload.betrag ?? null,
       ]
