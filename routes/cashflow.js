@@ -6,6 +6,7 @@
 // - Buchungsübersicht bereitstellen
 // - Fast-Booking-Buchungen speichern
 // - Bestehende Buchungen aktualisieren
+// - Bestehende Buchungen löschen
 // - Optionaler bisKw-Filter für Zeitraumvergleiche
 // - Zugriff nur für Admin, Supervisor und Geschäftsführer
 // - Saldo wird serverseitig über cashflow.kategorien.typ berechnet
@@ -41,6 +42,12 @@ function requireCashflowAccess(req, res, next) {
   }
 
   next();
+}
+
+function isValidUuid(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+    String(value || '').trim()
+  );
 }
 
 function parseJahrParam(req, res) {
@@ -412,7 +419,7 @@ router.post('/buchungen', verifyToken(), requireCashflowAccess, async (req, res)
 router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req, res) => {
   const id = String(req.params?.id || '').trim();
 
-  if (!id) {
+  if (!isValidUuid(id)) {
     return res.status(400).json({
       message: 'Ungültige Buchungs-ID.',
     });
@@ -499,6 +506,66 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
 
     return res.status(500).json({
       message: 'Serverfehler beim Aktualisieren der Cashflow-Buchung.',
+    });
+  }
+});
+
+// DELETE /api/cashflow/buchungen/:id
+router.delete('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req, res) => {
+  const id = String(req.params?.id || '').trim();
+
+  if (!isValidUuid(id)) {
+    return res.status(400).json({
+      message: 'Ungültige Buchungs-ID.',
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      `
+      DELETE FROM cashflow.buchungen b
+      USING cashflow.kategorien k
+      WHERE b.id = $1
+        AND k.id = b.kategorie_id
+        AND k.aktiv = true
+      RETURNING
+        b.id,
+        b.jahr,
+        b.kw,
+        b.datum,
+        b.tag,
+        b.kategorie_id,
+        k.name AS kategorie,
+        k.typ,
+        b.betrag,
+        b.quelle,
+        b.quelle_zeile,
+        b.erstellt_von,
+        b.erstellt_am,
+        b.geaendert_am,
+        b.filiale,
+        b.status,
+        b.notiz,
+        b.eintrag_typ
+      `,
+      [id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({
+        message: 'Cashflow-Buchung nicht gefunden.',
+      });
+    }
+
+    return res.json({
+      message: 'Cashflow-Buchung gelöscht.',
+      buchung: result.rows[0],
+    });
+  } catch (err) {
+    console.error('Fehler DELETE /api/cashflow/buchungen/:id:', err);
+
+    return res.status(500).json({
+      message: 'Serverfehler beim Löschen der Cashflow-Buchung.',
     });
   }
 });
