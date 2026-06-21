@@ -5,7 +5,7 @@
 // - KPI-Auswertung für Cashflow-Dashboard bereitstellen
 // - Buchungsübersicht bereitstellen
 // - Fast-Booking-Buchungen speichern
-// - Bestehende Buchungen aktualisieren (Status + Notiz)
+// - Bestehende Buchungen aktualisieren
 // - Optionaler bisKw-Filter für Zeitraumvergleiche
 // - Zugriff nur für Admin, Supervisor und Geschäftsführer
 // - Saldo wird serverseitig über cashflow.kategorien.typ berechnet
@@ -176,6 +176,20 @@ function parseUpdateBuchungPayload(req, res) {
       ? null
       : String(req.body.notiz).trim();
 
+  const filiale =
+    req.body?.filiale === undefined || req.body?.filiale === null
+      ? undefined
+      : String(req.body.filiale).trim();
+
+  const eintragTyp =
+    req.body?.eintrag_typ === undefined || req.body?.eintrag_typ === null
+      ? undefined
+      : String(req.body.eintrag_typ).trim();
+
+  const betragRaw = req.body?.betrag;
+  const betragProvided = betragRaw !== undefined && betragRaw !== null && betragRaw !== '';
+  const betrag = betragProvided ? Number(betragRaw) : undefined;
+
   if (status !== undefined && !ALLOWED_STATUS.has(status)) {
     res.status(400).json({
       message: 'Ungültiger Status. Erlaubt sind angekuendigt und gebucht.',
@@ -183,7 +197,42 @@ function parseUpdateBuchungPayload(req, res) {
     return null;
   }
 
-  if (status === undefined && req.body?.notiz === undefined) {
+  if (filiale !== undefined && !ALLOWED_FAST_BOOKING_FILIALEN.has(filiale)) {
+    res.status(400).json({
+      message:
+        'Ungültige Filiale. Erlaubt sind Verwaltung, Ahaus, Münster, Telgte und Vreden.',
+    });
+    return null;
+  }
+
+  if (eintragTyp !== undefined && !ALLOWED_EINTRAG_TYPEN.has(eintragTyp)) {
+    res.status(400).json({
+      message: 'Ungültiger Eintragstyp. Erlaubt sind betrag und feiertag.',
+    });
+    return null;
+  }
+
+  if (betragProvided && (!Number.isFinite(betrag) || betrag < 0)) {
+    res.status(400).json({
+      message: 'Ungültiger Betrag. Erwartet wird eine Zahl größer oder gleich 0.',
+    });
+    return null;
+  }
+
+  if (eintragTyp === 'betrag' && betragProvided && betrag <= 0) {
+    res.status(400).json({
+      message: 'Bei Eintragstyp betrag muss der Betrag größer 0 sein.',
+    });
+    return null;
+  }
+
+  if (
+    status === undefined &&
+    req.body?.notiz === undefined &&
+    filiale === undefined &&
+    eintragTyp === undefined &&
+    !betragProvided
+  ) {
     res.status(400).json({
       message: 'Keine gültigen Änderungsdaten übergeben.',
     });
@@ -193,8 +242,14 @@ function parseUpdateBuchungPayload(req, res) {
   return {
     status,
     notiz,
+    filiale,
+    eintragTyp,
+    betrag,
     updateStatus: status !== undefined,
     updateNotiz: req.body?.notiz !== undefined,
+    updateFiliale: filiale !== undefined,
+    updateEintragTyp: eintragTyp !== undefined,
+    updateBetrag: betragProvided,
   };
 }
 
@@ -327,6 +382,13 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
       SET
         status = CASE WHEN $2::boolean THEN $3 ELSE b.status END,
         notiz = CASE WHEN $4::boolean THEN $5 ELSE b.notiz END,
+        filiale = CASE WHEN $6::boolean THEN $7 ELSE b.filiale END,
+        eintrag_typ = CASE WHEN $8::boolean THEN $9 ELSE b.eintrag_typ END,
+        betrag = CASE
+          WHEN $8::boolean AND $9 = 'feiertag' THEN 0
+          WHEN $10::boolean THEN $11
+          ELSE b.betrag
+        END,
         geaendert_am = NOW()
       FROM cashflow.kategorien k
       WHERE b.id = $1
@@ -358,6 +420,12 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
         payload.status || null,
         payload.updateNotiz,
         payload.notiz,
+        payload.updateFiliale,
+        payload.filiale || null,
+        payload.updateEintragTyp,
+        payload.eintragTyp || null,
+        payload.updateBetrag,
+        payload.betrag ?? null,
       ]
     );
 
