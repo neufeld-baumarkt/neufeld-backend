@@ -5,6 +5,7 @@
 // - KPI-Auswertung für Cashflow-Dashboard bereitstellen
 // - Buchungsübersicht bereitstellen
 // - Fast-Booking-Buchungen speichern
+// - Unternehmensbuchungen automatisch auf Filialen verteilen
 // - Bestehende Buchungen aktualisieren
 // - Bestehende Buchungen löschen
 // - Optionaler bisKw-Filter für Zeitraumvergleiche
@@ -20,14 +21,15 @@ const verifyToken = require('../middleware/verifyToken');
 const ALLOWED_ROLES = new Set(['Admin', 'Supervisor', 'Geschäftsführer']);
 const ALLOWED_TAGS = new Set(['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So']);
 
+const STORED_FILIALEN = ['Verwaltung', 'Ahaus', 'Münster', 'Telgte', 'Vreden'];
+const SPLIT_FILIALEN = ['Ahaus', 'Münster', 'Telgte', 'Vreden'];
+
 const ALLOWED_FAST_BOOKING_FILIALEN = new Set([
-  'Verwaltung',
-  'Ahaus',
-  'Münster',
-  'Telgte',
-  'Vreden',
+  ...STORED_FILIALEN,
+  'Unternehmen',
 ]);
 
+const ALLOWED_STORED_FILIALEN = new Set(STORED_FILIALEN);
 const ALLOWED_EINTRAG_TYPEN = new Set(['betrag', 'feiertag']);
 const ALLOWED_STATUS = new Set(['angekuendigt', 'gebucht']);
 
@@ -48,6 +50,17 @@ function isValidUuid(value) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
     String(value || '').trim()
   );
+}
+
+function splitAmountToFilialen(betrag) {
+  const cents = Math.round(Number(betrag) * 100);
+  const base = Math.floor(cents / SPLIT_FILIALEN.length);
+  const remainder = cents % SPLIT_FILIALEN.length;
+
+  return SPLIT_FILIALEN.map((filiale, index) => ({
+    filiale,
+    betrag: (base + (index < remainder ? 1 : 0)) / 100,
+  }));
 }
 
 function parseJahrParam(req, res) {
@@ -85,9 +98,7 @@ function parseBisKwParam(req, res) {
 }
 
 function buildBisKwFilter(bisKw, params) {
-  if (bisKw === null) {
-    return '';
-  }
+  if (bisKw === null) return '';
 
   params.push(bisKw);
   return `AND b.kw <= $${params.length}`;
@@ -131,7 +142,7 @@ function parseFastBookingPayload(req, res) {
   if (!ALLOWED_FAST_BOOKING_FILIALEN.has(filiale)) {
     res.status(400).json({
       message:
-        'Ungültige Filiale. Erlaubt sind Verwaltung, Ahaus, Münster, Telgte und Vreden.',
+        'Ungültige Filiale. Erlaubt sind Verwaltung, Unternehmen, Ahaus, Münster, Telgte und Vreden.',
     });
     return null;
   }
@@ -220,7 +231,7 @@ function parseUpdateBuchungPayload(req, res) {
     return null;
   }
 
-  if (filiale !== undefined && !ALLOWED_FAST_BOOKING_FILIALEN.has(filiale)) {
+  if (filiale !== undefined && !ALLOWED_STORED_FILIALEN.has(filiale)) {
     res.status(400).json({
       message:
         'Ungültige Filiale. Erlaubt sind Verwaltung, Ahaus, Münster, Telgte und Vreden.',
@@ -236,16 +247,12 @@ function parseUpdateBuchungPayload(req, res) {
   }
 
   if (jahrProvided && (!Number.isInteger(jahr) || jahr < 2000 || jahr > 2100)) {
-    res.status(400).json({
-      message: 'Ungültiges Jahr.',
-    });
+    res.status(400).json({ message: 'Ungültiges Jahr.' });
     return null;
   }
 
   if (kwProvided && (!Number.isInteger(kw) || kw < 1 || kw > 53)) {
-    res.status(400).json({
-      message: 'Ungültige KW.',
-    });
+    res.status(400).json({ message: 'Ungültige KW.' });
     return null;
   }
 
@@ -333,78 +340,102 @@ router.post('/buchungen', verifyToken(), requireCashflowAccess, async (req, res)
 
     const erstelltVon = req.user?.name || req.user?.id || 'system';
 
-    const result = await pool.query(
-      `
-      INSERT INTO cashflow.buchungen (
-        jahr,
-        kw,
-        datum,
-        tag,
-        kategorie_id,
-        betrag,
-        quelle,
-        quelle_zeile,
-        erstellt_von,
-        filiale,
-        status,
-        notiz,
-        eintrag_typ
-      )
-      VALUES (
-        $1,
-        $2,
-        NULL,
-        $3,
-        $4,
-        $5,
-        'fast_booking',
-        NULL,
-        $6,
-        $7,
-        'angekuendigt',
-        $8,
-        $9
-      )
-      RETURNING
-        id,
-        jahr,
-        kw,
-        datum,
-        tag,
-        kategorie_id,
-        betrag,
-        quelle,
-        quelle_zeile,
-        erstellt_von,
-        erstellt_am,
-        geaendert_am,
-        filiale,
-        status,
-        notiz,
-        eintrag_typ
-      `,
-      [
-        payload.jahr,
-        payload.kw,
-        payload.tag,
-        payload.kategorieId,
-        payload.betrag,
-        erstelltVon,
-        payload.filiale,
-        payload.notiz,
-        payload.eintragTyp,
-      ]
-    );
+    const targets =
+      payload.filiale === 'Unternehmen'
+        ? splitAmountToFilialen(payload.betrag)
+        : [{ filiale: payload.filiale, betrag: payload.betrag }];
 
-    const inserted = result.rows[0];
+    const insertedRows = [];
+
+    await pool.query('BEGIN');
+
+    try {
+      for (const target of targets) {
+        const result = await pool.query(
+          `
+          INSERT INTO cashflow.buchungen (
+            jahr,
+            kw,
+            datum,
+            tag,
+            kategorie_id,
+            betrag,
+            quelle,
+            quelle_zeile,
+            erstellt_von,
+            filiale,
+            status,
+            notiz,
+            eintrag_typ
+          )
+          VALUES (
+            $1,
+            $2,
+            NULL,
+            $3,
+            $4,
+            $5,
+            'fast_booking',
+            NULL,
+            $6,
+            $7,
+            'angekuendigt',
+            $8,
+            $9
+          )
+          RETURNING
+            id,
+            jahr,
+            kw,
+            datum,
+            tag,
+            kategorie_id,
+            betrag,
+            quelle,
+            quelle_zeile,
+            erstellt_von,
+            erstellt_am,
+            geaendert_am,
+            filiale,
+            status,
+            notiz,
+            eintrag_typ
+          `,
+          [
+            payload.jahr,
+            payload.kw,
+            payload.tag,
+            payload.kategorieId,
+            payload.eintragTyp === 'feiertag' ? 0 : target.betrag,
+            erstelltVon,
+            target.filiale,
+            payload.filiale === 'Unternehmen'
+              ? payload.notiz || 'Unternehmensverteilung'
+              : payload.notiz,
+            payload.eintragTyp,
+          ]
+        );
+
+        insertedRows.push({
+          ...result.rows[0],
+          kategorie: kategorieCheck.rows[0].name,
+          typ: kategorieCheck.rows[0].typ,
+        });
+      }
+
+      await pool.query('COMMIT');
+    } catch (err) {
+      await pool.query('ROLLBACK');
+      throw err;
+    }
 
     return res.status(201).json({
-      message: 'Cashflow-Buchung gespeichert.',
-      buchung: {
-        ...inserted,
-        kategorie: kategorieCheck.rows[0].name,
-        typ: kategorieCheck.rows[0].typ,
-      },
+      message:
+        payload.filiale === 'Unternehmen'
+          ? 'Cashflow-Unternehmensbuchung verteilt gespeichert.'
+          : 'Cashflow-Buchung gespeichert.',
+      buchung: insertedRows[0],
+      buchungen: insertedRows,
     });
   } catch (err) {
     console.error('Fehler POST /api/cashflow/buchungen:', err);
@@ -571,7 +602,6 @@ router.delete('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req
 });
 
 // GET /api/cashflow/jahresuebersicht?jahr=2024
-// GET /api/cashflow/jahresuebersicht?jahr=2024&bisKw=18
 router.get('/jahresuebersicht', verifyToken(), requireCashflowAccess, async (req, res) => {
   const jahr = parseJahrParam(req, res);
   if (jahr === null) return;
@@ -628,9 +658,7 @@ router.get('/jahresuebersicht', verifyToken(), requireCashflowAccess, async (req
       ])
     );
 
-    const mergedWeeks = alleWochen.map((week) =>
-      weekMap.get(week.kw) || week
-    );
+    const mergedWeeks = alleWochen.map((week) => weekMap.get(week.kw) || week);
 
     return res.json({
       jahr,
@@ -646,7 +674,6 @@ router.get('/jahresuebersicht', verifyToken(), requireCashflowAccess, async (req
 });
 
 // GET /api/cashflow/buchungen?jahr=2024
-// GET /api/cashflow/buchungen?jahr=2024&bisKw=18
 router.get('/buchungen', verifyToken(), requireCashflowAccess, async (req, res) => {
   const jahr = parseJahrParam(req, res);
   if (jahr === null) return;
@@ -710,7 +737,6 @@ router.get('/buchungen', verifyToken(), requireCashflowAccess, async (req, res) 
 });
 
 // GET /api/cashflow/kategorien?jahr=2024
-// GET /api/cashflow/kategorien?jahr=2024&bisKw=18
 router.get('/kategorien', verifyToken(), requireCashflowAccess, async (req, res) => {
   const jahr = parseJahrParam(req, res);
   if (jahr === null) return;
@@ -783,7 +809,6 @@ router.get('/kategorien', verifyToken(), requireCashflowAccess, async (req, res)
 });
 
 // GET /api/cashflow/kpis?jahr=2024
-// GET /api/cashflow/kpis?jahr=2024&bisKw=18
 router.get('/kpis', verifyToken(), requireCashflowAccess, async (req, res) => {
   const jahr = parseJahrParam(req, res);
   if (jahr === null) return;
