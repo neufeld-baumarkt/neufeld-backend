@@ -340,10 +340,13 @@ router.post('/buchungen', verifyToken(), requireCashflowAccess, async (req, res)
 
     const erstelltVon = req.user?.name || req.user?.id || 'system';
 
+    const isEinnahme =
+     String(kategorieCheck.rows[0].typ || '').trim() === 'Einnahme';
+
     const targets =
-      payload.filiale === 'Unternehmen'
-        ? splitAmountToFilialen(payload.betrag)
-        : [{ filiale: payload.filiale, betrag: payload.betrag }];
+     payload.filiale === 'Unternehmen' && !isEinnahme
+       ? splitAmountToFilialen(payload.betrag)
+       : [{ filiale: payload.filiale, betrag: payload.betrag }];
 
     const insertedRows = [];
 
@@ -431,9 +434,9 @@ router.post('/buchungen', verifyToken(), requireCashflowAccess, async (req, res)
 
     return res.status(201).json({
       message:
-        payload.filiale === 'Unternehmen'
-          ? 'Cashflow-Unternehmensbuchung verteilt gespeichert.'
-          : 'Cashflow-Buchung gespeichert.',
+       payload.filiale === 'Unternehmen' && !isEinnahme
+       ? 'Cashflow-Unternehmensbuchung verteilt gespeichert.'
+       : 'Cashflow-Buchung gespeichert.',
       buchung: insertedRows[0],
       buchungen: insertedRows,
     });
