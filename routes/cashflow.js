@@ -21,7 +21,15 @@ const verifyToken = require('../middleware/verifyToken');
 const ALLOWED_ROLES = new Set(['Admin', 'Supervisor', 'Geschäftsführer']);
 const ALLOWED_TAGS = new Set(['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So']);
 
-const STORED_FILIALEN = ['Verwaltung', 'Ahaus', 'Münster', 'Telgte', 'Vreden'];
+const STORED_FILIALEN = [
+  'Unternehmen',
+  'Verwaltung',
+  'Ahaus',
+  'Münster',
+  'Telgte',
+  'Vreden',
+];
+
 const SPLIT_FILIALEN = ['Ahaus', 'Münster', 'Telgte', 'Vreden'];
 
 const ALLOWED_FAST_BOOKING_FILIALEN = new Set([
@@ -234,7 +242,7 @@ function parseUpdateBuchungPayload(req, res) {
   if (filiale !== undefined && !ALLOWED_STORED_FILIALEN.has(filiale)) {
     res.status(400).json({
       message:
-        'Ungültige Filiale. Erlaubt sind Verwaltung, Ahaus, Münster, Telgte und Vreden.',
+        'Ungültige Filiale. Erlaubt sind Unternehmen, Verwaltung, Ahaus, Münster, Telgte und Vreden.',
     });
     return null;
   }
@@ -341,12 +349,12 @@ router.post('/buchungen', verifyToken(), requireCashflowAccess, async (req, res)
     const erstelltVon = req.user?.name || req.user?.id || 'system';
 
     const isEinnahme =
-     String(kategorieCheck.rows[0].typ || '').trim() === 'Einnahme';
+      String(kategorieCheck.rows[0].typ || '').trim() === 'Einnahme';
 
     const targets =
-     payload.filiale === 'Unternehmen' && !isEinnahme
-       ? splitAmountToFilialen(payload.betrag)
-       : [{ filiale: payload.filiale, betrag: payload.betrag }];
+      payload.filiale === 'Unternehmen' && !isEinnahme
+        ? splitAmountToFilialen(payload.betrag)
+        : [{ filiale: payload.filiale, betrag: payload.betrag }];
 
     const insertedRows = [];
 
@@ -412,7 +420,7 @@ router.post('/buchungen', verifyToken(), requireCashflowAccess, async (req, res)
             payload.eintragTyp === 'feiertag' ? 0 : target.betrag,
             erstelltVon,
             target.filiale,
-            payload.filiale === 'Unternehmen'
+            payload.filiale === 'Unternehmen' && !isEinnahme
               ? payload.notiz || 'Unternehmensverteilung'
               : payload.notiz,
             payload.eintragTyp,
@@ -434,9 +442,9 @@ router.post('/buchungen', verifyToken(), requireCashflowAccess, async (req, res)
 
     return res.status(201).json({
       message:
-       payload.filiale === 'Unternehmen' && !isEinnahme
-       ? 'Cashflow-Unternehmensbuchung verteilt gespeichert.'
-       : 'Cashflow-Buchung gespeichert.',
+        payload.filiale === 'Unternehmen' && !isEinnahme
+          ? 'Cashflow-Unternehmensbuchung verteilt gespeichert.'
+          : 'Cashflow-Buchung gespeichert.',
       buchung: insertedRows[0],
       buchungen: insertedRows,
     });
