@@ -471,7 +471,37 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
   if (payload === null) return;
 
   try {
-    const result = await pool.query(
+  const currentResult = await pool.query(
+    `
+    SELECT
+      b.status,
+      b.betrag,
+      b.planbetrag,
+      k.typ
+    FROM cashflow.buchungen b
+    JOIN cashflow.kategorien k
+      ON k.id = b.kategorie_id
+    WHERE b.id = $1
+    `,
+    [id]
+  );
+
+  if (currentResult.rowCount === 0) {
+    return res.status(404).json({
+      message: 'Cashflow-Buchung nicht gefunden.',
+    });
+  }
+
+  const current = currentResult.rows[0];
+
+  const isEinnahme = current.typ === 'Einnahme';
+
+  const statuswechselZuGebucht =
+    isEinnahme &&
+    current.status === 'angekuendigt' &&
+    payload.status === 'gebucht';
+
+  const result = await pool.query(
       `
       UPDATE cashflow.buchungen b
       SET
@@ -510,7 +540,10 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
         b.filiale,
         b.status,
         b.notiz,
-        b.eintrag_typ
+        b.eintrag_typ,
+        b.planbetrag,
+        b.abweichung_betrag,
+        b.abweichung_prozent
       `,
       [
         id,
@@ -538,6 +571,42 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
         message: 'Cashflow-Buchung nicht gefunden.',
       });
     }
+
+    if (statuswechselZuGebucht) {
+  const neuerBetrag = Number(result.rows[0].betrag);
+  const planbetrag = Number(current.betrag);
+  const abweichungBetrag = neuerBetrag - planbetrag;
+  const abweichungProzent =
+    planbetrag > 0 ? (abweichungBetrag / planbetrag) * 100 : null;
+
+  const forecastResult = await pool.query(
+    `
+    UPDATE cashflow.buchungen
+    SET
+      planbetrag = $2,
+      abweichung_betrag = $3,
+      abweichung_prozent = $4,
+      geaendert_am = NOW()
+    WHERE id = $1
+    RETURNING
+      planbetrag,
+      abweichung_betrag,
+      abweichung_prozent
+    `,
+    [
+      id,
+      planbetrag,
+      abweichungBetrag,
+      abweichungProzent,
+    ]
+  );
+
+  result.rows[0].planbetrag = forecastResult.rows[0].planbetrag;
+  result.rows[0].abweichung_betrag =
+    forecastResult.rows[0].abweichung_betrag;
+  result.rows[0].abweichung_prozent =
+    forecastResult.rows[0].abweichung_prozent;
+}
 
     return res.json({
       message: 'Cashflow-Buchung aktualisiert.',
@@ -716,7 +785,10 @@ router.get('/buchungen', verifyToken(), requireCashflowAccess, async (req, res) 
         b.filiale,
         b.status,
         b.notiz,
-        b.eintrag_typ
+        b.eintrag_typ,
+        b.planbetrag,
+        b.abweichung_betrag,
+        b.abweichung_prozent
       FROM cashflow.buchungen b
       JOIN cashflow.kategorien k
         ON k.id = b.kategorie_id
