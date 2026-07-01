@@ -28,11 +28,114 @@ function isSelectAllowed(sql) {
   return /^select\s+/i.test(sql.trim());
 }
 
+function isCreateSchemaAllowed(sql) {
+  const pattern =
+    /^create\s+schema\s+if\s+not\s+exists\s+[a-zA-Z_][a-zA-Z0-9_]*\s*;?$/i;
+
+  return pattern.test(sql.trim());
+}
+
+function isCreateTableAllowed(sql) {
+  const normalized = sql.trim();
+
+  if (!/^create\s+table\s+if\s+not\s+exists\s+[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*\s*\(/i.test(normalized)) {
+    return false;
+  }
+
+  if (!/\)\s*;?$/i.test(normalized)) {
+    return false;
+  }
+
+  const forbiddenKeywords = [
+    /\bdrop\b/i,
+    /\btruncate\b/i,
+    /\bdelete\b/i,
+    /\bupdate\b/i,
+    /\balter\b/i,
+    /\bgrant\b/i,
+    /\brevoke\b/i,
+    /\bcopy\b/i,
+    /\bexecute\b/i,
+    /\bcall\b/i,
+  ];
+
+  return !forbiddenKeywords.some((pattern) => pattern.test(normalized));
+}
+
+function isCreateIndexAllowed(sql) {
+  const pattern =
+    /^create\s+index\s+if\s+not\s+exists\s+[a-zA-Z_][a-zA-Z0-9_]*\s+on\s+[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*\s*\(.+\)\s*;?$/i;
+
+  return pattern.test(sql.trim());
+}
+
+function isInsertAllowed(sql) {
+  const normalized = sql.trim();
+
+  if (!/^insert\s+into\s+[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*\s*\(/i.test(normalized)) {
+    return false;
+  }
+
+  if (!/\)\s+values\s*\(.+\)\s*(on\s+conflict\s*\(.+\)\s+do\s+(nothing|update\s+set\s+.+))?\s*;?$/i.test(normalized)) {
+    return false;
+  }
+
+  const forbiddenKeywords = [
+    /\bdrop\b/i,
+    /\btruncate\b/i,
+    /\bdelete\b/i,
+    /\bgrant\b/i,
+    /\brevoke\b/i,
+    /\bcopy\b/i,
+    /\bexecute\b/i,
+    /\bcall\b/i,
+  ];
+
+  return !forbiddenKeywords.some((pattern) => pattern.test(normalized));
+}
+
 function isAllowedDropConstraint(sql) {
   const pattern =
     /^alter\s+table\s+[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*\s+drop\s+constraint\s+if\s+exists\s+[a-zA-Z_][a-zA-Z0-9_]*\s*;?$/i;
 
   return pattern.test(sql.trim());
+}
+
+function isAllowedAddConstraint(sql) {
+  const normalized = sql.trim();
+
+  if (!/^alter\s+table\s+[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*\s+add\s+constraint\s+[a-zA-Z_][a-zA-Z0-9_]*\s+/i.test(normalized)) {
+    return false;
+  }
+
+  if (!/\s*;?$/i.test(normalized)) {
+    return false;
+  }
+
+  const allowedConstraintTypes = [
+    /\bunique\s*\(.+\)/i,
+    /\bforeign\s+key\s*\(.+\)\s+references\s+[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*\s*\(.+\)/i,
+    /\bcheck\s*\(.+\)/i,
+  ];
+
+  if (!allowedConstraintTypes.some((pattern) => pattern.test(normalized))) {
+    return false;
+  }
+
+  const forbiddenKeywords = [
+    /\bdrop\b/i,
+    /\btruncate\b/i,
+    /\bdelete\b/i,
+    /\bupdate\b/i,
+    /\binsert\b/i,
+    /\bgrant\b/i,
+    /\brevoke\b/i,
+    /\bcopy\b/i,
+    /\bexecute\b/i,
+    /\bcall\b/i,
+  ];
+
+  return !forbiddenKeywords.some((pattern) => pattern.test(normalized));
 }
 
 function validateSql(sql) {
@@ -56,14 +159,34 @@ function validateSql(sql) {
     return { ok: true, mode: 'select' };
   }
 
+  if (isCreateSchemaAllowed(sql)) {
+    return { ok: true, mode: 'create_schema' };
+  }
+
+  if (isCreateTableAllowed(sql)) {
+    return { ok: true, mode: 'create_table' };
+  }
+
+  if (isCreateIndexAllowed(sql)) {
+    return { ok: true, mode: 'create_index' };
+  }
+
+  if (isInsertAllowed(sql)) {
+    return { ok: true, mode: 'insert' };
+  }
+
   if (isAllowedDropConstraint(sql)) {
     return { ok: true, mode: 'drop_constraint' };
+  }
+
+  if (isAllowedAddConstraint(sql)) {
+    return { ok: true, mode: 'add_constraint' };
   }
 
   return {
     ok: false,
     message:
-      'Dieser SQL-Befehl ist nicht erlaubt. Erlaubt sind SELECT oder ALTER TABLE ... DROP CONSTRAINT IF EXISTS ...',
+      'Dieser SQL-Befehl ist nicht erlaubt. Erlaubt sind SELECT, CREATE SCHEMA, CREATE TABLE, CREATE INDEX, INSERT INTO oder gezielte ALTER TABLE CONSTRAINT-Befehle.',
   };
 }
 
