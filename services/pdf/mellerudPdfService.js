@@ -287,43 +287,55 @@ function buildFormRows(positions) {
 function drawHeader(page, fonts, order, pageNumber, totalPages) {
   const { bold, regular } = fonts;
 
-  drawText(page, 'Sonderpreis Baumarkt Bestellformular Neu ab 01.07.2026', 28, 560, {
+  drawText(page, 'Sonderpreis Baumarkt Bestellformular', 28, 560, {
     font: bold,
-    size: 14,
+    size: 15,
   });
-  drawText(page, 'Gebindeumstellung 0,5 l Spruehpistole', 28, 543, {
+
+  drawText(page, 'MELLERUD Bestellung', 28, 540, {
+    font: bold,
+    size: 12,
+  });
+
+  drawText(page, 'Gebindeumstellung 0,5 l Spruehpistole - Formularstand 01.07.2026', 28, 524, {
     font: regular,
-    size: 10,
+    size: 8,
   });
 
   drawText(page, `Filiale: ${order.filiale || ''}`, 610, 560, {
     font: bold,
     size: 10,
   });
-  drawText(page, `Bestellung: ${order.id}`, 610, 545, {
+
+  drawText(page, `Bestelldatum: ${formatDateDe(order.bestelldatum)}`, 610, 544, {
     font: regular,
-    size: 7,
-  });
-  drawText(page, `Seite ${pageNumber} / ${totalPages}`, 610, 532, {
-    font: regular,
-    size: 7,
+    size: 8,
   });
 
-  drawRect(page, 28, 475, 360, 50, { borderWidth: 0.7 });
-  drawText(page, 'Name ADM:', 38, 507, { font: bold, size: 8 });
-  drawLine(page, 92, 504, 370, 504, { thickness: 0.5 });
-  drawText(page, 'Unterschrift ADM erfolgt bei Bedarf manuell.', 92, 490, { font: regular, size: 7, color: rgb(0.35, 0.35, 0.35) });
+  drawText(page, `Seite ${pageNumber} / ${totalPages}`, 610, 530, {
+    font: regular,
+    size: 8,
+  });
 
-  drawRect(page, 408, 475, 405, 50, { borderWidth: 0.7 });
-  drawText(page, 'Ansprechpartner im Markt:', 418, 507, { font: bold, size: 8 });
-  drawText(page, order.gespraechspartner_snapshot || order.ordered_by_name || '', 535, 507, { font: regular, size: 8 });
-  drawText(page, 'Strasse:', 418, 492, { font: bold, size: 8 });
-  drawText(page, order.strasse_snapshot || '', 535, 492, { font: regular, size: 8 });
-  drawText(page, 'Ort:', 418, 477, { font: bold, size: 8 });
-  drawText(page, order.ort_snapshot || '', 535, 477, { font: regular, size: 8 });
+  drawRect(page, 28, 475, 360, 42, { borderWidth: 0.7 });
+  drawText(page, 'Name ADM:', 38, 501, { font: bold, size: 8 });
+  drawLine(page, 92, 498, 370, 498, { thickness: 0.5 });
+  drawText(page, 'Unterschrift ADM erfolgt bei Bedarf manuell.', 92, 485, {
+    font: regular,
+    size: 7,
+    color: rgb(0.35, 0.35, 0.35),
+  });
 
-  drawText(page, 'Datum:', 655, 477, { font: bold, size: 8 });
-  drawText(page, formatDateDe(order.bestelldatum), 700, 477, { font: regular, size: 8 });
+  drawRect(page, 408, 475, 405, 42, { borderWidth: 0.7 });
+  drawText(page, 'Ansprechpartner im Markt:', 418, 501, { font: bold, size: 8 });
+  drawText(page, order.gespraechspartner_snapshot || order.ordered_by_name || '', 535, 501, {
+    font: regular,
+    size: 8,
+  });
+  drawText(page, 'Strasse:', 418, 488, { font: bold, size: 8 });
+  drawText(page, order.strasse_snapshot || '', 535, 488, { font: regular, size: 8 });
+  drawText(page, 'Ort:', 418, 476, { font: bold, size: 8 });
+  drawText(page, order.ort_snapshot || '', 535, 476, { font: regular, size: 8 });
 }
 
 function drawTableHeader(page, fonts, x, y, columns) {
@@ -411,7 +423,7 @@ function drawArticleRow(page, fonts, row, x, y, columns, rowHeight, isEven) {
 }
 
 async function drawFooter(pdfDoc, page, fonts, order, isLastPage) {
-  const { regular, bold } = fonts;
+  const { regular } = fonts;
 
   drawLine(page, 28, 54, 358, 54, { thickness: 0.5 });
   drawLine(page, 438, 54, 768, 54, { thickness: 0.5 });
@@ -426,15 +438,6 @@ async function drawFooter(pdfDoc, page, fonts, order, isLastPage) {
   const stempel = await embedOptionalImage(pdfDoc, order.filiale, 'stempel.png');
   const unterschrift = await embedOptionalImage(pdfDoc, order.filiale, 'unterschrift.png');
 
-  if (stempel) {
-    page.drawImage(stempel, {
-      x: 610,
-      y: 22,
-      width: 90,
-      height: 45,
-    });
-  }
-
   if (unterschrift) {
     page.drawImage(unterschrift, {
       x: 455,
@@ -444,14 +447,14 @@ async function drawFooter(pdfDoc, page, fonts, order, isLastPage) {
     });
   }
 
-  drawText(page, order.firma_snapshot || 'Neufeld Baumarkt GmbH', 610, 85, {
-    font: bold,
-    size: 7,
-  });
-  drawText(page, order.kunden_nr_snapshot ? `Kunden-Nr.: ${order.kunden_nr_snapshot}` : '', 610, 74, {
-    font: regular,
-    size: 7,
-  });
+  if (stempel) {
+    page.drawImage(stempel, {
+      x: 610,
+      y: 58,
+      width: 95,
+      height: 45,
+    });
+  }
 }
 
 async function generateMellerudOrderPdf(orderId) {
