@@ -34,7 +34,7 @@ const MELLERUD_FORM_ARTICLES = [
   { ean: '4004666005177', lan: '2001005177', kundenArtNr: '150000271', name: 'Nikotin Entferner 0,5l', ve: '6', ek: '5,02 EUR', uvp: '8,49 EUR' },
   { ean: '4004666005504', lan: '2001005504', kundenArtNr: '150000272', name: 'Neu: BBQ& Outdoorküchen Reiniger 460ml alt: Grill & BBQ Reiniger', ve: '6', ek: '4,74 EUR', uvp: '8,49 EUR' },
   { ean: '4004666005467', lan: '2001005467', kundenArtNr: '150000273', name: 'Neu: Grillrost Reiniger 0,5l alt: Fett & Verkrustungen Entferner', ve: '6', ek: '4,64 EUR', uvp: '8,49 EUR' },
-  { ean: '4004666300074', lan: '2049300074', kundenArtNr: '150010042', name: 'Spezial Reinigungsschwamm braun', ve: '10', ek: '1,70 EUR', uvp: '3,49 EUR' },
+  { ean: '4004666300074', lan: '2049408291', kundenArtNr: '150010042', name: 'Spezial Reinigungsschwamm braun', ve: '10', ek: '1,70 EUR', uvp: '3,49 EUR' },
   { ean: '4004666000165', lan: '2001000165', kundenArtNr: '131030558', name: 'Öl & Fettflecken Entferner 0,5l', ve: '6', ek: '5,81 EUR', uvp: '11,50 EUR' },
   { ean: '4004666004958', lan: '2001004958', kundenArtNr: '150000274', name: 'Rostflecken Entferner 0,5l', ve: '6', ek: '6,29 EUR', uvp: '10,99 EUR' },
   { ean: '4004666001476', lan: '2001001476', kundenArtNr: '131030458', name: 'Graffiti & PU Schaum Entferner 0,5l', ve: '6', ek: '7,50 EUR', uvp: '13,99 EUR' },
@@ -284,7 +284,7 @@ function buildFormRows(positions) {
   return rows;
 }
 
-function drawHeader(page, fonts, order, pageNumber, totalPages) {
+function drawFullHeader(page, fonts, order, totalPages) {
   const { bold, regular } = fonts;
 
   drawText(page, 'Sonderpreis Baumarkt Bestellformular', 28, 560, {
@@ -312,7 +312,7 @@ function drawHeader(page, fonts, order, pageNumber, totalPages) {
     size: 8,
   });
 
-  drawText(page, `Seite ${pageNumber} / ${totalPages}`, 610, 530, {
+  drawText(page, `Seite 1 / ${totalPages}`, 610, 530, {
     font: regular,
     size: 8,
   });
@@ -336,6 +336,32 @@ function drawHeader(page, fonts, order, pageNumber, totalPages) {
   drawText(page, order.strasse_snapshot || '', 535, 488, { font: regular, size: 8 });
   drawText(page, 'Ort:', 418, 476, { font: bold, size: 8 });
   drawText(page, order.ort_snapshot || '', 535, 476, { font: regular, size: 8 });
+}
+
+function drawCompactHeader(page, fonts, order, pageNumber, totalPages) {
+  const { bold, regular } = fonts;
+
+  drawText(page, 'MELLERUD Bestellung', 28, 560, {
+    font: bold,
+    size: 12,
+  });
+
+  drawText(page, `Filiale: ${order.filiale || ''}`, 610, 560, {
+    font: bold,
+    size: 10,
+  });
+
+  drawText(page, `Bestelldatum: ${formatDateDe(order.bestelldatum)}`, 610, 544, {
+    font: regular,
+    size: 8,
+  });
+
+  drawText(page, `Seite ${pageNumber} / ${totalPages}`, 610, 530, {
+    font: regular,
+    size: 8,
+  });
+
+  drawLine(page, 28, 520, 813, 520, { thickness: 0.5, color: rgb(0.2, 0.2, 0.2) });
 }
 
 function drawTableHeader(page, fonts, x, y, columns) {
@@ -407,9 +433,9 @@ function drawArticleRow(page, fonts, row, x, y, columns, rowHeight, isEven) {
         });
       }
     } else if (index === 7) {
-      drawText(page, value, currentX + 19, y - 12, {
+      drawText(page, value, currentX + 24, y - 12, {
         font: bold,
-        size: 9,
+        size: 10,
       });
     } else {
       drawText(page, value, currentX + 3, y - 12, {
@@ -422,44 +448,85 @@ function drawArticleRow(page, fonts, row, x, y, columns, rowHeight, isEven) {
   });
 }
 
-async function drawFooter(pdfDoc, page, fonts, order, isLastPage) {
-  const { regular } = fonts;
+async function drawFinalSignatureBlock(pdfDoc, page, fonts, order) {
+  const { regular, bold } = fonts;
 
-  drawLine(page, 28, 54, 358, 54, { thickness: 0.5 });
-  drawLine(page, 438, 54, 768, 54, { thickness: 0.5 });
+  const blockTop = 126;
+  const lineY = 88;
+  const labelY = 72;
 
-  drawText(page, 'Unterschrift ADM', 28, 38, { font: regular, size: 8 });
-  drawText(page, 'Unterschrift Markt', 438, 38, { font: regular, size: 8 });
+  drawLine(page, 28, blockTop, 813, blockTop, { thickness: 0.6, color: rgb(0.2, 0.2, 0.2) });
 
-  if (!isLastPage) {
-    return;
-  }
+  drawText(page, 'Bestelldatum', 82, labelY, { font: regular, size: 7 });
+  drawText(page, formatDateDe(order.bestelldatum), 78, lineY + 10, { font: bold, size: 9 });
+  drawLine(page, 60, lineY, 180, lineY, { thickness: 0.6 });
 
-  const stempel = await embedOptionalImage(pdfDoc, order.filiale, 'stempel.png');
+  drawText(page, 'Unterschrift Besteller', 305, labelY, { font: regular, size: 7 });
+  drawLine(page, 250, lineY, 430, lineY, { thickness: 0.6 });
+
+  drawText(page, 'Firmenstempel', 632, labelY, { font: regular, size: 7 });
+  drawRect(page, 560, 68, 150, 58, {
+    borderWidth: 0.7,
+    borderColor: rgb(0, 0, 0),
+  });
+
   const unterschrift = await embedOptionalImage(pdfDoc, order.filiale, 'unterschrift.png');
+  const stempel = await embedOptionalImage(pdfDoc, order.filiale, 'stempel.png');
 
   if (unterschrift) {
     page.drawImage(unterschrift, {
-      x: 455,
-      y: 58,
-      width: 120,
-      height: 34,
+      x: 285,
+      y: 91,
+      width: 105,
+      height: 28,
     });
   }
 
   if (stempel) {
     page.drawImage(stempel, {
-      x: 610,
-      y: 58,
-      width: 95,
-      height: 45,
+      x: 575,
+      y: 76,
+      width: 120,
+      height: 42,
     });
   }
+
+  drawLine(page, 28, 44, 813, 44, { thickness: 0.5, color: rgb(0.2, 0.2, 0.2) });
+  drawText(page, 'Die Ware bleibt bis zur vollstaendigen Bezahlung unser Eigentum.', 325, 31, {
+    font: regular,
+    size: 6,
+    color: rgb(0.2, 0.2, 0.2),
+  });
+}
+
+function paginateRows(rows) {
+  const firstPageRows = 29;
+  const normalPageRows = 35;
+  const finalPageRows = 29;
+
+  if (rows.length <= firstPageRows) {
+    return [rows];
+  }
+
+  const pages = [];
+  pages.push(rows.slice(0, firstPageRows));
+
+  let remaining = rows.slice(firstPageRows);
+
+  while (remaining.length > finalPageRows) {
+    pages.push(remaining.slice(0, normalPageRows));
+    remaining = remaining.slice(normalPageRows);
+  }
+
+  pages.push(remaining);
+
+  return pages;
 }
 
 async function generateMellerudOrderPdf(orderId) {
   const { order, positions } = await loadOrderData(orderId);
   const rows = buildFormRows(positions);
+  const pageRows = paginateRows(rows);
 
   const pdfDoc = await PDFDocument.create();
 
@@ -479,27 +546,34 @@ async function generateMellerudOrderPdf(orderId) {
     { label: 'Bestellmenge VE', width: 66 },
   ];
 
-  const rowsPerPage = 29;
-  const totalPages = Math.ceil(rows.length / rowsPerPage);
   const tableX = 28;
-  const tableHeaderY = 455;
   const rowHeight = 12.5;
 
-  for (let pageIndex = 0; pageIndex < totalPages; pageIndex += 1) {
+  for (let pageIndex = 0; pageIndex < pageRows.length; pageIndex += 1) {
     const page = pdfDoc.addPage([PAGE_WIDTH, PAGE_HEIGHT]);
-    const pageRows = rows.slice(pageIndex * rowsPerPage, (pageIndex + 1) * rowsPerPage);
+    const isFirstPage = pageIndex === 0;
+    const isLastPage = pageIndex === pageRows.length - 1;
 
-    drawHeader(page, fonts, order, pageIndex + 1, totalPages);
+    const tableHeaderY = isFirstPage ? 455 : 500;
+
+    if (isFirstPage) {
+      drawFullHeader(page, fonts, order, pageRows.length);
+    } else {
+      drawCompactHeader(page, fonts, order, pageIndex + 1, pageRows.length);
+    }
+
     drawTableHeader(page, fonts, tableX, tableHeaderY, columns);
 
     let y = tableHeaderY - 18;
 
-    pageRows.forEach((row, rowIndex) => {
+    pageRows[pageIndex].forEach((row, rowIndex) => {
       y -= rowHeight;
       drawArticleRow(page, fonts, row, tableX, y + rowHeight, columns, rowHeight, rowIndex % 2 === 0);
     });
 
-    await drawFooter(pdfDoc, page, fonts, order, pageIndex === totalPages - 1);
+    if (isLastPage) {
+      await drawFinalSignatureBlock(pdfDoc, page, fonts, order);
+    }
   }
 
   const pdfBytes = await pdfDoc.save();
