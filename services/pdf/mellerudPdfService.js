@@ -180,6 +180,8 @@ async function loadOrderData(orderId) {
       o.ort_snapshot,
       o.auftrags_nr_snapshot,
       o.gespraechspartner_snapshot,
+      o.telefon_snapshot,
+      o.email_snapshot,
       s.name AS supplier_name,
       s.code AS supplier_code
     FROM "order".order_orders o
@@ -297,45 +299,47 @@ function drawFullHeader(page, fonts, order, totalPages) {
     size: 12,
   });
 
-  drawText(page, 'Gebindeumstellung 0,5 l Spruehpistole - Formularstand 01.07.2026', 28, 524, {
+  drawText(page, `Seite 1 / ${totalPages}`, 735, 560, {
     font: regular,
     size: 8,
   });
 
-  drawText(page, `Filiale: ${order.filiale || ''}`, 610, 560, {
-    font: bold,
-    size: 10,
-  });
+  drawRect(page, 28, 455, 370, 72, { borderWidth: 0.7 });
 
-  drawText(page, `Bestelldatum: ${formatDateDe(order.bestelldatum)}`, 610, 544, {
+  drawText(page, 'Filiale:', 38, 511, { font: bold, size: 8 });
+  drawText(page, order.filiale || '', 125, 511, { font: regular, size: 8 });
+
+  drawText(page, 'Lieferant:', 38, 498, { font: bold, size: 8 });
+  drawText(page, order.supplier_name || '', 125, 498, { font: regular, size: 8 });
+
+  drawText(page, 'Bestelldatum:', 38, 485, { font: bold, size: 8 });
+  drawText(page, formatDateDe(order.bestelldatum), 125, 485, { font: regular, size: 8 });
+
+  drawText(page, 'Kunden-Nr.:', 38, 472, { font: bold, size: 8 });
+  drawText(page, order.kunden_nr_snapshot || '', 125, 472, { font: regular, size: 8 });
+
+  drawRect(page, 408, 455, 405, 72, { borderWidth: 0.7 });
+
+  drawText(page, 'Firma:', 418, 511, { font: bold, size: 8 });
+  drawText(page, order.firma_snapshot || '', 505, 511, { font: regular, size: 8 });
+
+  drawText(page, 'Strasse:', 418, 498, { font: bold, size: 8 });
+  drawText(page, order.strasse_snapshot || '', 505, 498, { font: regular, size: 8 });
+
+  drawText(page, 'Ort:', 418, 485, { font: bold, size: 8 });
+  drawText(page, order.ort_snapshot || '', 505, 485, { font: regular, size: 8 });
+
+  drawText(page, 'Ansprechpartner:', 418, 472, { font: bold, size: 8 });
+  drawText(page, order.gespraechspartner_snapshot || order.ordered_by_name || '', 505, 472, {
     font: regular,
     size: 8,
   });
 
-  drawText(page, `Seite 1 / ${totalPages}`, 610, 530, {
-    font: regular,
-    size: 8,
-  });
+  drawText(page, 'Telefon:', 418, 459, { font: bold, size: 8 });
+  drawText(page, order.telefon_snapshot || '', 505, 459, { font: regular, size: 8 });
 
-  drawRect(page, 28, 475, 360, 42, { borderWidth: 0.7 });
-  drawText(page, 'Name ADM:', 38, 501, { font: bold, size: 8 });
-  drawLine(page, 92, 498, 370, 498, { thickness: 0.5 });
-  drawText(page, 'Unterschrift ADM erfolgt bei Bedarf manuell.', 92, 485, {
-    font: regular,
-    size: 7,
-    color: rgb(0.35, 0.35, 0.35),
-  });
-
-  drawRect(page, 408, 475, 405, 42, { borderWidth: 0.7 });
-  drawText(page, 'Ansprechpartner im Markt:', 418, 501, { font: bold, size: 8 });
-  drawText(page, order.gespraechspartner_snapshot || order.ordered_by_name || '', 535, 501, {
-    font: regular,
-    size: 8,
-  });
-  drawText(page, 'Strasse:', 418, 488, { font: bold, size: 8 });
-  drawText(page, order.strasse_snapshot || '', 535, 488, { font: regular, size: 8 });
-  drawText(page, 'Ort:', 418, 476, { font: bold, size: 8 });
-  drawText(page, order.ort_snapshot || '', 535, 476, { font: regular, size: 8 });
+  drawText(page, 'E-Mail:', 610, 459, { font: bold, size: 8 });
+  drawText(page, order.email_snapshot || '', 655, 459, { font: regular, size: 8 });
 }
 
 function drawCompactHeader(page, fonts, order, pageNumber, totalPages) {
