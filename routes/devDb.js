@@ -138,6 +138,17 @@ function isAllowedAddConstraint(sql) {
   return !forbiddenKeywords.some((pattern) => pattern.test(normalized));
 }
 
+function isAllowedAddBranchProfileContactColumn(sql) {
+  const normalized = sql.trim();
+
+  const allowedColumns = [
+    /^alter\s+table\s+"order"\.order_supplier_branch_profiles\s+add\s+column\s+telefon\s+text\s*;?$/i,
+    /^alter\s+table\s+"order"\.order_supplier_branch_profiles\s+add\s+column\s+email\s+text\s*;?$/i,
+  ];
+
+  return allowedColumns.some((pattern) => pattern.test(normalized));
+}
+
 function validateSql(sql) {
   if (!sql) {
     return { ok: false, message: 'SQL-Befehl fehlt.' };
@@ -183,10 +194,14 @@ function validateSql(sql) {
     return { ok: true, mode: 'add_constraint' };
   }
 
+  if (isAllowedAddBranchProfileContactColumn(sql)) {
+    return { ok: true, mode: 'add_branch_profile_contact_column' };
+  }
+
   return {
     ok: false,
     message:
-      'Dieser SQL-Befehl ist nicht erlaubt. Erlaubt sind SELECT, CREATE SCHEMA, CREATE TABLE, CREATE INDEX, INSERT INTO oder gezielte ALTER TABLE CONSTRAINT-Befehle.',
+      'Dieser SQL-Befehl ist nicht erlaubt. Erlaubt sind SELECT, CREATE SCHEMA, CREATE TABLE, CREATE INDEX, INSERT INTO, gezielte ALTER TABLE CONSTRAINT-Befehle oder die freigegebenen Kontaktspalten für order_supplier_branch_profiles.',
   };
 }
 
