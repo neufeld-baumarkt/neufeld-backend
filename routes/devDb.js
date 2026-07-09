@@ -45,9 +45,16 @@ function isCreateTableAllowed(sql) {
   if (!/\)\s*;?$/i.test(normalized)) return false;
 
   const forbiddenKeywords = [
-    /\bdrop\b/i, /\btruncate\b/i, /\bdelete\b/i, /\bupdate\b/i,
-    /\balter\b/i, /\bgrant\b/i, /\brevoke\b/i, /\bcopy\b/i,
-    /\bexecute\b/i, /\bcall\b/i,
+    /\bdrop\b/i,
+    /\btruncate\b/i,
+    /\bdelete\b/i,
+    /\bupdate\b/i,
+    /\balter\b/i,
+    /\bgrant\b/i,
+    /\brevoke\b/i,
+    /\bcopy\b/i,
+    /\bexecute\b/i,
+    /\bcall\b/i,
   ];
 
   return !forbiddenKeywords.some((pattern) => pattern.test(normalized));
@@ -72,8 +79,14 @@ function isInsertAllowed(sql) {
   }
 
   const forbiddenKeywords = [
-    /\bdrop\b/i, /\btruncate\b/i, /\bdelete\b/i, /\bgrant\b/i,
-    /\brevoke\b/i, /\bcopy\b/i, /\bexecute\b/i, /\bcall\b/i,
+    /\bdrop\b/i,
+    /\btruncate\b/i,
+    /\bdelete\b/i,
+    /\bgrant\b/i,
+    /\brevoke\b/i,
+    /\bcopy\b/i,
+    /\bexecute\b/i,
+    /\bcall\b/i,
   ];
 
   return !forbiddenKeywords.some((pattern) => pattern.test(normalized));
@@ -90,9 +103,16 @@ function isUpdateAllowed(sql) {
   if (!/;?$/i.test(normalized)) return false;
 
   const forbiddenKeywords = [
-    /\bdrop\b/i, /\btruncate\b/i, /\bdelete\b/i, /\balter\b/i,
-    /\bgrant\b/i, /\brevoke\b/i, /\bcopy\b/i, /\bexecute\b/i,
-    /\bcall\b/i, /\bcreate\b/i,
+    /\bdrop\b/i,
+    /\btruncate\b/i,
+    /\bdelete\b/i,
+    /\balter\b/i,
+    /\bgrant\b/i,
+    /\brevoke\b/i,
+    /\bcopy\b/i,
+    /\bexecute\b/i,
+    /\bcall\b/i,
+    /\bcreate\b/i,
   ];
 
   return !forbiddenKeywords.some((pattern) => pattern.test(normalized));
@@ -121,9 +141,16 @@ function isAllowedAddConstraint(sql) {
   if (!allowedConstraintTypes.some((pattern) => pattern.test(normalized))) return false;
 
   const forbiddenKeywords = [
-    /\bdrop\b/i, /\btruncate\b/i, /\bdelete\b/i, /\bupdate\b/i,
-    /\binsert\b/i, /\bgrant\b/i, /\brevoke\b/i, /\bcopy\b/i,
-    /\bexecute\b/i, /\bcall\b/i,
+    /\bdrop\b/i,
+    /\btruncate\b/i,
+    /\bdelete\b/i,
+    /\bupdate\b/i,
+    /\binsert\b/i,
+    /\bgrant\b/i,
+    /\brevoke\b/i,
+    /\bcopy\b/i,
+    /\bexecute\b/i,
+    /\bcall\b/i,
   ];
 
   return !forbiddenKeywords.some((pattern) => pattern.test(normalized));
@@ -135,6 +162,17 @@ function isAllowedAddBranchProfileContactColumn(sql) {
   const allowedColumns = [
     /^alter\s+table\s+"order"\.order_supplier_branch_profiles\s+add\s+column\s+telefon\s+text\s*;?$/i,
     /^alter\s+table\s+"order"\.order_supplier_branch_profiles\s+add\s+column\s+email\s+text\s*;?$/i,
+  ];
+
+  return allowedColumns.some((pattern) => pattern.test(normalized));
+}
+
+function isAllowedAddOrderContactSnapshotColumn(sql) {
+  const normalized = sql.trim();
+
+  const allowedColumns = [
+    /^alter\s+table\s+"order"\.order_orders\s+add\s+column\s+telefon_snapshot\s+text\s*;?$/i,
+    /^alter\s+table\s+"order"\.order_orders\s+add\s+column\s+email_snapshot\s+text\s*;?$/i,
   ];
 
   return allowedColumns.some((pattern) => pattern.test(normalized));
@@ -166,11 +204,14 @@ function validateSql(sql) {
   if (isAllowedAddBranchProfileContactColumn(sql)) {
     return { ok: true, mode: 'add_branch_profile_contact_column' };
   }
+  if (isAllowedAddOrderContactSnapshotColumn(sql)) {
+    return { ok: true, mode: 'add_order_contact_snapshot_column' };
+  }
 
   return {
     ok: false,
     message:
-      'Dieser SQL-Befehl ist nicht erlaubt. Erlaubt sind SELECT, CREATE SCHEMA, CREATE TABLE, CREATE INDEX, INSERT INTO, UPDATE mit WHERE, gezielte ALTER TABLE CONSTRAINT-Befehle oder freigegebene Kontaktspalten.',
+      'Dieser SQL-Befehl ist nicht erlaubt. Erlaubt sind SELECT, CREATE SCHEMA, CREATE TABLE, CREATE INDEX, INSERT INTO, UPDATE mit WHERE, gezielte ALTER TABLE CONSTRAINT-Befehle oder freigegebene Kontakt-/Snapshot-Spalten.',
   };
 }
 
