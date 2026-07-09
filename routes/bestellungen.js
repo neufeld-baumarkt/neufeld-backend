@@ -617,7 +617,9 @@ router.get('/filialprofil', verifyToken(), async (req, res) => {
         ort,
         kunden_nr,
         auftrags_nr,
-        gespraechspartner
+        gespraechspartner,
+        telefon,
+        email
       FROM "order".order_supplier_branch_profiles
       WHERE supplier_id = $1
         AND aktiv = true
@@ -625,6 +627,7 @@ router.get('/filialprofil', verifyToken(), async (req, res) => {
       `,
       [supplierData.id]
     );
+
 
     return res.json({
       status: 'ok',
@@ -1037,7 +1040,9 @@ router.post('/', verifyToken(), async (req, res) => {
         ort,
         kunden_nr,
         auftrags_nr,
-        gespraechspartner
+        gespraechspartner,
+        telefon,
+        email
       FROM "order".order_supplier_branch_profiles
       WHERE supplier_id = $1
         AND filiale = $2
@@ -1056,57 +1061,61 @@ router.post('/', verifyToken(), async (req, res) => {
 
     const profileData = profileResult.rows[0];
 
-    const orderInsertResult = await client.query(
-      `
-      INSERT INTO "order".order_orders (
-        supplier_id,
-        filiale,
-        ordered_by_name,
-        bestelldatum,
-        status,
-        gesamtsumme_netto,
-        budget_booking_id,
-        split_snapshot,
-        supplier_formular_typ_snapshot,
-        firma_snapshot,
-        kunden_nr_snapshot,
-        strasse_snapshot,
-        ort_snapshot,
-        auftrags_nr_snapshot,
-        gespraechspartner_snapshot
-      )
-      VALUES (
-        $1, $2, $3, $4::date, $5, 0, NULL, NULL, $6, $7, $8, $9, $10, $11, $12
-      )
-      RETURNING
-        id,
-        supplier_id,
-        filiale,
-        ordered_by_name,
-        bestelldatum,
-        status,
-        gesamtsumme_netto,
-        budget_booking_id,
-        split_snapshot,
-        supplier_formular_typ_snapshot,
-        created_at,
-        updated_at
-      `,
-      [
-        supplierData.id,
-        effectiveFiliale,
-        userName,
-        bestelldatum,
-        orderStatus,
-        supplierData.formular_typ,
-        profileData.firma,
-        profileData.kunden_nr,
-        profileData.strasse,
-        profileData.ort,
-        profileData.auftrags_nr,
-        profileData.gespraechspartner,
-      ]
-    );
+const orderInsertResult = await client.query(
+  `
+  INSERT INTO "order".order_orders (
+    supplier_id,
+    filiale,
+    ordered_by_name,
+    bestelldatum,
+    status,
+    gesamtsumme_netto,
+    budget_booking_id,
+    split_snapshot,
+    supplier_formular_typ_snapshot,
+    firma_snapshot,
+    kunden_nr_snapshot,
+    strasse_snapshot,
+    ort_snapshot,
+    auftrags_nr_snapshot,
+    gespraechspartner_snapshot,
+    telefon_snapshot,
+    email_snapshot
+  )
+  VALUES (
+    $1, $2, $3, $4::date, $5, 0, NULL, NULL, $6, $7, $8, $9, $10, $11, $12, $13, $14
+  )
+  RETURNING
+    id,
+    supplier_id,
+    filiale,
+    ordered_by_name,
+    bestelldatum,
+    status,
+    gesamtsumme_netto,
+    budget_booking_id,
+    split_snapshot,
+    supplier_formular_typ_snapshot,
+    created_at,
+    updated_at
+  `,
+  [
+    supplierData.id,
+    effectiveFiliale,
+    userName,
+    bestelldatum,
+    orderStatus,
+    supplierData.formular_typ,
+    profileData.firma,
+    profileData.kunden_nr,
+    profileData.strasse,
+    profileData.ort,
+    profileData.auftrags_nr,
+    profileData.gespraechspartner,
+    profileData.telefon,
+    profileData.email,
+  ]
+);
 
     const orderRow = orderInsertResult.rows[0];
     const createdPositions = [];
