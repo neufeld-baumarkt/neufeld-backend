@@ -42,21 +42,12 @@ function isCreateTableAllowed(sql) {
     return false;
   }
 
-  if (!/\)\s*;?$/i.test(normalized)) {
-    return false;
-  }
+  if (!/\)\s*;?$/i.test(normalized)) return false;
 
   const forbiddenKeywords = [
-    /\bdrop\b/i,
-    /\btruncate\b/i,
-    /\bdelete\b/i,
-    /\bupdate\b/i,
-    /\balter\b/i,
-    /\bgrant\b/i,
-    /\brevoke\b/i,
-    /\bcopy\b/i,
-    /\bexecute\b/i,
-    /\bcall\b/i,
+    /\bdrop\b/i, /\btruncate\b/i, /\bdelete\b/i, /\bupdate\b/i,
+    /\balter\b/i, /\bgrant\b/i, /\brevoke\b/i, /\bcopy\b/i,
+    /\bexecute\b/i, /\bcall\b/i,
   ];
 
   return !forbiddenKeywords.some((pattern) => pattern.test(normalized));
@@ -81,14 +72,27 @@ function isInsertAllowed(sql) {
   }
 
   const forbiddenKeywords = [
-    /\bdrop\b/i,
-    /\btruncate\b/i,
-    /\bdelete\b/i,
-    /\bgrant\b/i,
-    /\brevoke\b/i,
-    /\bcopy\b/i,
-    /\bexecute\b/i,
-    /\bcall\b/i,
+    /\bdrop\b/i, /\btruncate\b/i, /\bdelete\b/i, /\bgrant\b/i,
+    /\brevoke\b/i, /\bcopy\b/i, /\bexecute\b/i, /\bcall\b/i,
+  ];
+
+  return !forbiddenKeywords.some((pattern) => pattern.test(normalized));
+}
+
+function isUpdateAllowed(sql) {
+  const normalized = sql.trim();
+
+  if (!/^update\s+(?:"[a-zA-Z_][a-zA-Z0-9_]*"|[a-zA-Z_][a-zA-Z0-9_]*)\.(?:"[a-zA-Z_][a-zA-Z0-9_]*"|[a-zA-Z_][a-zA-Z0-9_]*)\s+set\s+/i.test(normalized)) {
+    return false;
+  }
+
+  if (!/\swhere\s+/i.test(normalized)) return false;
+  if (!/;?$/i.test(normalized)) return false;
+
+  const forbiddenKeywords = [
+    /\bdrop\b/i, /\btruncate\b/i, /\bdelete\b/i, /\balter\b/i,
+    /\bgrant\b/i, /\brevoke\b/i, /\bcopy\b/i, /\bexecute\b/i,
+    /\bcall\b/i, /\bcreate\b/i,
   ];
 
   return !forbiddenKeywords.some((pattern) => pattern.test(normalized));
@@ -108,31 +112,18 @@ function isAllowedAddConstraint(sql) {
     return false;
   }
 
-  if (!/\s*;?$/i.test(normalized)) {
-    return false;
-  }
-
   const allowedConstraintTypes = [
     /\bunique\s*\(.+\)/i,
     /\bforeign\s+key\s*\(.+\)\s+references\s+[a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z_][a-zA-Z0-9_]*\s*\(.+\)/i,
     /\bcheck\s*\(.+\)/i,
   ];
 
-  if (!allowedConstraintTypes.some((pattern) => pattern.test(normalized))) {
-    return false;
-  }
+  if (!allowedConstraintTypes.some((pattern) => pattern.test(normalized))) return false;
 
   const forbiddenKeywords = [
-    /\bdrop\b/i,
-    /\btruncate\b/i,
-    /\bdelete\b/i,
-    /\bupdate\b/i,
-    /\binsert\b/i,
-    /\bgrant\b/i,
-    /\brevoke\b/i,
-    /\bcopy\b/i,
-    /\bexecute\b/i,
-    /\bcall\b/i,
+    /\bdrop\b/i, /\btruncate\b/i, /\bdelete\b/i, /\bupdate\b/i,
+    /\binsert\b/i, /\bgrant\b/i, /\brevoke\b/i, /\bcopy\b/i,
+    /\bexecute\b/i, /\bcall\b/i,
   ];
 
   return !forbiddenKeywords.some((pattern) => pattern.test(normalized));
@@ -150,9 +141,7 @@ function isAllowedAddBranchProfileContactColumn(sql) {
 }
 
 function validateSql(sql) {
-  if (!sql) {
-    return { ok: false, message: 'SQL-Befehl fehlt.' };
-  }
+  if (!sql) return { ok: false, message: 'SQL-Befehl fehlt.' };
 
   if (sql.length > MAX_SQL_LENGTH) {
     return { ok: false, message: `SQL-Befehl ist zu lang. Maximum: ${MAX_SQL_LENGTH} Zeichen.` };
@@ -166,34 +155,14 @@ function validateSql(sql) {
     return { ok: false, message: 'Mehrere SQL-Statements sind nicht erlaubt.' };
   }
 
-  if (isSelectAllowed(sql)) {
-    return { ok: true, mode: 'select' };
-  }
-
-  if (isCreateSchemaAllowed(sql)) {
-    return { ok: true, mode: 'create_schema' };
-  }
-
-  if (isCreateTableAllowed(sql)) {
-    return { ok: true, mode: 'create_table' };
-  }
-
-  if (isCreateIndexAllowed(sql)) {
-    return { ok: true, mode: 'create_index' };
-  }
-
-  if (isInsertAllowed(sql)) {
-    return { ok: true, mode: 'insert' };
-  }
-
-  if (isAllowedDropConstraint(sql)) {
-    return { ok: true, mode: 'drop_constraint' };
-  }
-
-  if (isAllowedAddConstraint(sql)) {
-    return { ok: true, mode: 'add_constraint' };
-  }
-
+  if (isSelectAllowed(sql)) return { ok: true, mode: 'select' };
+  if (isCreateSchemaAllowed(sql)) return { ok: true, mode: 'create_schema' };
+  if (isCreateTableAllowed(sql)) return { ok: true, mode: 'create_table' };
+  if (isCreateIndexAllowed(sql)) return { ok: true, mode: 'create_index' };
+  if (isInsertAllowed(sql)) return { ok: true, mode: 'insert' };
+  if (isUpdateAllowed(sql)) return { ok: true, mode: 'update' };
+  if (isAllowedDropConstraint(sql)) return { ok: true, mode: 'drop_constraint' };
+  if (isAllowedAddConstraint(sql)) return { ok: true, mode: 'add_constraint' };
   if (isAllowedAddBranchProfileContactColumn(sql)) {
     return { ok: true, mode: 'add_branch_profile_contact_column' };
   }
@@ -201,49 +170,34 @@ function validateSql(sql) {
   return {
     ok: false,
     message:
-      'Dieser SQL-Befehl ist nicht erlaubt. Erlaubt sind SELECT, CREATE SCHEMA, CREATE TABLE, CREATE INDEX, INSERT INTO, gezielte ALTER TABLE CONSTRAINT-Befehle oder die freigegebenen Kontaktspalten für order_supplier_branch_profiles.',
+      'Dieser SQL-Befehl ist nicht erlaubt. Erlaubt sind SELECT, CREATE SCHEMA, CREATE TABLE, CREATE INDEX, INSERT INTO, UPDATE mit WHERE, gezielte ALTER TABLE CONSTRAINT-Befehle oder freigegebene Kontaktspalten.',
   };
 }
 
 router.post('/execute', verifyToken(), async (req, res) => {
   if (process.env.DEV_DB_CONSOLE_ENABLED !== 'true') {
-    return res.status(403).json({
-      ok: false,
-      message: 'DEV-DB-Konsole ist serverseitig deaktiviert.',
-    });
+    return res.status(403).json({ ok: false, message: 'DEV-DB-Konsole ist serverseitig deaktiviert.' });
   }
 
   if (!isAdmin(req)) {
-    return res.status(403).json({
-      ok: false,
-      message: 'Zugriff verweigert. Nur Admin darf DEV-DB-Befehle ausführen.',
-    });
+    return res.status(403).json({ ok: false, message: 'Zugriff verweigert. Nur Admin darf DEV-DB-Befehle ausführen.' });
   }
 
   const { sql, pin } = req.body || {};
 
   if (!process.env.DEV_DB_CONSOLE_PIN) {
-    return res.status(500).json({
-      ok: false,
-      message: 'DEV_DB_CONSOLE_PIN ist serverseitig nicht gesetzt.',
-    });
+    return res.status(500).json({ ok: false, message: 'DEV_DB_CONSOLE_PIN ist serverseitig nicht gesetzt.' });
   }
 
   if (!pin || String(pin) !== String(process.env.DEV_DB_CONSOLE_PIN)) {
-    return res.status(401).json({
-      ok: false,
-      message: 'PIN falsch oder fehlt.',
-    });
+    return res.status(401).json({ ok: false, message: 'PIN falsch oder fehlt.' });
   }
 
   const normalizedSql = normalizeSql(sql);
   const validation = validateSql(normalizedSql);
 
   if (!validation.ok) {
-    return res.status(400).json({
-      ok: false,
-      message: validation.message,
-    });
+    return res.status(400).json({ ok: false, message: validation.message });
   }
 
   const startedAt = new Date();
