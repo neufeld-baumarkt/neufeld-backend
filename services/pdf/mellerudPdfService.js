@@ -496,7 +496,7 @@ async function drawFinalSignatureBlock(pdfDoc, page, fonts, order) {
   }
 
   drawLine(page, 28, 44, 813, 44, { thickness: 0.5, color: rgb(0.2, 0.2, 0.2) });
-  drawText(page, 'Die Ware bleibt bis zur vollstaendigen Bezahlung unser Eigentum.', 325, 31, {
+  drawText(page, 'Diese Bestellung wurde mit dem digitalen Bestellsystem der Neufeld Baumarkt GmbH erstellt und automatisch versendet.', 325, 31, {
     font: regular,
     size: 6,
     color: rgb(0.2, 0.2, 0.2),
