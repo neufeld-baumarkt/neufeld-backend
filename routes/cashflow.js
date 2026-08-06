@@ -8,6 +8,10 @@
 // - Unternehmensbuchungen automatisch auf Filialen verteilen
 // - Bestehende Buchungen aktualisieren
 // - Bestehende Buchungen löschen
+// - Rechnungsdaten bei Ausgaben verwalten
+// - Avis- und Rechnungsnummern gemeinsam durchsuchen
+// - Einzelrechnungen und vollständige Avis buchen
+// - Negative Ausgaben als Gutschriften zulassen
 // - Optionaler bisKw-Filter für Zeitraumvergleiche
 // - Zugriff nur für Admin, Supervisor und Geschäftsführer
 // - Saldo wird serverseitig über cashflow.kategorien.typ berechnet
@@ -40,6 +44,7 @@ const ALLOWED_FAST_BOOKING_FILIALEN = new Set([
 const ALLOWED_STORED_FILIALEN = new Set(STORED_FILIALEN);
 const ALLOWED_EINTRAG_TYPEN = new Set(['betrag', 'feiertag']);
 const ALLOWED_STATUS = new Set(['angekuendigt', 'gebucht']);
+const ALLOWED_ZAHLUNGSARTEN = new Set(['abbuchung', 'ueberweisung']);
 
 function requireCashflowAccess(req, res, next) {
   const role = req.user?.role;
@@ -61,14 +66,47 @@ function isValidUuid(value) {
 }
 
 function splitAmountToFilialen(betrag) {
-  const cents = Math.round(Number(betrag) * 100);
-  const base = Math.floor(cents / SPLIT_FILIALEN.length);
-  const remainder = cents % SPLIT_FILIALEN.length;
+  const numericAmount = Number(betrag);
+  const sign = numericAmount < 0 ? -1 : 1;
+  const absoluteCents = Math.abs(Math.round(numericAmount * 100));
+  const base = Math.floor(absoluteCents / SPLIT_FILIALEN.length);
+  const remainder = absoluteCents % SPLIT_FILIALEN.length;
 
   return SPLIT_FILIALEN.map((filiale, index) => ({
     filiale,
-    betrag: (base + (index < remainder ? 1 : 0)) / 100,
+    betrag: (sign * (base + (index < remainder ? 1 : 0))) / 100,
   }));
+}
+
+function normalizeOptionalText(value) {
+  if (value === undefined) return undefined;
+  if (value === null || String(value).trim() === '') return null;
+  return String(value).trim();
+}
+
+function parseOptionalIsoDate(value) {
+  if (value === undefined) return { provided: false, value: undefined };
+  if (value === null || String(value).trim() === '') {
+    return { provided: true, value: null };
+  }
+
+  const normalized = String(value).trim();
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
+    return { provided: true, value: NaN };
+  }
+
+  return { provided: true, value: normalized };
+}
+
+function deriveGroupedStatus(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return 'angekuendigt';
+
+  const bookedCount = rows.filter((row) => row.status === 'gebucht').length;
+
+  if (bookedCount === 0) return 'angekuendigt';
+  if (bookedCount === rows.length) return 'gebucht';
+  return 'teilweise_gebucht';
 }
 
 function parseJahrParam(req, res) {
@@ -167,9 +205,9 @@ function parseFastBookingPayload(req, res) {
   if (eintragTyp === 'betrag') {
     betrag = Number(req.body?.betrag);
 
-    if (!Number.isFinite(betrag) || betrag <= 0) {
+    if (!Number.isFinite(betrag) || betrag === 0) {
       res.status(400).json({
-        message: 'Ungültiger Betrag. Erwartet wird eine Zahl größer 0.',
+        message: 'Ungültiger Betrag. Erwartet wird eine Zahl ungleich 0.',
       });
       return null;
     }
@@ -232,6 +270,29 @@ function parseUpdateBuchungPayload(req, res) {
     betragRaw !== undefined && betragRaw !== null && betragRaw !== '';
   const betrag = betragProvided ? Number(betragRaw) : undefined;
 
+  const rechnungsnummer = normalizeOptionalText(req.body?.rechnungsnummer);
+  const rechnungsdatumParsed = parseOptionalIsoDate(req.body?.rechnungsdatum);
+  const avisNummer = normalizeOptionalText(req.body?.avis_nummer);
+  const zahlungsart = normalizeOptionalText(req.body?.zahlungsart);
+
+  if (rechnungsdatumParsed.provided && Number.isNaN(rechnungsdatumParsed.value)) {
+    res.status(400).json({
+      message: 'Ungültiges Rechnungsdatum. Erwartet wird YYYY-MM-DD.',
+    });
+    return null;
+  }
+
+  if (
+    zahlungsart !== undefined &&
+    zahlungsart !== null &&
+    !ALLOWED_ZAHLUNGSARTEN.has(zahlungsart)
+  ) {
+    res.status(400).json({
+      message: 'Ungültige Zahlungsart. Erlaubt sind abbuchung und ueberweisung.',
+    });
+    return null;
+  }
+
   if (status !== undefined && !ALLOWED_STATUS.has(status)) {
     res.status(400).json({
       message: 'Ungültiger Status. Erlaubt sind angekuendigt und gebucht.',
@@ -271,16 +332,16 @@ function parseUpdateBuchungPayload(req, res) {
     return null;
   }
 
-  if (betragProvided && (!Number.isFinite(betrag) || betrag < 0)) {
+  if (betragProvided && !Number.isFinite(betrag)) {
     res.status(400).json({
-      message: 'Ungültiger Betrag. Erwartet wird eine Zahl größer oder gleich 0.',
+      message: 'Ungültiger Betrag.',
     });
     return null;
   }
 
-  if (eintragTyp === 'betrag' && betragProvided && betrag <= 0) {
+  if (eintragTyp === 'betrag' && betragProvided && betrag === 0) {
     res.status(400).json({
-      message: 'Bei Eintragstyp betrag muss der Betrag größer 0 sein.',
+      message: 'Bei Eintragstyp betrag muss der Betrag ungleich 0 sein.',
     });
     return null;
   }
@@ -293,7 +354,11 @@ function parseUpdateBuchungPayload(req, res) {
     !jahrProvided &&
     !kwProvided &&
     tag === undefined &&
-    !betragProvided
+    !betragProvided &&
+    rechnungsnummer === undefined &&
+    !rechnungsdatumParsed.provided &&
+    avisNummer === undefined &&
+    zahlungsart === undefined
   ) {
     res.status(400).json({
       message: 'Keine gültigen Änderungsdaten übergeben.',
@@ -317,7 +382,15 @@ function parseUpdateBuchungPayload(req, res) {
     updateJahr: jahrProvided,
     updateKw: kwProvided,
     updateTag: tag !== undefined,
+    rechnungsnummer,
+    rechnungsdatum: rechnungsdatumParsed.value,
+    avisNummer,
+    zahlungsart,
     updateBetrag: betragProvided,
+    updateRechnungsnummer: rechnungsnummer !== undefined,
+    updateRechnungsdatum: rechnungsdatumParsed.provided,
+    updateAvisNummer: avisNummer !== undefined,
+    updateZahlungsart: zahlungsart !== undefined,
   };
 }
 
@@ -351,6 +424,20 @@ router.post('/buchungen', verifyToken(), requireCashflowAccess, async (req, res)
     const isEinnahme =
       String(kategorieCheck.rows[0].typ || '').trim() === 'Einnahme';
 
+    if (payload.eintragTyp === 'betrag') {
+      if (isEinnahme && payload.betrag <= 0) {
+        return res.status(400).json({
+          message: 'Einnahmen müssen größer 0 sein.',
+        });
+      }
+
+      if (!isEinnahme && payload.betrag === 0) {
+        return res.status(400).json({
+          message: 'Ausgaben und Gutschriften müssen ungleich 0 sein.',
+        });
+      }
+    }
+
     const targets =
       payload.filiale === 'Unternehmen' && !isEinnahme
         ? splitAmountToFilialen(payload.betrag)
@@ -377,7 +464,11 @@ router.post('/buchungen', verifyToken(), requireCashflowAccess, async (req, res)
             filiale,
             status,
             notiz,
-            eintrag_typ
+            eintrag_typ,
+            rechnungsnummer,
+            rechnungsdatum,
+            avis_nummer,
+            zahlungsart
           )
           VALUES (
             $1,
@@ -392,7 +483,11 @@ router.post('/buchungen', verifyToken(), requireCashflowAccess, async (req, res)
             $7,
             'angekuendigt',
             $8,
-            $9
+            $9,
+            NULL,
+            NULL,
+            NULL,
+            NULL
           )
           RETURNING
             id,
@@ -410,7 +505,11 @@ router.post('/buchungen', verifyToken(), requireCashflowAccess, async (req, res)
             filiale,
             status,
             notiz,
-            eintrag_typ
+            eintrag_typ,
+            rechnungsnummer,
+            rechnungsdatum,
+            avis_nummer,
+            zahlungsart
           `,
           [
             payload.jahr,
@@ -477,6 +576,7 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
       b.status,
       b.betrag,
       b.planbetrag,
+      b.eintrag_typ,
       k.typ
     FROM cashflow.buchungen b
     JOIN cashflow.kategorien k
@@ -495,6 +595,36 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
   const current = currentResult.rows[0];
 
   const isEinnahme = current.typ === 'Einnahme';
+
+  const hasInvoiceFieldUpdate =
+    payload.updateRechnungsnummer ||
+    payload.updateRechnungsdatum ||
+    payload.updateAvisNummer ||
+    payload.updateZahlungsart;
+
+  if (isEinnahme && hasInvoiceFieldUpdate) {
+    return res.status(400).json({
+      message: 'Rechnungsdaten sind ausschließlich bei Ausgaben zulässig.',
+    });
+  }
+
+  const effectiveEintragTyp = payload.updateEintragTyp
+    ? payload.eintragTyp
+    : current.eintrag_typ;
+
+  if (payload.updateBetrag && effectiveEintragTyp === 'betrag') {
+    if (isEinnahme && payload.betrag <= 0) {
+      return res.status(400).json({
+        message: 'Einnahmen müssen größer 0 sein.',
+      });
+    }
+
+    if (!isEinnahme && payload.betrag === 0) {
+      return res.status(400).json({
+        message: 'Ausgaben und Gutschriften müssen ungleich 0 sein.',
+      });
+    }
+  }
 
   const statuswechselZuGebucht =
     isEinnahme &&
@@ -517,6 +647,10 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
           WHEN $16::boolean THEN $17
           ELSE b.betrag
         END,
+        rechnungsnummer = CASE WHEN $18::boolean THEN $19 ELSE b.rechnungsnummer END,
+        rechnungsdatum = CASE WHEN $20::boolean THEN $21::date ELSE b.rechnungsdatum END,
+        avis_nummer = CASE WHEN $22::boolean THEN $23 ELSE b.avis_nummer END,
+        zahlungsart = CASE WHEN $24::boolean THEN $25 ELSE b.zahlungsart END,
         geaendert_am = NOW()
       FROM cashflow.kategorien k
       WHERE b.id = $1
@@ -543,7 +677,11 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
         b.eintrag_typ,
         b.planbetrag,
         b.abweichung_betrag,
-        b.abweichung_prozent
+        b.abweichung_prozent,
+        b.rechnungsnummer,
+        b.rechnungsdatum,
+        b.avis_nummer,
+        b.zahlungsart
       `,
       [
         id,
@@ -563,6 +701,14 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
         payload.tag || null,
         payload.updateBetrag,
         payload.betrag ?? null,
+        payload.updateRechnungsnummer,
+        payload.rechnungsnummer,
+        payload.updateRechnungsdatum,
+        payload.rechnungsdatum ?? null,
+        payload.updateAvisNummer,
+        payload.avisNummer,
+        payload.updateZahlungsart,
+        payload.zahlungsart,
       ]
     );
 
@@ -657,7 +803,11 @@ router.delete('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req
         b.filiale,
         b.status,
         b.notiz,
-        b.eintrag_typ
+        b.eintrag_typ,
+        b.rechnungsnummer,
+        b.rechnungsdatum,
+        b.avis_nummer,
+        b.zahlungsart
       `,
       [id]
     );
@@ -678,6 +828,271 @@ router.delete('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req
     return res.status(500).json({
       message: 'Serverfehler beim Löschen der Cashflow-Buchung.',
     });
+  }
+});
+
+
+// GET /api/cashflow/buchungen/suche?suchwert=...
+router.get('/buchungen/suche', verifyToken(), requireCashflowAccess, async (req, res) => {
+  const suchwert = String(req.query?.suchwert || '').trim();
+
+  if (!suchwert) {
+    return res.status(400).json({
+      message: 'suchwert fehlt.',
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        b.id,
+        b.jahr,
+        b.kw,
+        b.datum,
+        b.tag,
+        b.kategorie_id,
+        k.name AS kategorie,
+        k.typ,
+        b.betrag,
+        b.filiale,
+        b.status,
+        b.notiz,
+        b.eintrag_typ,
+        b.rechnungsnummer,
+        b.rechnungsdatum,
+        b.avis_nummer,
+        b.zahlungsart,
+        b.erstellt_von,
+        b.erstellt_am,
+        b.geaendert_am
+      FROM cashflow.buchungen b
+      JOIN cashflow.kategorien k
+        ON k.id = b.kategorie_id
+      WHERE k.aktiv = true
+        AND k.typ = 'Ausgabe'
+        AND (
+          b.avis_nummer = $1
+          OR b.rechnungsnummer = $1
+        )
+      ORDER BY
+        b.avis_nummer NULLS LAST,
+        b.rechnungsdatum NULLS LAST,
+        b.rechnungsnummer NULLS LAST,
+        b.id
+      `,
+      [suchwert]
+    );
+
+    const avisMap = new Map();
+
+    for (const row of result.rows) {
+      if (!row.avis_nummer) continue;
+
+      if (!avisMap.has(row.avis_nummer)) {
+        avisMap.set(row.avis_nummer, []);
+      }
+
+      avisMap.get(row.avis_nummer).push(row);
+    }
+
+    const avisTreffer = Array.from(avisMap.entries()).map(([avisNummer, rows]) => ({
+      typ: 'avis',
+      avis_nummer: avisNummer,
+      anzahl_rechnungen: rows.length,
+      gesamtsumme: rows
+        .reduce((sum, row) => sum + Number(row.betrag || 0), 0)
+        .toFixed(2),
+      status: deriveGroupedStatus(rows),
+      rechnungen: rows.map((row) => ({
+        id: row.id,
+        rechnungsnummer: row.rechnungsnummer,
+        rechnungsdatum: row.rechnungsdatum,
+        betrag: row.betrag,
+        filiale: row.filiale,
+        kategorie: row.kategorie,
+        status: row.status,
+        zahlungsart: row.zahlungsart,
+      })),
+    }));
+
+    const rechnungsTreffer = result.rows
+      .filter((row) => row.rechnungsnummer === suchwert)
+      .map((row) => ({
+        typ: 'rechnung',
+        id: row.id,
+        rechnungsnummer: row.rechnungsnummer,
+        rechnungsdatum: row.rechnungsdatum,
+        avis_nummer: row.avis_nummer,
+        betrag: row.betrag,
+        filiale: row.filiale,
+        kategorie: row.kategorie,
+        status: row.status,
+        zahlungsart: row.zahlungsart,
+      }));
+
+    return res.json({
+      suchwert,
+      anzahl_treffer: avisTreffer.length + rechnungsTreffer.length,
+      avis: avisTreffer,
+      rechnungen: rechnungsTreffer,
+    });
+  } catch (err) {
+    console.error('Fehler GET /api/cashflow/buchungen/suche:', err);
+
+    return res.status(500).json({
+      message: 'Serverfehler bei der Suche nach Avis oder Rechnungsnummer.',
+    });
+  }
+});
+
+// POST /api/cashflow/buchungen/:id/buchen
+router.post('/buchungen/:id/buchen', verifyToken(), requireCashflowAccess, async (req, res) => {
+  const id = String(req.params?.id || '').trim();
+
+  if (!isValidUuid(id)) {
+    return res.status(400).json({
+      message: 'Ungültige Buchungs-ID.',
+    });
+  }
+
+  try {
+    const result = await pool.query(
+      `
+      UPDATE cashflow.buchungen b
+      SET
+        status = 'gebucht',
+        geaendert_am = NOW()
+      FROM cashflow.kategorien k
+      WHERE b.id = $1
+        AND k.id = b.kategorie_id
+        AND k.aktiv = true
+        AND k.typ = 'Ausgabe'
+      RETURNING
+        b.id,
+        b.rechnungsnummer,
+        b.rechnungsdatum,
+        b.avis_nummer,
+        b.betrag,
+        b.filiale,
+        b.status,
+        b.zahlungsart,
+        b.geaendert_am
+      `,
+      [id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({
+        message: 'Ausgabenbuchung nicht gefunden.',
+      });
+    }
+
+    return res.json({
+      message: 'Rechnung wurde gebucht.',
+      buchung: result.rows[0],
+    });
+  } catch (err) {
+    console.error('Fehler POST /api/cashflow/buchungen/:id/buchen:', err);
+
+    return res.status(500).json({
+      message: 'Serverfehler beim Buchen der Rechnung.',
+    });
+  }
+});
+
+// POST /api/cashflow/avis/:avisNummer/buchen
+router.post('/avis/:avisNummer/buchen', verifyToken(), requireCashflowAccess, async (req, res) => {
+  const avisNummer = String(req.params?.avisNummer || '').trim();
+
+  if (!avisNummer) {
+    return res.status(400).json({
+      message: 'Avis-Nummer fehlt.',
+    });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    const rowsResult = await client.query(
+      `
+      SELECT
+        b.id,
+        b.status
+      FROM cashflow.buchungen b
+      JOIN cashflow.kategorien k
+        ON k.id = b.kategorie_id
+      WHERE b.avis_nummer = $1
+        AND k.aktiv = true
+        AND k.typ = 'Ausgabe'
+      FOR UPDATE
+      `,
+      [avisNummer]
+    );
+
+    if (rowsResult.rowCount === 0) {
+      await client.query('ROLLBACK');
+
+      return res.status(404).json({
+        message: 'Avis nicht gefunden.',
+      });
+    }
+
+    const updateResult = await client.query(
+      `
+      UPDATE cashflow.buchungen b
+      SET
+        status = 'gebucht',
+        geaendert_am = NOW()
+      FROM cashflow.kategorien k
+      WHERE b.avis_nummer = $1
+        AND b.status = 'angekuendigt'
+        AND k.id = b.kategorie_id
+        AND k.aktiv = true
+        AND k.typ = 'Ausgabe'
+      RETURNING
+        b.id,
+        b.rechnungsnummer,
+        b.rechnungsdatum,
+        b.avis_nummer,
+        b.betrag,
+        b.filiale,
+        b.status,
+        b.zahlungsart,
+        b.geaendert_am
+      `,
+      [avisNummer]
+    );
+
+    await client.query('COMMIT');
+
+    return res.json({
+      message:
+        updateResult.rowCount > 0
+          ? 'Avis wurde vollständig gebucht.'
+          : 'Avis war bereits vollständig gebucht.',
+      avis_nummer: avisNummer,
+      anzahl_rechnungen: rowsResult.rowCount,
+      anzahl_neu_gebucht: updateResult.rowCount,
+      status: 'gebucht',
+      buchungen: updateResult.rows,
+    });
+  } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackErr) {
+      console.error('Rollback-Fehler POST /api/cashflow/avis/:avisNummer/buchen:', rollbackErr);
+    }
+
+    console.error('Fehler POST /api/cashflow/avis/:avisNummer/buchen:', err);
+
+    return res.status(500).json({
+      message: 'Serverfehler beim Buchen des Avis.',
+    });
+  } finally {
+    client.release();
   }
 });
 
@@ -788,7 +1203,11 @@ router.get('/buchungen', verifyToken(), requireCashflowAccess, async (req, res) 
         b.eintrag_typ,
         b.planbetrag,
         b.abweichung_betrag,
-        b.abweichung_prozent
+        b.abweichung_prozent,
+        b.rechnungsnummer,
+        b.rechnungsdatum,
+        b.avis_nummer,
+        b.zahlungsart
       FROM cashflow.buchungen b
       JOIN cashflow.kategorien k
         ON k.id = b.kategorie_id
