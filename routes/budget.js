@@ -190,8 +190,8 @@ function canWriteBookingType(role, bookingType) {
   if (!BOOKING_TYPES.includes(bookingType)) return false;
 
   if (bookingType === 'bestellung') {
-    // Filiale (eigene), Manager-1, Supervisor, Admin dürfen schreiben
-    return role === ROLE_FILIALE || role === ROLE_MANAGER_1 || role === ROLE_SUPERVISOR || role === ROLE_ADMIN;
+    // Filiale (eigene), Manager-1, Geschäftsführer, Supervisor, Admin dürfen schreiben
+    return role === ROLE_FILIALE || role === ROLE_MANAGER_1 || role === ROLE_GF || role === ROLE_SUPERVISOR || role === ROLE_ADMIN;
   }
 
   if (bookingType === 'sonderbestellung') {
@@ -204,8 +204,8 @@ function canWriteBookingType(role, bookingType) {
     return role === ROLE_ADMIN || role === ROLE_SUPERVISOR || role === ROLE_MANAGER_1 || role === ROLE_GF;
   }
 
-  // abgabe / korrektur: Schreiben: Manager-1, Supervisor, Admin
-  return role === ROLE_ADMIN || role === ROLE_SUPERVISOR || role === ROLE_MANAGER_1;
+  // abgabe / korrektur: Schreiben: Manager-1, Geschäftsführer, Supervisor, Admin
+  return role === ROLE_ADMIN || role === ROLE_SUPERVISOR || role === ROLE_MANAGER_1 || role === ROLE_GF;
 }
 
 function canReadBookingType(role, bookingType) {
