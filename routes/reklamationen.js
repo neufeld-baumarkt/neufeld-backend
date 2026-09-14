@@ -113,8 +113,10 @@ function looksLikeReklaNrUnique(err) {
 
 function looksLikeTrackingUnique(err) {
   if (!err) return false;
+  if (err.constraint === 'ux_reklamationen_tracking_id_norm') return true;
+
   const detail = normText(err.detail).toLowerCase();
-  return detail.includes('key (tracking_id)=') || detail.includes('(tracking_id)');
+  return detail.includes('key (tracking_id)=') || detail.includes('tracking_id');
 }
 
 async function fetchExistingByReklaNr(reklaNr) {
