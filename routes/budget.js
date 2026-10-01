@@ -91,24 +91,18 @@ function parseAktionsvorabTargetFromAktionNr(aktionNrRaw) {
     };
   }
 
-  if (aktionNr.length !== 6) {
+  const normalizedAktionNr = aktionNr.toUpperCase();
+
+  if (!/^[AS]\d{5}$/.test(normalizedAktionNr)) {
     return {
       ok: false,
       message:
-        "aktion_nr ist ungültig: Erwartet werden exakt 6 Zeichen (z. B. A02645 oder S02645)."
+        "aktion_nr ist ungültig: Erwartet werden A oder S gefolgt von fünf Ziffern (z. B. A02645 oder S02645)."
     };
   }
 
-  const yearPart = aktionNr.slice(2, 4);
-  const kwPart = aktionNr.slice(4, 6);
-
-  if (!/^\d{2}$/.test(yearPart) || !/^\d{2}$/.test(kwPart)) {
-    return {
-      ok: false,
-      message:
-        "aktion_nr ist ungültig: Stellen 3-4 müssen das Jahr und Stellen 5-6 die KW enthalten."
-    };
-  }
+  const yearPart = normalizedAktionNr.slice(2, 4);
+  const kwPart = normalizedAktionNr.slice(4, 6);
 
   const jahr = 2000 + Number(yearPart);
   const kw = Number(kwPart);
@@ -131,7 +125,7 @@ function parseAktionsvorabTargetFromAktionNr(aktionNrRaw) {
     ok: true,
     jahr,
     kw,
-    aktion_nr: aktionNr.toUpperCase()
+    aktion_nr: normalizedAktionNr
   };
 }
 
@@ -328,6 +322,30 @@ async function resolveWeekBudgetId(client, filiale, jahr, kw) {
     [filiale, jahr, kw]
   );
   return r.rows?.[0]?.id || null;
+}
+
+async function ensureWeekBudgetId(client, filiale, jahr, kw) {
+  const result = await client.query(
+    `
+      INSERT INTO budget.week_budgets (filiale, jahr, kw, prozentsatz_snapshot, freigegeben, created_at, updated_at)
+      VALUES (
+        $1, $2, $3,
+        COALESCE((SELECT prozentsatz FROM budget.week_rules WHERE jahr = $2 AND kw = $3 LIMIT 1), 0),
+        false, NOW(), NOW()
+      )
+      ON CONFLICT (filiale, jahr, kw)
+      DO UPDATE SET
+        prozentsatz_snapshot = CASE
+          WHEN budget.week_budgets.prozentsatz_snapshot = 0 THEN EXCLUDED.prozentsatz_snapshot
+          ELSE budget.week_budgets.prozentsatz_snapshot
+        END,
+        updated_at = NOW()
+      RETURNING id
+    `,
+    [filiale, jahr, kw]
+  );
+
+  return result.rows[0].id;
 }
 
 async function resolveTargetWeekBudgetId(client, jahr, kw, splitItem) {
@@ -1044,6 +1062,197 @@ router.get('/bookings', verifyToken(), async (req, res) => {
   } catch (e) {
     console.error('Fehler GET /api/budget/bookings:', e.message);
     return res.status(500).json({ message: 'Serverfehler (Bookings GET).' });
+  }
+});
+
+// POST /api/budget/bookings/actions
+// Legt eine Aktion in einem atomaren Vorgang für mehrere Filialen an.
+router.post('/bookings/actions', verifyToken(), async (req, res) => {
+  const { role } = req.user || {};
+
+  if (!canWriteBookingType(role, 'aktionsvorab')) {
+    return res.status(403).json({ message: 'Zugriff verweigert: Rolle darf keine Aktionen anlegen.' });
+  }
+
+  const parsedTarget = parseAktionsvorabTargetFromAktionNr(req.body?.aktion_nr);
+  if (!parsedTarget.ok) {
+    return res.status(400).json({ message: parsedTarget.message });
+  }
+
+  if (!Array.isArray(req.body?.filialen) || req.body.filialen.length === 0) {
+    return res.status(400).json({ message: 'Mindestens eine Filiale muss ausgewählt sein.' });
+  }
+
+  const requestedBranches = [];
+  const seenBranches = new Set();
+  for (const item of req.body.filialen) {
+    const filiale = normalizeFiliale(item?.filiale);
+    const betrag = parseNumericSafe(item?.betrag);
+
+    if (!filiale) {
+      return res.status(400).json({ message: 'Jede ausgewählte Filiale benötigt einen gültigen Namen.' });
+    }
+
+    const branchKey = filiale.toLocaleLowerCase('de-DE');
+    if (seenBranches.has(branchKey)) {
+      return res.status(400).json({ message: `Filiale ${filiale} wurde mehrfach übergeben.` });
+    }
+    seenBranches.add(branchKey);
+
+    if (betrag === null || betrag <= 0) {
+      return res.status(400).json({ message: `Betrag für ${filiale} ist Pflicht und muss größer als 0 sein.` });
+    }
+
+    requestedBranches.push({ filiale, betrag: Math.round(betrag * 100) / 100, branchKey });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const activeResult = await client.query(
+      `SELECT name FROM filialen WHERE aktiv = true AND LOWER(name) = ANY($1::text[])`,
+      [requestedBranches.map((item) => item.branchKey)]
+    );
+    const activeByKey = new Map(
+      (activeResult.rows || []).map((row) => [String(row.name).toLocaleLowerCase('de-DE'), row.name])
+    );
+    const missingBranches = requestedBranches
+      .filter((item) => !activeByKey.has(item.branchKey))
+      .map((item) => item.filiale);
+
+    if (missingBranches.length > 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        message: `Unbekannte oder inaktive Filiale(n): ${missingBranches.join(', ')}.`
+      });
+    }
+
+    const branches = requestedBranches
+      .map((item) => ({ ...item, filiale: activeByKey.get(item.branchKey) }))
+      .sort((left, right) => left.filiale.localeCompare(right.filiale, 'de-DE'));
+
+    const existingByBranch = new Map();
+    for (const item of branches) {
+      const existingResult = await lockAndFindExistingActions(
+        client,
+        item.filiale,
+        parsedTarget.aktion_nr
+      );
+      const existingActions = existingResult.rows || [];
+      existingByBranch.set(item.filiale, existingActions);
+    }
+
+    const conflicts = branches
+      .map((item) => {
+        const existingActions = existingByBranch.get(item.filiale) || [];
+        if (existingActions.length === 0) return null;
+        return {
+          filiale: item.filiale,
+          betrag: sumBookingAmounts(existingActions),
+          booking_count: existingActions.length
+        };
+      })
+      .filter(Boolean);
+
+    if (conflicts.length > 0 && !wantsExistingActionMerge(req.body?.merge_existing_action)) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        code: 'ACTION_ALREADY_EXISTS',
+        message: `Die Aktion ${parsedTarget.aktion_nr} ist bereits in ${conflicts.length} Filiale(n) vorhanden.`,
+        existing_actions: conflicts,
+        action: {
+          aktion_nr: parsedTarget.aktion_nr,
+          jahr: parsedTarget.jahr,
+          kw: parsedTarget.kw
+        }
+      });
+    }
+
+    const splitConflict = branches.find((item) =>
+      (existingByBranch.get(item.filiale) || []).some(
+        (booking) => booking.parent_booking_id || booking.has_splits
+      )
+    );
+    if (splitConflict) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        code: 'ACTION_MERGE_REQUIRES_SPLIT_EDIT',
+        message:
+          `Die Aktion ${parsedTarget.aktion_nr} ist in ${splitConflict.filiale} Bestandteil einer ` +
+          'aufgeteilten Buchung und kann deshalb nicht automatisch zusammengeführt werden.'
+      });
+    }
+
+    const bookings = [];
+    for (const item of branches) {
+      const existingActions = existingByBranch.get(item.filiale) || [];
+
+      if (existingActions.length > 0) {
+        const canonical = existingActions[0];
+        const mergedAmount = Math.round((sumBookingAmounts(existingActions) + item.betrag) * 100) / 100;
+        const updated = await client.query(
+          `
+            UPDATE budget.bookings
+            SET betrag = $2, aktion_nr = $3
+            WHERE id = $1
+            RETURNING *
+          `,
+          [canonical.id, mergedAmount, parsedTarget.aktion_nr]
+        );
+
+        const duplicateIds = existingActions.slice(1).map((booking) => booking.id);
+        if (duplicateIds.length > 0) {
+          await client.query(`DELETE FROM budget.bookings WHERE id = ANY($1::uuid[])`, [duplicateIds]);
+        }
+
+        bookings.push({ ...updated.rows[0], filiale: item.filiale, merged: true });
+        continue;
+      }
+
+      const weekBudgetId = await ensureWeekBudgetId(
+        client,
+        item.filiale,
+        parsedTarget.jahr,
+        parsedTarget.kw
+      );
+      const inserted = await client.query(
+        `
+          INSERT INTO budget.bookings
+            (week_budget_id, datum, typ, betrag, lieferant, aktion_nr, beschreibung,
+             von_filiale, an_filiale, status, created_by, created_at, source)
+          VALUES
+            ($1, CURRENT_DATE, 'aktionsvorab', $2, NULL, $3, NULL,
+             NULL, NULL, 'offen', $4, NOW(), $5)
+          RETURNING *
+        `,
+        [
+          weekBudgetId,
+          item.betrag,
+          parsedTarget.aktion_nr,
+          req.user?.name || 'unknown',
+          SOURCE_AKTION
+        ]
+      );
+      bookings.push({ ...inserted.rows[0], filiale: item.filiale, merged: false });
+    }
+
+    await client.query('COMMIT');
+    return res.status(201).json({
+      message: `Aktion für ${bookings.length} Filiale(n) angelegt.`,
+      action: {
+        aktion_nr: parsedTarget.aktion_nr,
+        jahr: parsedTarget.jahr,
+        kw: parsedTarget.kw
+      },
+      bookings
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Fehler POST /api/budget/bookings/actions:', error.message);
+    return res.status(500).json({ message: 'Serverfehler beim filialübergreifenden Anlegen der Aktion.' });
+  } finally {
+    client.release();
   }
 });
 
