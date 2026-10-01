@@ -243,7 +243,7 @@ test('creates one regular action booking for every selected active branch atomic
 
   const handler = loadBookingsPostHandler(client, '/bookings/actions');
   const response = makeResponse();
-  await handler(makeActionRequest(), response.api);
+  await handler(makeActionRequest({ beschreibung: 'Aufbau am Eingang' }), response.api);
 
   assert.equal(response.statusCode, 201);
   assert.deepEqual(response.body.action, { aktion_nr: 'A02713', jahr: 2027, kw: 13 });
@@ -257,7 +257,10 @@ test('creates one regular action booking for every selected active branch atomic
     ['Ahaus', 2027, 13],
     ['Vreden', 2027, 13],
   ]);
-  assert.equal(queries.filter((query) => query.sql.startsWith('INSERT INTO budget.bookings')).length, 2);
+  const bookingInserts = queries.filter((query) => query.sql.startsWith('INSERT INTO budget.bookings'));
+  assert.equal(bookingInserts.length, 2);
+  assert.ok(bookingInserts.every((query) => query.sql.includes("'Zentrallager'")));
+  assert.ok(bookingInserts.every((query) => query.params[3] === 'Aufbau am Eingang'));
   assert.ok(queries.some((query) => query.sql === 'COMMIT'));
 });
 
@@ -306,4 +309,46 @@ test('reports branch-specific duplicates before changing any booking', async () 
   assert.ok(!queries.some((query) => query.sql.startsWith('UPDATE budget.bookings')));
   assert.ok(!queries.some((query) => query.sql.startsWith('INSERT INTO budget.bookings')));
   assert.ok(queries.some((query) => query.sql === 'ROLLBACK'));
+});
+
+test('sets Zentrallager and appends a new remark when an existing branch action is merged', async () => {
+  const queries = [];
+  const existing = {
+    id: '11111111-1111-1111-1111-111111111111',
+    betrag: '100.00',
+    parent_booking_id: null,
+    has_splits: false,
+    beschreibung: 'Alter Hinweis',
+  };
+  const client = {
+    async query(sql, params) {
+      const normalized = String(sql).replace(/\s+/g, ' ').trim();
+      queries.push({ sql: normalized, params });
+      if (normalized.startsWith('SELECT name FROM filialen')) return { rows: [{ name: 'Ahaus' }] };
+      if (normalized.includes('UPPER(BTRIM(b.aktion_nr))')) return { rows: [existing] };
+      if (normalized.startsWith('UPDATE budget.bookings')) {
+        return { rows: [{ ...existing, betrag: params[1], lieferant: 'Zentrallager' }] };
+      }
+      return { rows: [] };
+    },
+    release() {},
+  };
+  const handler = loadBookingsPostHandler(client, '/bookings/actions');
+  const response = makeResponse();
+
+  await handler(
+    makeActionRequest({
+      filialen: [{ filiale: 'Ahaus', betrag: 50 }],
+      beschreibung: 'Neuer Hinweis',
+      merge_existing_action: true,
+    }),
+    response.api
+  );
+
+  assert.equal(response.statusCode, 201);
+  const update = queries.find((query) => query.sql.startsWith('UPDATE budget.bookings'));
+  assert.deepEqual(update.params, [existing.id, 150, 'A02713', 'Neuer Hinweis']);
+  assert.ok(update.sql.includes("lieferant = 'Zentrallager'"));
+  assert.ok(update.sql.includes("beschreibung || ' | ' || $4"));
+  assert.ok(queries.some((query) => query.sql === 'COMMIT'));
 });

@@ -1078,6 +1078,7 @@ router.post('/bookings/actions', verifyToken(), async (req, res) => {
   if (!parsedTarget.ok) {
     return res.status(400).json({ message: parsedTarget.message });
   }
+  const beschreibung = normalizeTextOrNull(req.body?.beschreibung);
 
   if (!Array.isArray(req.body?.filialen) || req.body.filialen.length === 0) {
     return res.status(400).json({ message: 'Mindestens eine Filiale muss ausgewählt sein.' });
@@ -1194,11 +1195,19 @@ router.post('/bookings/actions', verifyToken(), async (req, res) => {
         const updated = await client.query(
           `
             UPDATE budget.bookings
-            SET betrag = $2, aktion_nr = $3
+            SET betrag = $2,
+                aktion_nr = $3,
+                lieferant = 'Zentrallager',
+                beschreibung = CASE
+                  WHEN $4::text IS NULL THEN beschreibung
+                  WHEN beschreibung IS NULL OR BTRIM(beschreibung) = '' THEN $4
+                  WHEN BTRIM(beschreibung) = BTRIM($4) THEN beschreibung
+                  ELSE beschreibung || ' | ' || $4
+                END
             WHERE id = $1
             RETURNING *
           `,
-          [canonical.id, mergedAmount, parsedTarget.aktion_nr]
+          [canonical.id, mergedAmount, parsedTarget.aktion_nr, beschreibung]
         );
 
         const duplicateIds = existingActions.slice(1).map((booking) => booking.id);
@@ -1222,14 +1231,15 @@ router.post('/bookings/actions', verifyToken(), async (req, res) => {
             (week_budget_id, datum, typ, betrag, lieferant, aktion_nr, beschreibung,
              von_filiale, an_filiale, status, created_by, created_at, source)
           VALUES
-            ($1, CURRENT_DATE, 'aktionsvorab', $2, NULL, $3, NULL,
-             NULL, NULL, 'offen', $4, NOW(), $5)
+            ($1, CURRENT_DATE, 'aktionsvorab', $2, 'Zentrallager', $3, $4,
+             NULL, NULL, 'offen', $5, NOW(), $6)
           RETURNING *
         `,
         [
           weekBudgetId,
           item.betrag,
           parsedTarget.aktion_nr,
+          beschreibung,
           req.user?.name || 'unknown',
           SOURCE_AKTION
         ]
