@@ -131,8 +131,51 @@ function parseAktionsvorabTargetFromAktionNr(aktionNrRaw) {
     ok: true,
     jahr,
     kw,
-    aktion_nr: aktionNr
+    aktion_nr: aktionNr.toUpperCase()
   };
+}
+
+function wantsExistingActionMerge(value) {
+  return value === true;
+}
+
+async function lockAndFindExistingActions(client, filiale, aktionNr) {
+  // Serialisiert konkurrierende Anlageversuche für genau eine Filiale/Aktionsnummer.
+  // So können auch ohne sofortige UNIQUE-Migration keine neuen Duplikate entstehen.
+  await client.query(
+    `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+    [`budget-action:${filiale}:${aktionNr}`]
+  );
+
+  return client.query(
+    `
+      SELECT
+        b.*,
+        wb.filiale,
+        wb.jahr,
+        wb.kw,
+        EXISTS (
+          SELECT 1
+          FROM budget.booking_splits bs
+          WHERE bs.parent_booking_id = b.id
+        ) AS has_splits
+      FROM budget.bookings b
+      JOIN budget.week_budgets wb ON wb.id = b.week_budget_id
+      WHERE wb.filiale = $1
+        AND b.typ = 'aktionsvorab'
+        AND UPPER(BTRIM(b.aktion_nr)) = UPPER(BTRIM($2))
+      ORDER BY b.created_at ASC, b.id ASC
+      FOR UPDATE OF b
+    `,
+    [filiale, aktionNr]
+  );
+}
+
+function sumBookingAmounts(rows) {
+  return (rows || []).reduce((sum, row) => {
+    const value = parseNumericSafe(row?.betrag);
+    return sum + (value === null ? 0 : value);
+  }, 0);
 }
 
 // Zentral-User können die Filiale übergeben via:
@@ -1067,6 +1110,78 @@ router.post('/bookings', verifyToken(), async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+
+    if (typ === 'aktionsvorab') {
+      const existingResult = await lockAndFindExistingActions(client, filiale, aktion_nr);
+      const existingActions = existingResult.rows || [];
+
+      if (existingActions.length > 0 && !wantsExistingActionMerge(req.body?.merge_existing_action)) {
+        const existingTotal = sumBookingAmounts(existingActions);
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          code: 'ACTION_ALREADY_EXISTS',
+          message: `Die Aktion ${aktion_nr} gibt es bereits in KW ${kw}.`,
+          existing_action: {
+            aktion_nr,
+            filiale,
+            jahr,
+            kw,
+            betrag: existingTotal,
+            booking_count: existingActions.length
+          }
+        });
+      }
+
+      if (existingActions.length > 0) {
+        const containsSplitBooking = existingActions.some(
+          (booking) => booking.parent_booking_id || booking.has_splits
+        );
+
+        if (containsSplitBooking) {
+          await client.query('ROLLBACK');
+          return res.status(409).json({
+            code: 'ACTION_MERGE_REQUIRES_SPLIT_EDIT',
+            message:
+              `Die Aktion ${aktion_nr} ist in ${filiale} Bestandteil einer aufgeteilten Buchung ` +
+              'und kann deshalb nicht automatisch zusammengeführt werden.'
+          });
+        }
+
+        const canonical = existingActions[0];
+        const mergedAmount = Math.round((sumBookingAmounts(existingActions) + betrag) * 100) / 100;
+
+        const updated = await client.query(
+          `
+            UPDATE budget.bookings
+            SET betrag = $2,
+                aktion_nr = $3
+            WHERE id = $1
+            RETURNING *
+          `,
+          [canonical.id, mergedAmount, aktion_nr]
+        );
+
+        const duplicateIds = existingActions.slice(1).map((booking) => booking.id);
+        if (duplicateIds.length > 0) {
+          await client.query(
+            `DELETE FROM budget.bookings WHERE id = ANY($1::uuid[])`,
+            [duplicateIds]
+          );
+        }
+
+        const weekSummaryRaw = await fetchWeekSummary(client, filiale, jahr, kw);
+        const weekSummary = redactWeekSummaryForRole(weekSummaryRaw, role);
+
+        await client.query('COMMIT');
+
+        return res.json({
+          message: 'Aktion zusammengeführt.',
+          merged: true,
+          booking: updated.rows[0],
+          week_summary: weekSummary
+        });
+      }
+    }
 
     const wbRes = await client.query(
       `
