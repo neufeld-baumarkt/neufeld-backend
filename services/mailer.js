@@ -22,13 +22,13 @@ function getMailConfig() {
   return config;
 }
 
-async function sendOrderMail({ subject, text, to, attachments = [] }) {
+async function sendOrderMail({ subject, text, to, cc = [], attachments = [] }) {
   try {
     const config = getMailConfig();
 
     if (!config.host || !config.user || !config.pass) {
       console.warn('MAIL: SMTP-Konfiguration unvollständig');
-      return;
+      return { status: 'failed', message: 'SMTP-Konfiguration unvollständig' };
     }
 
     const finalRecipient =
@@ -38,7 +38,7 @@ async function sendOrderMail({ subject, text, to, attachments = [] }) {
 
     if (!finalRecipient) {
       console.warn('MAIL: Kein Empfänger definiert');
-      return;
+      return { status: 'failed', message: 'Kein Empfänger definiert' };
     }
 
     const transporter = nodemailer.createTransport({
@@ -58,16 +58,19 @@ async function sendOrderMail({ subject, text, to, attachments = [] }) {
     await transporter.sendMail({
       from: `"Neufeld Bestellungen" <${config.user}>`,
       to: finalRecipient,
+      cc: config.mode === 'test' ? [] : cc,
       subject,
       text,
       attachments,
     });
 
     console.log(`MAIL: erfolgreich gesendet an ${finalRecipient}`);
+    return { status: 'sent', message: 'E-Mail erfolgreich versendet' };
   } catch (err) {
     console.error('MAIL ERROR:', err.message);
     console.error('MAIL ERROR CODE:', err.code);
     console.error('MAIL ERROR COMMAND:', err.command);
+    return { status: 'failed', message: err.message, code: err.code || null };
   }
 }
 

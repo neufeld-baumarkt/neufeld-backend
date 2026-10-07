@@ -6,66 +6,6 @@ const db = require('../../db');
 const PAGE_WIDTH = 841.89;
 const PAGE_HEIGHT = 595.28;
 
-const MELLERUD_FORM_ARTICLES = [
-  { ean: '4004666005047', lan: '2001005047', kundenArtNr: '150000261', name: 'Schimmel Schutz 0,5l', ve: '6', ek: '5,04 EUR', uvp: '9,99 EUR' },
-  { ean: '4004666004835', lan: '2001004835', kundenArtNr: '150000262', name: 'Schimmel Entferner 0,5l', ve: '6', ek: '4,27 EUR', uvp: '8,69 EUR' },
-  { ean: '4004666009250', lan: '2001009250', kundenArtNr: '150000039', name: 'Schimmel Frei Haftgel 0,25l', ve: '6', ek: '3,46 EUR', uvp: '6,49 EUR' },
-  { ean: '4004666004675', lan: '2001004675', kundenArtNr: '150000263', name: 'Schimmel Vernichter 0,5l', ve: '6', ek: '4,01 EUR', uvp: '8,79 EUR' },
-  { ean: '4004666004750', lan: '2001004750', kundenArtNr: '150000264', name: 'Fugen Reiniger 0,5l', ve: '6', ek: '3,75 EUR', uvp: '7,69 EUR' },
-  { ean: '4004666004712', lan: '2001004712', kundenArtNr: '150000265', name: 'Küchen Entfetter 0,5l', ve: '6', ek: '3,01 EUR', uvp: '6,69 EUR' },
-  { ean: '4004666002275', lan: '2001002275', kundenArtNr: '131030554', name: 'Glaskeramik Kochfeld Reiniger 0,5l', ve: '6', ek: '4,38 EUR', uvp: '7,69 EUR' },
-  { ean: '4004666001780', lan: '2001001780', kundenArtNr: '131030550', name: 'Edelstahl & Chrom Pflege 0,25l', ve: '6', ek: '4,22 EUR', uvp: '7,49 EUR' },
-  { ean: '4004666005306', lan: '2001005306', kundenArtNr: '150000266', name: 'Backofen Reiniger 0,5l', ve: '6', ek: '4,50 EUR', uvp: '7,49 EUR' },
-  { ean: '4004666008291', lan: '2049408291', kundenArtNr: '110082120', name: 'Silicon & Glaskeramik Kochfeld Schaber inkl. Ersatzklinge', ve: '10', ek: '2,84 EUR', uvp: '4,99 EUR' },
-  { ean: '4004666008345', lan: '2049408345', kundenArtNr: '110082121', name: 'Silicon & Glaskeramik Kochfeld Schaber Ersatzklingen 5er Pack', ve: '10', ek: '1,98 EUR', uvp: '3,99 EUR' },
-  { ean: '4004666001032', lan: '2001001032', kundenArtNr: '131030551', name: 'Kaffeemaschinen Entkalker 0,5l', ve: '6', ek: '2,68 EUR', uvp: '6,69 EUR' },
-  { ean: '4004666001636', lan: '2001001636', kundenArtNr: '131030611', name: 'Wasch & Spülmaschinen Reiniger & Pflege 0,5l', ve: '6', ek: '3,21 EUR', uvp: '6,69 EUR' },
-  { ean: '4004666009106', lan: '2003109106', kundenArtNr: '131030671', name: 'Rohr Frei Granulat 0,6kg', ve: '6', ek: '2,28 EUR', uvp: '4,99 EUR' },
-  { ean: '4004666009151', lan: '2003109151', kundenArtNr: '131030559', name: 'Rohr Frei Aktivgel 1,0l', ve: '4', ek: '3,25 EUR', uvp: '5,49 EUR' },
-  { ean: '4004666004910', lan: '2001004910', kundenArtNr: '150000267', name: 'Duschkabinen Reiniger 0,5l', ve: '6', ek: '3,36 EUR', uvp: '6,49 EUR' },
-  { ean: '4004666005139', lan: '2001005139', kundenArtNr: '150000268', name: 'Bad & Sanitär Kraftreiniger 0,5l', ve: '6', ek: '4,13 EUR', uvp: '7,69 EUR' },
-  { ean: '4004666000219', lan: '2001000219', kundenArtNr: '131030555', name: 'Kalk & Rost Löser 0,5l', ve: '6', ek: '2,76 EUR', uvp: '6,29 EUR' },
-  { ean: '4004666002077', lan: '2001002077', kundenArtNr: '199710012', name: 'Spülkasten Reiniger 0,5l', ve: '6', ek: '4,55 EUR', uvp: '8,69 EUR' },
-  { ean: '4004666004873', lan: '2001004873', kundenArtNr: '150000269', name: 'Braunstein Entferner 0,5l', ve: '6', ek: '5,00 EUR', uvp: '8,49 EUR' },
-  { ean: '4004666000820', lan: '2001000820', kundenArtNr: '131030560', name: 'Urin & Kalkstein Entferner 1,0l', ve: '4', ek: '3,64 EUR', uvp: '7,69 EUR' },
-  { ean: '4004666001773', lan: '2001001773', kundenArtNr: '156060127', name: 'Silicon Entferner 0,25l', ve: '6', ek: '5,17 EUR', uvp: '9,99 EUR' },
-  { ean: '4004666001766', lan: '2001001766', kundenArtNr: '131030455', name: 'Aufkleber & Klebereste Entferner 0,25l', ve: '6', ek: '4,06 EUR', uvp: '7,69 EUR' },
-  { ean: '4004666004637', lan: '2001004637', kundenArtNr: '150000270', name: 'Kamin & Ofenglas Reiniger 0,5l', ve: '6', ek: '4,76 EUR', uvp: '8,49 EUR' },
-  { ean: '4004666005177', lan: '2001005177', kundenArtNr: '150000271', name: 'Nikotin Entferner 0,5l', ve: '6', ek: '5,02 EUR', uvp: '8,49 EUR' },
-  { ean: '4004666005504', lan: '2001005504', kundenArtNr: '150000272', name: 'Neu: BBQ& Outdoorküchen Reiniger 460ml alt: Grill & BBQ Reiniger', ve: '6', ek: '4,74 EUR', uvp: '8,49 EUR' },
-  { ean: '4004666005467', lan: '2001005467', kundenArtNr: '150000273', name: 'Neu: Grillrost Reiniger 0,5l alt: Fett & Verkrustungen Entferner', ve: '6', ek: '4,64 EUR', uvp: '8,49 EUR' },
-  { ean: '4004666300074', lan: '2049408291', kundenArtNr: '150010042', name: 'Spezial Reinigungsschwamm braun', ve: '10', ek: '1,70 EUR', uvp: '3,49 EUR' },
-  { ean: '4004666000165', lan: '2001000165', kundenArtNr: '131030558', name: 'Öl & Fettflecken Entferner 0,5l', ve: '6', ek: '5,81 EUR', uvp: '11,50 EUR' },
-  { ean: '4004666004958', lan: '2001004958', kundenArtNr: '150000274', name: 'Rostflecken Entferner 0,5l', ve: '6', ek: '6,29 EUR', uvp: '10,99 EUR' },
-  { ean: '4004666001476', lan: '2001001476', kundenArtNr: '131030458', name: 'Graffiti & PU Schaum Entferner 0,5l', ve: '6', ek: '7,50 EUR', uvp: '13,99 EUR' },
-  { ean: '4004666001629', lan: '2001001629', kundenArtNr: '131040183', name: 'Edelstahl & Metall Reiniger 0,5l', ve: '6', ek: '3,97 EUR', uvp: '7,99 EUR' },
-  { ean: '4004666004798', lan: '2001004798', kundenArtNr: '150000275', name: 'Grabstein Reiniger 0,5l', ve: '6', ek: '3,44 EUR', uvp: '7,69 EUR' },
-  { ean: '4004666000110', lan: '2001000110', kundenArtNr: '131030467', name: 'Algen & Grünbelag Entferner 1,0l', ve: '4', ek: '3,84 EUR', uvp: '7,99 EUR' },
-  { ean: '4004666000127', lan: '2001000127', kundenArtNr: '131030468', name: 'Algen & Grünbelag Entferner 2,5l', ve: '1', ek: '8,43 EUR', uvp: '15,99 EUR' },
-  { ean: '4004666000301', lan: '2001000301', kundenArtNr: '131030531', name: 'Grundreiniger Intensiv 1,0l', ve: '4', ek: '4,06 EUR', uvp: '7,69 EUR' },
-  { ean: '4004666005542', lan: '2001005542', kundenArtNr: '150000276', name: 'Staubfrei Reiniger & Pflege 0,5 l', ve: '6', ek: '3,43 EUR', uvp: '5,99 EUR' },
-  { ean: '4004666005627', lan: '2001005627', kundenArtNr: '150000277', name: 'Glas & Spiegel Reiniger 0,5 l', ve: '6', ek: '2,85 EUR', uvp: '4,99 EUR' },
-  { ean: '4004666005429', lan: '2001005429', kundenArtNr: '150000278', name: 'Neu: Kunstoff Reiniger 0,5 l alt: Kunststoff Oberflächen Reiniger', ve: '6', ek: '3,11 EUR', uvp: '6,49 EUR' },
-  { ean: '4004666001544', lan: '2001001544', kundenArtNr: '2001001544', name: 'Kunststoff Fenster Reiniger 1,0l', ve: '4', ek: '4,29 EUR', uvp: '7,69 EUR' },
-  { ean: '4004666003289', lan: '2003003289', kundenArtNr: '150000144', name: 'Teppich Spezialreiniger Aktivschaum 0,4 L', ve: '6', ek: '4,57 EUR', uvp: '7,99 EUR' },
-  { ean: '4004666010409', lan: '2001010409', kundenArtNr: '131030547', name: 'Laminat & Vinyl Reiniger & Pflege 1,0l', ve: '4', ek: '4,03 EUR', uvp: '7,69 EUR' },
-  { ean: '4004666001513', lan: '2001001513', kundenArtNr: '131030548', name: 'Parkett Reiniger & Pflege 1,0l', ve: '4', ek: '4,28 EUR', uvp: '8,69 EUR' },
-  { ean: '4004666001490', lan: '2001001490', kundenArtNr: '131030549', name: 'Parkett & Holzboden Versiegelung 1,0l', ve: '4', ek: '6,09 EUR', uvp: '10,99 EUR' },
-  { ean: '4004666000943', lan: '2001000943', kundenArtNr: '150000006', name: 'Fliesen & Feinsteinzeug Reiniger 1,0l', ve: '4', ek: '3,92 EUR', uvp: '7,69 EUR' },
-  { ean: '4004666001803', lan: '2001001803', kundenArtNr: '131030470', name: 'Granitboden Seife 1,0l', ve: '4', ek: '4,06 EUR', uvp: '7,69 EUR' },
-  { ean: '4004666000950', lan: '2001000950', kundenArtNr: '131030674', name: 'Marmor Reiniger 1,0l', ve: '4', ek: '4,24 EUR', uvp: '8,69 EUR' },
-  { ean: '4004666000981', lan: '2001000981', kundenArtNr: '157060262', name: 'Zementschleier Entferner Säurefrei 1,0l', ve: '4', ek: '4,30 EUR', uvp: '8,69 EUR' },
-  { ean: '4004666000004', lan: '2001000004', kundenArtNr: '157060251', name: 'Zementschleier Entferner Säurehaltig 1,0l', ve: '4', ek: '3,22 EUR', uvp: '7,69 EUR' },
-  { ean: '4004666000059', lan: '2001000059', kundenArtNr: '131030530', name: 'Fliesen & Stein Grundreiniger säurehaltig 1,0l', ve: '4', ek: '3,73 EUR', uvp: '7,69 EUR' },
-  { ean: '4004666002695', lan: '2001002695', kundenArtNr: '150000006', name: 'Stein & Platten Grundreiniger säurefrei 1,0l', ve: '4', ek: '4,06 EUR', uvp: '8,69 EUR' },
-  { ean: '4004666001469', lan: '2001001469', kundenArtNr: '131030673', name: 'Stein & Platten Imprägnierung 1,0l', ve: '4', ek: '8,96 EUR', uvp: '17,50 EUR' },
-  { ean: '4004666002824', lan: '2001002824', kundenArtNr: '157060293', name: 'Stein & Platten Versiegelung 0,5l', ve: '6', ek: '4,12 EUR', uvp: '8,69 EUR' },
-  { ean: '4004666010614', lan: '2001010614', kundenArtNr: '150000072', name: 'Leder Reiniger & Pflege 0,25 l', ve: '6', ek: '6,21 EUR', uvp: '9,99 EUR' },
-  { ean: '4004666002367', lan: '2001002367', kundenArtNr: '150000012', name: 'Oberflächen Grundreiniger 0,5 l', ve: '6', ek: '4,37 EUR', uvp: '7,49 EUR' },
-  { ean: '4004666000936', lan: '2001000936', kundenArtNr: '150000001', name: 'Wand &Bodenfliesen Reiniger 1,0 l', ve: '4', ek: '3,71 EUR', uvp: '7,69 EUR' },
-  { ean: '4004666009281', lan: '2001009281', kundenArtNr: '150000070', name: 'Schimmel Entferner 0,25 l', ve: '6', ek: '3,28 EUR', uvp: '6,49 EUR' },
-];
-
 function cleanText(value) {
   return String(value ?? '')
     .replace(/€/g, 'EUR')
@@ -83,8 +23,25 @@ function formatDateDe(value) {
   return date.toLocaleDateString('de-DE');
 }
 
-function normalizeKey(value) {
-  return cleanText(value).toLowerCase();
+function formatMoneyEur(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '';
+
+  return `${n.toFixed(2).replace('.', ',')} EUR`;
+}
+
+function calcEkEinzel(article) {
+  const ekEinzel = Number(article.ek_einzel);
+  if (Number.isFinite(ekEinzel)) return ekEinzel;
+
+  const ekProKarton = Number(article.ek_pro_karton);
+  const veStueck = Number(article.ve_stueck);
+
+  if (Number.isFinite(ekProKarton) && Number.isFinite(veStueck) && veStueck > 0) {
+    return ekProKarton / veStueck;
+  }
+
+  return null;
 }
 
 function drawText(page, text, x, y, options = {}) {
@@ -118,23 +75,14 @@ function drawRect(page, x, y, width, height, options = {}) {
   });
 }
 
-function splitText(text, maxChars) {
-  const words = cleanText(text).split(' ');
-  const lines = [];
-  let current = '';
-
-  for (const word of words) {
-    const next = current ? `${current} ${word}` : word;
-    if (next.length > maxChars && current) {
-      lines.push(current);
-      current = word;
-    } else {
-      current = next;
-    }
+function clipTextToWidth(text, font, size, maxWidth) {
+  const clean = cleanText(text);
+  if (font.widthOfTextAtSize(clean, size) <= maxWidth) return clean;
+  let clipped = clean;
+  while (clipped.length > 1 && font.widthOfTextAtSize(`${clipped}…`, size) > maxWidth) {
+    clipped = clipped.slice(0, -1);
   }
-
-  if (current) lines.push(current);
-  return lines.slice(0, 2);
+  return `${clipped}…`;
 }
 
 function getFilialAssetPath(filiale, filename) {
@@ -169,6 +117,7 @@ async function loadOrderData(orderId) {
     `
     SELECT
       o.id,
+      o.supplier_id,
       o.filiale,
       o.ordered_by_name,
       o.bestelldatum,
@@ -197,14 +146,18 @@ async function loadOrderData(orderId) {
     throw new Error(`Bestellung nicht gefunden: ${orderId}`);
   }
 
+  const order = orderRes.rows[0];
+
   const positionsRes = await db.query(
     `
     SELECT
       supplier_article_no_snapshot,
+      kunden_art_nr_snapshot,
       ean_snapshot,
       name_snapshot,
       ve_stueck_snapshot,
       ek_pro_karton_snapshot,
+      ek_einzel_snapshot,
       menge_kartons,
       positionssumme_netto,
       sort_index_snapshot
@@ -216,74 +169,27 @@ async function loadOrderData(orderId) {
   );
 
   return {
-    order: orderRes.rows[0],
+    order,
     positions: positionsRes.rows,
   };
 }
 
-function buildQuantityMaps(positions) {
-  const byEan = new Map();
-  const byLan = new Map();
-
-  for (const pos of positions) {
-    const menge = Number(pos.menge_kartons);
-    if (!Number.isFinite(menge) || menge <= 0) continue;
-
-    const ean = normalizeKey(pos.ean_snapshot);
-    const lan = normalizeKey(pos.supplier_article_no_snapshot);
-
-    if (ean) byEan.set(ean, (byEan.get(ean) || 0) + menge);
-    if (lan) byLan.set(lan, (byLan.get(lan) || 0) + menge);
-  }
-
-  return { byEan, byLan };
-}
-
 function buildFormRows(positions) {
-  const { byEan, byLan } = buildQuantityMaps(positions);
-  const matchedKeys = new Set();
-
-  const rows = MELLERUD_FORM_ARTICLES.map((article) => {
-    const eanKey = normalizeKey(article.ean);
-    const lanKey = normalizeKey(article.lan);
-
-    const menge = (byEan.get(eanKey) || byLan.get(lanKey) || '');
-
-    if (menge) {
-      matchedKeys.add(eanKey);
-      matchedKeys.add(lanKey);
-    }
-
+  return positions.map((position) => {
+    const ekEinzel = calcEkEinzel({
+      ek_einzel: position.ek_einzel_snapshot,
+      ek_pro_karton: position.ek_pro_karton_snapshot,
+      ve_stueck: position.ve_stueck_snapshot,
+    });
     return {
-      ...article,
-      menge,
+      ean: cleanText(position.ean_snapshot) || '-',
+      kundenArtNr: cleanText(position.kunden_art_nr_snapshot) || '-',
+      name: cleanText(position.name_snapshot) || '-',
+      ve: cleanText(position.ve_stueck_snapshot) || '-',
+      ek: ekEinzel !== null ? formatMoneyEur(ekEinzel) : '',
+      menge: Number(position.menge_kartons) || '',
     };
   });
-
-  for (const pos of positions) {
-    const eanKey = normalizeKey(pos.ean_snapshot);
-    const lanKey = normalizeKey(pos.supplier_article_no_snapshot);
-
-    if ((eanKey && matchedKeys.has(eanKey)) || (lanKey && matchedKeys.has(lanKey))) {
-      continue;
-    }
-
-    const menge = Number(pos.menge_kartons);
-    if (!Number.isFinite(menge) || menge <= 0) continue;
-
-    rows.push({
-      ean: cleanText(pos.ean_snapshot) || '-',
-      lan: cleanText(pos.supplier_article_no_snapshot) || '-',
-      kundenArtNr: '-',
-      name: cleanText(pos.name_snapshot) || '-',
-      ve: cleanText(pos.ve_stueck_snapshot) || '-',
-      ek: '',
-      uvp: '',
-      menge,
-    });
-  }
-
-  return rows;
 }
 
 function drawFullHeader(page, fonts, order, totalPages) {
@@ -405,12 +311,10 @@ function drawArticleRow(page, fonts, row, x, y, columns, rowHeight, isEven) {
 
   const values = [
     row.ean,
-    row.lan,
     row.kundenArtNr,
     row.name,
     row.ve,
     row.ek,
-    row.uvp,
     row.menge ? String(row.menge) : '',
   ];
 
@@ -422,21 +326,12 @@ function drawArticleRow(page, fonts, row, x, y, columns, rowHeight, isEven) {
       borderColor: rgb(0.45, 0.45, 0.45),
     });
 
-    if (index === 3) {
-      const lines = splitText(value, 48);
-      drawText(page, lines[0] || '', currentX + 3, y - 8, {
+    if (index === 2) {
+      drawText(page, clipTextToWidth(value, regular, 6.6, col.width - 6), currentX + 3, y - 12, {
         font: regular,
         size: 6.6,
       });
-
-      if (lines[1]) {
-        drawText(page, lines[1], currentX + 3, y - 16, {
-          font: regular,
-          size: 6.1,
-          color: rgb(0.25, 0.25, 0.25),
-        });
-      }
-    } else if (index === 7) {
+    } else if (index === 5) {
       drawText(page, value, currentX + 24, y - 12, {
         font: bold,
         size: 10,
@@ -540,14 +435,12 @@ async function generateMellerudOrderPdf(orderId) {
   };
 
   const columns = [
-    { label: 'EAN', width: 84 },
-    { label: 'LAN', width: 72 },
-    { label: 'Kunden Art.-Nr.', width: 76 },
-    { label: 'Artikelbezeichnung', width: 275 },
-    { label: 'VE', width: 28 },
-    { label: 'netto EK/Stueck', width: 68 },
-    { label: 'empf. UVP/Stueck', width: 74 },
-    { label: 'Bestellmenge VE', width: 66 },
+    { label: 'EAN', width: 110 },
+    { label: 'Kunden Art.-Nr.', width: 105 },
+    { label: 'Artikelbezeichnung', width: 350 },
+    { label: 'VE/Stueck', width: 58 },
+    { label: 'netto EK/Stueck', width: 82 },
+    { label: 'Bestellmenge VE', width: 80 },
   ];
 
   const tableX = 28;
