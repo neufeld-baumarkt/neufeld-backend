@@ -6,7 +6,14 @@ const verifyToken = require('../middleware/verifyToken');
 const db = require('../db');
 const { sendOrderMail } = require('../services/mailer');
 const { generateMellerudOrderPdf } = require('../services/pdf/mellerudPdfService');
-const { calculateOrderPlan, centsToMoney, isValidIsoDate, normalizeSupplierCode, supportsMellerudWorkflow } = require('../lib/orderRules');
+const {
+  calculateOrderPlan,
+  centsToMoney,
+  isValidIsoDate,
+  normalizeMellerudArticleIdentity,
+  normalizeSupplierCode,
+  supportsMellerudWorkflow,
+} = require('../lib/orderRules');
 const { resolveCanonicalOrderRecipients } = require('../lib/orderEmailPolicy');
 
 const GLOBAL_ROLES = new Set(['Admin', 'Supervisor', 'Geschäftsführer', 'Manager-1']);
@@ -334,6 +341,36 @@ async function handleArticles(req, res, includePrices) {
 
 router.get('/artikel', verifyToken(), (req, res) => handleArticles(req, res, false));
 router.get('/artikel-mit-ek', verifyToken(), (req, res) => handleArticles(req, res, true));
+
+router.patch('/artikel/:id', verifyToken(), async (req, res) => {
+  try {
+    if (!canReadAllOrders(req.user?.role)) {
+      return res.status(403).json({ message: 'Artikelstammdaten dürfen nur von Superusern bearbeitet werden' });
+    }
+
+    const articleId = ensureUuid(req.params.id, 'Artikel-ID');
+    const identity = normalizeMellerudArticleIdentity(req.body?.article);
+    const result = await db.query(
+      `UPDATE "order".order_supplier_articles a
+       SET supplier_article_no=$1, kunden_art_nr=$2, updated_at=NOW()
+       FROM "order".order_suppliers s
+       WHERE a.id=$3 AND a.supplier_id=s.id AND lower(s.code)='mellerud'
+       RETURNING a.id, a.supplier_article_no, a.kunden_art_nr, a.ean,
+                 a.name, a.ve_stueck, a.sort_index, a.aktiv`,
+      [identity.supplier_article_no, identity.kunden_art_nr, articleId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Mellerud-Artikel nicht gefunden' });
+    }
+    return res.json({ status: 'ok', item: result.rows[0] });
+  } catch (error) {
+    if (error?.code === '23505') {
+      return res.status(409).json({ message: 'Diese Mellerud-Artikelnummer ist bereits vergeben' });
+    }
+    const statusCode = error.statusCode || 400;
+    return res.status(statusCode).json({ message: error.message || 'Artikelnummern konnten nicht gespeichert werden' });
+  }
+});
 
 router.get('/', verifyToken(), async (req, res) => {
   try {

@@ -1,7 +1,6 @@
 const fs = require('fs');
 const path = require('path');
 const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
-const db = require('../../db');
 
 const PAGE_WIDTH = 841.89;
 const PAGE_HEIGHT = 595.28;
@@ -113,6 +112,7 @@ async function embedOptionalImage(pdfDoc, filiale, filename) {
 }
 
 async function loadOrderData(orderId) {
+  const db = require('../../db');
   const orderRes = await db.query(
     `
     SELECT
@@ -183,7 +183,7 @@ function buildFormRows(positions) {
     });
     return {
       ean: cleanText(position.ean_snapshot) || '-',
-      kundenArtNr: cleanText(position.kunden_art_nr_snapshot) || '-',
+      supplierArticleNo: cleanText(position.supplier_article_no_snapshot) || '-',
       name: cleanText(position.name_snapshot) || '-',
       ve: cleanText(position.ve_stueck_snapshot) || '-',
       ek: ekEinzel !== null ? formatMoneyEur(ekEinzel) : '',
@@ -311,7 +311,7 @@ function drawArticleRow(page, fonts, row, x, y, columns, rowHeight, isEven) {
 
   const values = [
     row.ean,
-    row.kundenArtNr,
+    row.supplierArticleNo,
     row.name,
     row.ve,
     row.ek,
@@ -436,7 +436,7 @@ async function generateMellerudOrderPdf(orderId) {
 
   const columns = [
     { label: 'EAN', width: 110 },
-    { label: 'Kunden Art.-Nr.', width: 105 },
+    { label: 'Mellerud Art.-Nr.', width: 105 },
     { label: 'Artikelbezeichnung', width: 350 },
     { label: 'VE/Stueck', width: 58 },
     { label: 'netto EK/Stueck', width: 82 },
@@ -478,5 +478,6 @@ async function generateMellerudOrderPdf(orderId) {
 }
 
 module.exports = {
+  buildFormRows,
   generateMellerudOrderPdf,
 };
