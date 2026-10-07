@@ -6,7 +6,7 @@ const verifyToken = require('../middleware/verifyToken');
 const db = require('../db');
 const { sendOrderMail } = require('../services/mailer');
 const { generateMellerudOrderPdf } = require('../services/pdf/mellerudPdfService');
-const { calculateOrderPlan, centsToMoney, isValidIsoDate, normalizeSupplierCode } = require('../lib/orderRules');
+const { calculateOrderPlan, centsToMoney, isValidIsoDate, normalizeSupplierCode, supportsMellerudWorkflow } = require('../lib/orderRules');
 const { resolveCanonicalOrderRecipients } = require('../lib/orderEmailPolicy');
 
 const GLOBAL_ROLES = new Set(['Admin', 'Supervisor', 'Geschäftsführer', 'Manager-1']);
@@ -434,7 +434,7 @@ router.post('/', verifyToken(), async (req, res) => {
     );
     if (supplierResult.rows.length === 0) { const error = new Error('Lieferant nicht gefunden oder inaktiv'); error.statusCode = 404; throw error; }
     const supplier = supplierResult.rows[0];
-    if (normalizeSupplierCode(supplier.formular_typ) !== 'mellerud') {
+    if (!supportsMellerudWorkflow(supplier)) {
       const error = new Error('Für diesen Lieferanten ist noch kein verbindlicher Bestellworkflow verfügbar'); error.statusCode = 409; throw error;
     }
     const branchesResult = await client.query('SELECT name FROM public.filialen WHERE aktiv=true ORDER BY name');
