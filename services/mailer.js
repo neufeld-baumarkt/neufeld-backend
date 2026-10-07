@@ -1,4 +1,5 @@
 const nodemailer = require('nodemailer');
+const { validateMailEnvelope } = require('../lib/orderEmailPolicy');
 
 function getMailConfig() {
   const config = {
@@ -31,15 +32,13 @@ async function sendOrderMail({ subject, text, to, cc = [], attachments = [] }) {
       return { status: 'failed', message: 'SMTP-Konfiguration unvollständig' };
     }
 
-    const finalRecipient =
-      config.mode === 'test'
-        ? config.testRecipient
-        : to;
-
-    if (!finalRecipient) {
-      console.warn('MAIL: Kein Empfänger definiert');
-      return { status: 'failed', message: 'Kein Empfänger definiert' };
-    }
+    const envelope = validateMailEnvelope({
+      mode: config.mode,
+      sender: config.user,
+      to,
+      cc,
+      testRecipient: config.testRecipient,
+    });
 
     const transporter = nodemailer.createTransport({
       host: config.host,
@@ -57,14 +56,14 @@ async function sendOrderMail({ subject, text, to, cc = [], attachments = [] }) {
 
     await transporter.sendMail({
       from: `"Neufeld Bestellungen" <${config.user}>`,
-      to: finalRecipient,
-      cc: config.mode === 'test' ? [] : cc,
+      to: envelope.to,
+      cc: envelope.cc,
       subject,
       text,
       attachments,
     });
 
-    console.log(`MAIL: erfolgreich gesendet an ${finalRecipient}`);
+    console.log(`MAIL: erfolgreich gesendet an ${envelope.to.join(', ')}`);
     return { status: 'sent', message: 'E-Mail erfolgreich versendet' };
   } catch (err) {
     console.error('MAIL ERROR:', err.message);

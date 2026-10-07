@@ -7,6 +7,7 @@ const db = require('../db');
 const { sendOrderMail } = require('../services/mailer');
 const { generateMellerudOrderPdf } = require('../services/pdf/mellerudPdfService');
 const { calculateOrderPlan, centsToMoney, isValidIsoDate, normalizeSupplierCode } = require('../lib/orderRules');
+const { resolveCanonicalOrderRecipients } = require('../lib/orderEmailPolicy');
 
 const GLOBAL_ROLES = new Set(['Admin', 'Supervisor', 'Geschäftsführer', 'Manager-1']);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -161,23 +162,25 @@ async function loadOrderDetail(client, orderId, user) {
 
 async function resolveDispatchRecipients(client, order, mode, env) {
   const branchEmail = normalizeText(order.branch_email || order.email_snapshot);
-  if (mode === 'final') {
-    const supplierEmail = normalizeText(order.supplier_order_email);
-    if (!supplierEmail) throw new Error('Beim Lieferanten ist keine Bestell-E-Mail hinterlegt');
-    return { to: [supplierEmail], cc: branchEmail ? [branchEmail] : [] };
-  }
   const supervisorName = normalizeText(env.ORDER_LIGHT_SUPERVISOR_NAME) || 'Mirko';
-  const supervisorResult = await client.query(
-    `SELECT email FROM public.users
-     WHERE role='Supervisor'
-       AND (lower(name)=lower($1) OR lower(name) LIKE lower($1)||' %')
-     ORDER BY CASE WHEN lower(name)=lower($1) THEN 0 ELSE 1 END, id LIMIT 1`,
-    [supervisorName]
-  );
-  const supervisorEmail = normalizeText(env.ORDER_LIGHT_SUPERVISOR_EMAIL || supervisorResult.rows[0]?.email);
-  if (!supervisorEmail) throw new Error(`Keine aktive Supervisor-Mailadresse für ${supervisorName} gefunden`);
-  if (!branchEmail) throw new Error('Für die bestellende Filiale ist keine E-Mail hinterlegt');
-  return { to: Array.from(new Set([supervisorEmail, branchEmail])), cc: [] };
+  let supervisorEmail = normalizeText(env.ORDER_LIGHT_SUPERVISOR_EMAIL);
+  if (mode !== 'final' && !supervisorEmail) {
+    const supervisorResult = await client.query(
+      `SELECT email FROM public.users
+       WHERE role='Supervisor'
+         AND (lower(name)=lower($1) OR lower(name) LIKE lower($1)||' %')
+       ORDER BY CASE WHEN lower(name)=lower($1) THEN 0 ELSE 1 END, id LIMIT 1`,
+      [supervisorName]
+    );
+    supervisorEmail = normalizeText(supervisorResult.rows[0]?.email);
+  }
+  return resolveCanonicalOrderRecipients({
+    mode,
+    branch: order.filiale,
+    storedBranchEmail: branchEmail,
+    storedSupplierEmail: order.supplier_order_email,
+    configuredSupervisorEmail: supervisorEmail,
+  });
 }
 
 async function dispatchOrder(orderId, env = process.env) {
