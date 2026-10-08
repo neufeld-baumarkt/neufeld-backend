@@ -1,640 +1,215 @@
+'use strict';
+
+const crypto = require('crypto');
 const express = require('express');
-const bcrypt = require('bcrypt');
-
-const router = express.Router();
-
 const pool = require('../db');
 const verifyToken = require('../middleware/verifyToken');
+const {
+  canCreatePushTasks, canManagePushTask, canReviewPushTask, canUsePushTasks,
+  modeOf, normalizePushTaskInput, verifyJobSignature,
+} = require('../lib/pushTaskPolicy');
+const { processPushTaskEscalations } = require('../services/pushTaskEscalationService');
 
-// --- Helpers ---
-function isCentralRole(role) {
-  return ['Admin', 'Supervisor', 'Geschäftsführer', 'Manager-1'].includes(role);
+const router = express.Router();
+const photoParser = express.raw({ type: ['image/jpeg', 'image/png', 'image/webp'], limit: '5mb' });
+const mode = () => modeOf(process.env.PUSH_TASK_MODE);
+const clean = (value) => typeof value === 'string' ? value.trim() : '';
+const hasGlobalTaskView = (user) => user?.role === 'Admin' || (mode() === 'full' && user?.role === 'Geschäftsführer');
+
+function requireFeature(req, res, next) {
+  if (!canUsePushTasks(req.user?.role, mode())) return res.status(403).json({ message: 'Pushtasks sind während des Piloten nur für Admin und Supervisor freigeschaltet.' });
+  next();
 }
 
-function isFourDigitPin(pin) {
-  return typeof pin === 'string' && /^[0-9]{4}$/.test(pin);
+async function withTransaction(work) {
+  const client = await pool.connect();
+  try { await client.query('BEGIN'); const value = await work(client); await client.query('COMMIT'); return value; }
+  catch (error) { try { await client.query('ROLLBACK'); } catch (_) {} throw error; }
+  finally { client.release(); }
 }
 
-// --- Lockout Policy ---
-const PIN_MAX_FAILS = 5;
-const PIN_LOCK_MINUTES = 15;
+const taskSelect = `SELECT t.*,cu.name AS creator_name,cu.role AS creator_role,
+  COALESCE((SELECT jsonb_agg(jsonb_build_object(
+    'id',a.id,'assignee_user_id',a.assignee_user_id,'assignee_name',u.name,'assignee_role',u.role,
+    'status',a.status,'escalation_level',a.escalation_level,'escalation_snoozed_until',a.escalation_snoozed_until,
+    'seen_at',a.seen_at,'submitted_at',a.submitted_at,'submission_comment',a.submission_comment,
+    'approved_at',a.approved_at,'rejected_at',a.rejected_at,'review_comment',a.review_comment,
+    'evidence',COALESCE((SELECT jsonb_agg(jsonb_build_object('id',e.id,'file_name',e.file_name,'mime_type',e.mime_type,'size_bytes',e.size_bytes,'created_at',e.created_at)) FROM core.push_task_evidence e WHERE e.assignment_id=a.id),'[]'::jsonb)
+  ) ORDER BY u.name) FROM core.push_task_assignments a JOIN public.users u ON u.id=a.assignee_user_id
+    WHERE a.task_id=t.id AND ($2::boolean OR t.created_by_user_id=$1 OR a.assignee_user_id=$1)),'[]'::jsonb) AS assignments,
+  COALESCE((SELECT jsonb_agg(jsonb_build_object(
+    'id',ev.id,'event_type',ev.event_type,'actor_name',actor.name,'details',ev.details,'created_at',ev.created_at
+  ) ORDER BY ev.created_at DESC) FROM core.push_task_events ev LEFT JOIN public.users actor ON actor.id=ev.actor_user_id
+    WHERE ev.task_id=t.id AND ($2::boolean OR t.created_by_user_id=$1 OR ev.assignment_id IN
+      (SELECT own_event.id FROM core.push_task_assignments own_event WHERE own_event.task_id=t.id AND own_event.assignee_user_id=$1))),'[]'::jsonb) AS events
+  FROM core.push_tasks t JOIN public.users cu ON cu.id=t.created_by_user_id`;
 
-/**
- * Private: Tasks (Read-only) – STEP 2.1
- * GET /api/tasks
- * - Filiale: nur eigene Tasks (owner=me)
- * - Andere Rollen: aktuell 403 (bewusst minimal)
- */
-router.get('/', verifyToken(), async (req, res) => {
+async function loadTask(id, user) {
+  const result = await pool.query(`${taskSelect} WHERE t.id=$3 AND ($2::boolean OR t.created_by_user_id=$1 OR EXISTS
+    (SELECT 1 FROM core.push_task_assignments mine WHERE mine.task_id=t.id AND mine.assignee_user_id=$1))`,
+  [user.id,hasGlobalTaskView(user),id]);
+  return result.rows[0] || null;
+}
+
+router.post('/internal/process-escalations', async (req, res) => {
+  if (!verifyJobSignature({ secret:process.env.TASK_JOB_SECRET,timestamp:req.get('x-task-job-timestamp'),signature:req.get('x-task-job-signature'),method:req.method,path:req.originalUrl.split('?')[0] })) {
+    return res.status(401).json({ message: 'Ungültige Job-Signatur.' });
+  }
+  try { return res.json({ status:'ok',result:await processPushTaskEscalations({ pool }) }); }
+  catch (error) { console.error('Pushtask-Eskalationsjob:',error); return res.status(500).json({ message:'Eskalationsjob fehlgeschlagen.' }); }
+});
+
+router.use(verifyToken(), requireFeature);
+
+router.get('/users', async (req,res) => {
+  const result = await pool.query(`SELECT id,name,role,filiale FROM public.users WHERE active=true ORDER BY name`);
+  res.json({ users:result.rows.filter((user)=>canUsePushTasks(user.role,mode())) });
+});
+
+router.get('/notifications', async (req,res) => {
+  const result = await pool.query(`SELECT id,task_id,assignment_id,escalation_level,kind,title,body,read_at,created_at
+    FROM core.push_task_notifications WHERE user_id=$1 ORDER BY read_at NULLS FIRST,created_at DESC LIMIT 100`, [req.user.id]);
+  res.json({ notifications:result.rows });
+});
+
+router.post('/notifications/:id/read', async (req,res) => {
+  const result = await pool.query(`UPDATE core.push_task_notifications SET read_at=COALESCE(read_at,now()) WHERE id=$1 AND user_id=$2 RETURNING *`, [req.params.id,req.user.id]);
+  if (!result.rowCount) return res.status(404).json({ message:'Benachrichtigung nicht gefunden.' });
+  res.json({ notification:result.rows[0] });
+});
+
+router.get('/', async (req,res) => {
+  const result = await pool.query(`${taskSelect} WHERE $2::boolean OR t.created_by_user_id=$1 OR EXISTS
+    (SELECT 1 FROM core.push_task_assignments mine WHERE mine.task_id=t.id AND mine.assignee_user_id=$1)
+    ORDER BY CASE t.status WHEN 'active' THEN 0 ELSE 1 END,t.due_at,t.created_at DESC LIMIT 300`, [req.user.id,hasGlobalTaskView(req.user)]);
+  res.json({ mode:mode(),tasks:result.rows });
+});
+
+router.post('/', async (req,res) => {
+  if (!canCreatePushTasks(req.user.role,mode())) return res.status(403).json({ message:'Keine Berechtigung zum Erstellen.' });
   try {
-    const { role, filiale } = req.user || {};
-
-    if (role !== 'Filiale') {
-      return res.status(403).json({ message: 'Zugriff verweigert (nur Filiale in STEP 2.1).' });
+    const input = normalizePushTaskInput(req.body);
+    const users = await pool.query(`SELECT id,name,role,active FROM public.users WHERE id=ANY($1::int[])`, [input.assigneeIds]);
+    if (users.rowCount !== input.assigneeIds.length || users.rows.some((user)=>!user.active || !canUsePushTasks(user.role,mode()))) {
+      return res.status(400).json({ message:'Im Piloten dürfen ausschließlich aktive Admin- und Supervisor-Benutzer ausgewählt werden.' });
     }
-
-    if (!filiale) {
-      return res.status(400).json({ message: 'Filiale im Token fehlt. Bitte erneut anmelden.' });
-    }
-
-    const fRes = await pool.query(
-      'SELECT id, name FROM public.filialen WHERE name = $1 LIMIT 1',
-      [filiale]
-    );
-
-    if (fRes.rows.length === 0) {
-      return res.status(404).json({ message: `Filiale '${filiale}' nicht in public.filialen gefunden.` });
-    }
-
-    const filialeId = fRes.rows[0].id;
-
-    const q = `
-      SELECT
-        t.id,
-        t.owner_type,
-        t.owner_id,
-        t.title,
-        t.body,
-        t.status,
-        t.created_by_user_id,
-        t.created_at,
-        t.updated_at,
-        t.ack_at,
-        t.admin_closed_at,
-        t.admin_closed_by_user_id,
-        t.admin_note,
-        t.executed_at,
-        t.executed_by_user_id,
-        t.due_at,
-        t.source_type,
-        t.source_id,
-        le.event_type AS last_event_type,
-        le.event_at   AS last_event_at
-      FROM core.tasks t
-      LEFT JOIN LATERAL (
-        SELECT event_type, event_at
-        FROM core.task_events
-        WHERE task_id = t.id
-        ORDER BY event_at DESC
-        LIMIT 1
-      ) le ON true
-      WHERE t.owner_type = 'filiale'
-        AND t.owner_id = $1
-        AND t.status = ANY($2::text[])
-      ORDER BY t.created_at DESC
-      LIMIT 200
-    `;
-
-    const statuses = ['open', 'ack', 'admin_closed', 'executed', 'canceled'];
-    const tRes = await pool.query(q, [filialeId, statuses]);
-
-    return res.json({
-      owner: { owner_type: 'filiale', owner_id: filialeId, filiale_name: filiale },
-      tasks: tRes.rows,
+    const id = await withTransaction(async (client) => {
+      const created = await client.query(`INSERT INTO core.push_tasks
+        (task_type,title,description,priority,proof_mode,due_at,reminder_at,urgent_at,hard_escalation_at,created_by_user_id)
+        VALUES ('central_push',$1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
+      [input.title,input.description,input.priority,input.proofMode,input.dueAt,input.reminderAt,input.urgentAt,input.hardAt,req.user.id]);
+      for (const userId of input.assigneeIds) await client.query(`INSERT INTO core.push_task_assignments (task_id,assignee_user_id) VALUES ($1,$2)`, [created.rows[0].id,userId]);
+      await client.query(`INSERT INTO core.push_task_events (task_id,event_type,actor_user_id,details) VALUES ($1,'created',$2,$3)`, [created.rows[0].id,req.user.id,{assignee_user_ids:input.assigneeIds}]);
+      return created.rows[0].id;
     });
-  } catch (err) {
-    console.error('GET /api/tasks Fehler:', err);
-    return res.status(500).json({ message: 'Serverfehler' });
-  }
+    res.status(201).json({ task:await loadTask(id,req.user) });
+  } catch (error) { res.status(error.statusCode||500).json({ message:error.statusCode?error.message:'Task konnte nicht erstellt werden.' }); }
 });
 
-/**
- * Private: Tasks Create – STEP 2.2
- * POST /api/tasks
- */
-router.post('/', verifyToken(), async (req, res) => {
+router.get('/:id', async (req,res) => {
+  const task = await loadTask(req.params.id,req.user); if (!task) return res.status(404).json({ message:'Task nicht gefunden.' });
+  res.json({ task });
+});
+
+router.patch('/:id', async (req,res) => {
+  const existing = await loadTask(req.params.id,req.user); if (!existing) return res.status(404).json({ message:'Task nicht gefunden.' });
+  if (!canManagePushTask(existing,req.user,mode())) return res.status(403).json({ message:'Nur Ersteller, Admin oder Geschäftsführer dürfen bearbeiten.' });
+  if (existing.status !== 'active') return res.status(409).json({ message:'Abgeschlossene oder abgebrochene Tasks sind schreibgeschützt.' });
   try {
-    const { id: actorUserId, role } = req.user || {};
-
-    if (!isCentralRole(role)) {
-      return res.status(403).json({ message: 'Zugriff verweigert (Task erstellen nur Zentrale-Rollen).' });
-    }
-
-    const owner_type = String(req.body?.owner_type || '').trim();
-    const owner_id_raw = req.body?.owner_id;
-    const title = String(req.body?.title || '').trim();
-    const body = String(req.body?.body || '').trim();
-
-    const due_at_raw = req.body?.due_at ?? null;
-    const source_type = req.body?.source_type != null ? String(req.body.source_type).trim() : null;
-    const source_id = req.body?.source_id != null ? String(req.body.source_id).trim() : null;
-
-    if (owner_type !== 'filiale') {
-      return res.status(400).json({ message: "owner_type muss 'filiale' sein (Startphase)." });
-    }
-
-    const owner_id = Number(owner_id_raw);
-    if (!Number.isInteger(owner_id) || owner_id <= 0) {
-      return res.status(400).json({ message: 'owner_id muss eine gültige Filial-ID (int) sein.' });
-    }
-
-    if (!title) return res.status(400).json({ message: 'title ist Pflicht.' });
-    if (!body) return res.status(400).json({ message: 'body ist Pflicht.' });
-
-    let due_at = null;
-    if (due_at_raw !== null && due_at_raw !== '') {
-      const d = new Date(due_at_raw);
-      if (Number.isNaN(d.getTime())) {
-        return res.status(400).json({ message: 'due_at ist kein gültiges Datum.' });
-      }
-      due_at = d.toISOString();
-    }
-
-    const fRes = await pool.query('SELECT id FROM public.filialen WHERE id = $1 LIMIT 1', [owner_id]);
-    if (fRes.rows.length === 0) {
-      return res.status(404).json({ message: `Filiale mit id=${owner_id} nicht gefunden.` });
-    }
-
-    await pool.query('BEGIN');
-
-    const insertTaskQ = `
-      INSERT INTO core.tasks (
-        owner_type, owner_id, title, body, status, created_by_user_id,
-        due_at, source_type, source_id
-      )
-      VALUES ($1,$2,$3,$4,'open',$5,$6,$7,$8)
-      RETURNING
-        id, owner_type, owner_id, title, body, status,
-        created_by_user_id, created_at, updated_at,
-        ack_at, admin_closed_at, admin_closed_by_user_id, admin_note,
-        executed_at, executed_by_user_id,
-        due_at, source_type, source_id
-    `;
-    const tIns = await pool.query(insertTaskQ, [
-      owner_type,
-      owner_id,
-      title,
-      body,
-      actorUserId,
-      due_at,
-      source_type,
-      source_id,
-    ]);
-
-    const task = tIns.rows[0];
-
-    const insertEventQ = `
-      INSERT INTO core.task_events (task_id, event_type, actor_user_id, meta)
-      VALUES ($1,'created',$2,$3)
-      RETURNING event_type, event_at
-    `;
-    const meta = { source: 'api', role };
-    const eIns = await pool.query(insertEventQ, [task.id, actorUserId, meta]);
-
-    await pool.query('COMMIT');
-
-    return res.status(201).json({
-      task: {
-        ...task,
-        last_event_type: eIns.rows[0]?.event_type || 'created',
-        last_event_at: eIns.rows[0]?.event_at || null,
-      },
+    const input = normalizePushTaskInput({ ...req.body,assignee_user_ids:existing.assignments.map((item)=>item.assignee_user_id) });
+    await withTransaction(async (client) => {
+      await client.query(`UPDATE core.push_tasks SET title=$2,description=$3,priority=$4,proof_mode=$5,due_at=$6,reminder_at=$7,urgent_at=$8,hard_escalation_at=$9,updated_at=now() WHERE id=$1`,
+      [existing.id,input.title,input.description,input.priority,input.proofMode,input.dueAt,input.reminderAt,input.urgentAt,input.hardAt]);
+      await client.query(`INSERT INTO core.push_task_events (task_id,event_type,actor_user_id,details) VALUES ($1,'updated',$2,$3)`, [existing.id,req.user.id,{reason:clean(req.body.reason)||null}]);
     });
-  } catch (err) {
-    try {
-      await pool.query('ROLLBACK');
-    } catch (_) {}
-    console.error('POST /api/tasks Fehler:', err);
-    return res.status(500).json({ message: 'Serverfehler' });
-  }
+    res.json({ task:await loadTask(existing.id,req.user) });
+  } catch (error) { res.status(error.statusCode||500).json({ message:error.statusCode?error.message:'Task konnte nicht gespeichert werden.' }); }
 });
 
-/**
- * Private: Task Ack (ohne PIN) – STEP 2.3
- * POST /api/tasks/:id/ack
- */
-router.post('/:id/ack', verifyToken(), async (req, res) => {
-  const taskId = String(req.params?.id || '').trim();
-
-  try {
-    const { role, filiale, id: actorUserId } = req.user || {};
-
-    if (role !== 'Filiale') {
-      return res.status(403).json({ message: 'Zugriff verweigert (ack nur Filiale).' });
-    }
-    if (!filiale) {
-      return res.status(400).json({ message: 'Filiale im Token fehlt. Bitte erneut anmelden.' });
-    }
-    if (!taskId) {
-      return res.status(400).json({ message: 'Task-ID fehlt.' });
-    }
-
-    const fRes = await pool.query('SELECT id FROM public.filialen WHERE name = $1 LIMIT 1', [filiale]);
-    if (fRes.rows.length === 0) {
-      return res.status(404).json({ message: `Filiale '${filiale}' nicht in public.filialen gefunden.` });
-    }
-    const filialeId = fRes.rows[0].id;
-
-    await pool.query('BEGIN');
-
-    const updQ = `
-      UPDATE core.tasks
-      SET status = 'ack',
-          ack_at = now(),
-          updated_at = now()
-      WHERE id = $1
-        AND owner_type = 'filiale'
-        AND owner_id = $2
-        AND status = 'open'
-      RETURNING
-        id, owner_type, owner_id, title, body, status,
-        created_by_user_id, created_at, updated_at,
-        ack_at, admin_closed_at, admin_closed_by_user_id, admin_note,
-        executed_at, executed_by_user_id,
-        due_at, source_type, source_id
-    `;
-    const updRes = await pool.query(updQ, [taskId, filialeId]);
-
-    if (updRes.rows.length === 1) {
-      const task = updRes.rows[0];
-
-      const evQ = `
-        INSERT INTO core.task_events (task_id, event_type, actor_user_id, meta)
-        VALUES ($1,'ack',$2,$3)
-        RETURNING event_type, event_at
-      `;
-      const meta = { source: 'api', owner_type: 'filiale', owner_id: filialeId };
-      const evRes = await pool.query(evQ, [task.id, actorUserId, meta]);
-
-      await pool.query('COMMIT');
-
-      return res.json({
-        task: {
-          ...task,
-          last_event_type: evRes.rows[0]?.event_type || 'ack',
-          last_event_at: evRes.rows[0]?.event_at || null,
-        },
-      });
-    }
-
-    await pool.query('ROLLBACK');
-
-    const getQ = `
-      SELECT
-        t.*,
-        le.event_type AS last_event_type,
-        le.event_at   AS last_event_at
-      FROM core.tasks t
-      LEFT JOIN LATERAL (
-        SELECT event_type, event_at
-        FROM core.task_events
-        WHERE task_id = t.id
-        ORDER BY event_at DESC
-        LIMIT 1
-      ) le ON true
-      WHERE t.id = $1
-        AND t.owner_type = 'filiale'
-        AND t.owner_id = $2
-      LIMIT 1
-    `;
-    const getRes = await pool.query(getQ, [taskId, filialeId]);
-
-    if (getRes.rows.length === 0) {
-      return res.status(404).json({ message: 'Task nicht gefunden.' });
-    }
-
-    return res.json({ task: getRes.rows[0] });
-  } catch (err) {
-    try {
-      await pool.query('ROLLBACK');
-    } catch (_) {}
-    console.error('POST /api/tasks/:id/ack Fehler:', err);
-    return res.status(500).json({ message: 'Serverfehler' });
-  }
+router.post('/:id/seen', async (req,res) => {
+  const updated = await pool.query(`UPDATE core.push_task_assignments SET status=CASE WHEN status='open' THEN 'seen' ELSE status END,seen_at=COALESCE(seen_at,now()),updated_at=now()
+    WHERE task_id=$1 AND assignee_user_id=$2 AND status IN ('open','seen','rejected') RETURNING id`, [req.params.id,req.user.id]);
+  if (!updated.rowCount) return res.status(404).json({ message:'Eigene offene Zuweisung nicht gefunden.' });
+  await pool.query(`INSERT INTO core.push_task_events (task_id,assignment_id,event_type,actor_user_id) VALUES ($1,$2,'seen',$3)`, [req.params.id,updated.rows[0].id,req.user.id]);
+  res.json({ task:await loadTask(req.params.id,req.user) });
 });
 
-/**
- * Private: Task Execute (mit PIN) – STEP 2.4
- * POST /api/tasks/:id/execute
- * Body: { display_name: "Julien", pin: "4831" }
- */
-router.post('/:id/execute', verifyToken(), async (req, res) => {
-  const taskId = String(req.params?.id || '').trim();
+router.post('/:id/assignments/:assignmentId/photo', photoParser, async (req,res) => {
+  if (!canUsePushTasks(req.user?.role,mode())) return res.status(403).json({ message:'Kein Zugriff.' });
+  const assignment = await pool.query(`SELECT a.id,a.task_id,a.assignee_user_id FROM core.push_task_assignments a JOIN core.push_tasks t ON t.id=a.task_id
+    WHERE a.id=$1 AND a.task_id=$2 AND t.status='active'`, [req.params.assignmentId,req.params.id]);
+  if (!assignment.rowCount || Number(assignment.rows[0].assignee_user_id)!==Number(req.user.id)) return res.status(403).json({ message:'Foto darf nur für die eigene Zuweisung hochgeladen werden.' });
+  if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ message:'Bilddatei fehlt.' });
+  const mime = req.get('content-type')?.split(';')[0]; const fileName = clean(decodeURIComponent(req.get('x-file-name')||'nachweis.jpg')).slice(0,200);
+  const result = await pool.query(`INSERT INTO core.push_task_evidence (assignment_id,evidence_type,file_name,mime_type,size_bytes,sha256,content,uploaded_by_user_id)
+    VALUES ($1,'photo',$2,$3,$4,$5,$6,$7) RETURNING id,file_name,mime_type,size_bytes,created_at`,
+  [assignment.rows[0].id,fileName,mime,req.body.length,crypto.createHash('sha256').update(req.body).digest('hex'),req.body,req.user.id]);
+  await pool.query(`INSERT INTO core.push_task_events (task_id,assignment_id,event_type,actor_user_id,details) VALUES ($1,$2,'photo_uploaded',$3,$4)`, [req.params.id,assignment.rows[0].id,req.user.id,{evidence_id:result.rows[0].id}]);
+  res.status(201).json({ evidence:result.rows[0] });
+});
 
+router.get('/:id/evidence/:evidenceId', async (req,res) => {
+  const task = await loadTask(req.params.id,req.user); if (!task) return res.status(404).json({ message:'Task nicht gefunden.' });
+  const result = await pool.query(`SELECT file_name,mime_type,content FROM core.push_task_evidence e JOIN core.push_task_assignments a ON a.id=e.assignment_id WHERE e.id=$1 AND a.task_id=$2`, [req.params.evidenceId,req.params.id]);
+  if (!result.rowCount) return res.status(404).json({ message:'Nachweis nicht gefunden.' });
+  res.type(result.rows[0].mime_type).set('Content-Disposition',`inline; filename="${result.rows[0].file_name.replace(/["\\]/g,'_')}"`).send(result.rows[0].content);
+});
+
+router.post('/:id/submit', async (req,res) => {
+  const assignment = await pool.query(`SELECT a.*,t.proof_mode,t.created_by_user_id,t.title FROM core.push_task_assignments a JOIN core.push_tasks t ON t.id=a.task_id
+    WHERE a.task_id=$1 AND a.assignee_user_id=$2 AND t.status='active'`, [req.params.id,req.user.id]);
+  if (!assignment.rowCount) return res.status(404).json({ message:'Eigene Zuweisung nicht gefunden.' }); const row = assignment.rows[0];
+  if (row.proof_mode!=='confirm' && !(await pool.query(`SELECT 1 FROM core.push_task_evidence WHERE assignment_id=$1 LIMIT 1`,[row.id])).rowCount) return res.status(400).json({ message:'Für diese Task ist ein Foto erforderlich.' });
+  const comment = clean(req.body?.comment);
+  await withTransaction(async (client) => {
+    await client.query(`UPDATE core.push_task_assignments SET status='submitted',submitted_at=now(),submission_comment=$2,review_comment=NULL,rejected_at=NULL,updated_at=now() WHERE id=$1`, [row.id,comment||null]);
+    await client.query(`INSERT INTO core.push_task_events (task_id,assignment_id,event_type,actor_user_id,details) VALUES ($1,$2,'submitted',$3,$4)`, [req.params.id,row.id,req.user.id,{comment:comment||null}]);
+    await client.query(`INSERT INTO core.push_task_notifications (task_id,assignment_id,user_id,escalation_level,kind,title,body) VALUES ($1,$2,$3,0,'approval_required',$4,$5)`, [req.params.id,row.id,row.created_by_user_id,`Abnahme erforderlich: ${row.title}`,`${req.user.name} hat die Erledigung eingereicht.`]);
+  });
+  res.json({ task:await loadTask(req.params.id,req.user) });
+});
+
+router.post('/:id/assignments/:assignmentId/review', async (req,res) => {
+  const task = await loadTask(req.params.id,req.user); if (!task) return res.status(404).json({ message:'Task nicht gefunden.' });
+  if (!canReviewPushTask(task,req.user)) return res.status(403).json({ message:'Nur der ursprüngliche Ersteller darf die Erledigung abnehmen.' });
+  if (task.status !== 'active') return res.status(409).json({ message:'Diese Task ist bereits abgeschlossen oder abgebrochen.' });
+  const action=clean(req.body?.action),reason=clean(req.body?.reason);
+  if (!['approve','reject'].includes(action)||(action==='reject'&&!reason)) return res.status(400).json({ message:'Entscheidung ungültig; eine Ablehnung benötigt eine Begründung.' });
   try {
-    const { role, filiale, id: actorUserId } = req.user || {};
-
-    if (role !== 'Filiale') {
-      return res.status(403).json({ message: 'Zugriff verweigert (execute nur Filiale).' });
-    }
-    if (!filiale) {
-      return res.status(400).json({ message: 'Filiale im Token fehlt. Bitte erneut anmelden.' });
-    }
-    if (!taskId) {
-      return res.status(400).json({ message: 'Task-ID fehlt.' });
-    }
-
-    const display_name = String(req.body?.display_name || '').trim();
-    const pin = String(req.body?.pin || '').trim();
-
-    if (!display_name) return res.status(400).json({ message: 'display_name ist Pflicht.' });
-    if (!isFourDigitPin(pin)) return res.status(400).json({ message: 'pin muss exakt 4-stellig numerisch sein.' });
-
-    const fRes = await pool.query('SELECT id FROM public.filialen WHERE name = $1 LIMIT 1', [filiale]);
-    if (fRes.rows.length === 0) {
-      return res.status(404).json({ message: `Filiale '${filiale}' nicht in public.filialen gefunden.` });
-    }
-    const filialeId = fRes.rows[0].id;
-
-    const t0 = await pool.query(
-      `SELECT id, status, owner_id
-       FROM core.tasks
-       WHERE id = $1 AND owner_type='filiale' AND owner_id = $2
-       LIMIT 1`,
-      [taskId, filialeId]
-    );
-    if (t0.rows.length === 0) {
-      return res.status(404).json({ message: 'Task nicht gefunden.' });
-    }
-
-    const currentStatus = t0.rows[0].status;
-
-    if (['executed', 'admin_closed', 'canceled'].includes(currentStatus)) {
-      const getQ = `
-        SELECT
-          t.*,
-          le.event_type AS last_event_type,
-          le.event_at   AS last_event_at
-        FROM core.tasks t
-        LEFT JOIN LATERAL (
-          SELECT event_type, event_at
-          FROM core.task_events
-          WHERE task_id = t.id
-          ORDER BY event_at DESC
-          LIMIT 1
-        ) le ON true
-        WHERE t.id = $1
-          AND t.owner_type = 'filiale'
-          AND t.owner_id = $2
-        LIMIT 1
-      `;
-      const getRes = await pool.query(getQ, [taskId, filialeId]);
-      return res.json({ task: getRes.rows[0] });
-    }
-
-    const pRes = await pool.query(
-      `SELECT id, pin_hash, is_active, failed_attempts, locked_until
-       FROM core.filiale_pins
-       WHERE filiale_id = $1 AND display_name = $2
-       LIMIT 1`,
-      [filialeId, display_name]
-    );
-
-    if (pRes.rows.length === 0) {
-      await pool.query(
-        `INSERT INTO core.task_events (task_id, event_type, actor_user_id, meta)
-         VALUES ($1,'pin_failed',$2,$3)`,
-        [taskId, actorUserId, { display_name, reason: 'not_found_or_mismatch' }]
-      );
-      return res.status(401).json({ message: 'PIN ungültig.' });
-    }
-
-    const pinRow = pRes.rows[0];
-
-    if (!pinRow.is_active) {
-      return res.status(403).json({ message: 'PIN deaktiviert.' });
-    }
-
-    if (pinRow.locked_until && new Date(pinRow.locked_until).getTime() > Date.now()) {
-      return res.status(423).json({ message: 'PIN gesperrt. Bitte später erneut versuchen.' });
-    }
-
-    const ok = await bcrypt.compare(pin, pinRow.pin_hash);
-
-    if (!ok) {
-      const nextFails = Number(pinRow.failed_attempts || 0) + 1;
-      const lock =
-        nextFails >= PIN_MAX_FAILS
-          ? new Date(Date.now() + PIN_LOCK_MINUTES * 60 * 1000).toISOString()
-          : null;
-
-      await pool.query(
-        `UPDATE core.filiale_pins
-         SET failed_attempts = $1,
-             last_failed_at = now(),
-             locked_until = $2
-         WHERE id = $3`,
-        [nextFails, lock, pinRow.id]
-      );
-
-      await pool.query(
-        `INSERT INTO core.task_events (task_id, event_type, actor_user_id, meta)
-         VALUES ($1,'pin_failed',$2,$3)`,
-        [taskId, actorUserId, { display_name, failed_attempts: nextFails, locked_until: lock }]
-      );
-
-      return res.status(401).json({ message: 'PIN ungültig.' });
-    }
-
-    await pool.query('BEGIN');
-
-    await pool.query(
-      `UPDATE core.filiale_pins
-       SET failed_attempts = 0,
-           locked_until = NULL,
-           last_failed_at = NULL,
-           last_used_at = now()
-       WHERE id = $1`,
-      [pinRow.id]
-    );
-
-    const updQ = `
-      UPDATE core.tasks
-      SET status = 'executed',
-          executed_at = now(),
-          executed_by_user_id = $3,
-          updated_at = now()
-      WHERE id = $1
-        AND owner_type = 'filiale'
-        AND owner_id = $2
-        AND status <> 'executed'
-      RETURNING
-        id, owner_type, owner_id, title, body, status,
-        created_by_user_id, created_at, updated_at,
-        ack_at, admin_closed_at, admin_closed_by_user_id, admin_note,
-        executed_at, executed_by_user_id,
-        due_at, source_type, source_id
-    `;
-    const updRes = await pool.query(updQ, [taskId, filialeId, actorUserId]);
-
-    if (updRes.rows.length === 0) {
-      await pool.query('ROLLBACK');
-
-      const getRes = await pool.query(
-        `SELECT t.*,
-                le.event_type AS last_event_type,
-                le.event_at AS last_event_at
-         FROM core.tasks t
-         LEFT JOIN LATERAL (
-           SELECT event_type, event_at
-           FROM core.task_events
-           WHERE task_id = t.id
-           ORDER BY event_at DESC
-           LIMIT 1
-         ) le ON true
-         WHERE t.id=$1 AND t.owner_type='filiale' AND t.owner_id=$2
-         LIMIT 1`,
-        [taskId, filialeId]
-      );
-
-      return res.json({ task: getRes.rows[0] });
-    }
-
-    const task = updRes.rows[0];
-
-    const evRes = await pool.query(
-      `INSERT INTO core.task_events (task_id, event_type, actor_user_id, meta)
-       VALUES ($1,'executed',$2,$3)
-       RETURNING event_type, event_at`,
-      [task.id, actorUserId, { display_name }]
-    );
-
-    await pool.query('COMMIT');
-
-    return res.json({
-      task: {
-        ...task,
-        last_event_type: evRes.rows[0]?.event_type || 'executed',
-        last_event_at: evRes.rows[0]?.event_at || null,
-      },
+    await withTransaction(async (client) => {
+      const changed = await client.query(`UPDATE core.push_task_assignments SET status=$3,approved_at=CASE WHEN $3='approved' THEN now() ELSE approved_at END,
+        rejected_at=CASE WHEN $3='rejected' THEN now() ELSE NULL END,review_comment=$4,updated_at=now() WHERE id=$1 AND task_id=$2 AND status='submitted' RETURNING assignee_user_id`,
+      [req.params.assignmentId,req.params.id,action==='approve'?'approved':'rejected',reason||null]);
+      if (!changed.rowCount) throw Object.assign(new Error('Zuweisung wartet nicht auf Abnahme.'),{statusCode:409});
+      await client.query(`INSERT INTO core.push_task_events (task_id,assignment_id,event_type,actor_user_id,details) VALUES ($1,$2,$3,$4,$5)`, [req.params.id,req.params.assignmentId,action==='approve'?'approved':'rejected',req.user.id,{reason:reason||null}]);
+      await client.query(`INSERT INTO core.push_task_notifications (task_id,assignment_id,user_id,escalation_level,kind,title,body) VALUES ($1,$2,$3,0,$4,$5,$6)`,
+      [req.params.id,req.params.assignmentId,changed.rows[0].assignee_user_id,action==='approve'?'approved':'rejected',`${action==='approve'?'Bestätigt':'Abgelehnt'}: ${task.title}`,reason||'Die Erledigung wurde bestätigt.']);
+      if (!(await client.query(`SELECT 1 FROM core.push_task_assignments WHERE task_id=$1 AND status<>'approved' LIMIT 1`,[req.params.id])).rowCount) await client.query(`UPDATE core.push_tasks SET status='completed',completed_at=now(),updated_at=now() WHERE id=$1`,[req.params.id]);
     });
-  } catch (err) {
-    try {
-      await pool.query('ROLLBACK');
-    } catch (_) {}
-    console.error('POST /api/tasks/:id/execute Fehler:', err);
-    return res.status(500).json({ message: 'Serverfehler' });
-  }
+    res.json({ task:await loadTask(req.params.id,req.user) });
+  } catch (error) { res.status(error.statusCode||500).json({ message:error.statusCode?error.message:'Abnahme fehlgeschlagen.' }); }
 });
 
-/**
- * Private: Admin Close (Zentrale) – STEP 2.5
- * POST /api/tasks/:id/admin-close
- * Body: { note: "..." }
- */
-router.post('/:id/admin-close', verifyToken(), async (req, res) => {
-  const taskId = String(req.params?.id || '').trim();
-
-  try {
-    const { role, id: actorUserId } = req.user || {};
-
-    if (!isCentralRole(role)) {
-      return res.status(403).json({ message: 'Zugriff verweigert (admin-close nur Zentrale-Rollen).' });
-    }
-    if (!taskId) {
-      return res.status(400).json({ message: 'Task-ID fehlt.' });
-    }
-
-    const note = String(req.body?.note || '').trim();
-    if (!note) {
-      return res.status(400).json({ message: 'note ist Pflicht.' });
-    }
-
-    const t0 = await pool.query(
-      `SELECT id, status
-       FROM core.tasks
-       WHERE id = $1
-       LIMIT 1`,
-      [taskId]
-    );
-
-    if (t0.rows.length === 0) {
-      return res.status(404).json({ message: 'Task nicht gefunden.' });
-    }
-
-    if (t0.rows[0].status === 'admin_closed') {
-      const getRes = await pool.query(
-        `SELECT
-           t.*,
-           le.event_type AS last_event_type,
-           le.event_at   AS last_event_at
-         FROM core.tasks t
-         LEFT JOIN LATERAL (
-           SELECT event_type, event_at
-           FROM core.task_events
-           WHERE task_id = t.id
-           ORDER BY event_at DESC
-           LIMIT 1
-         ) le ON true
-         WHERE t.id = $1
-         LIMIT 1`,
-        [taskId]
-      );
-      return res.json({ task: getRes.rows[0] });
-    }
-
-    await pool.query('BEGIN');
-
-    const updQ = `
-      UPDATE core.tasks
-      SET status = 'admin_closed',
-          admin_closed_at = now(),
-          admin_closed_by_user_id = $2,
-          admin_note = $3,
-          updated_at = now()
-      WHERE id = $1
-        AND status <> 'admin_closed'
-      RETURNING
-        id, owner_type, owner_id, title, body, status,
-        created_by_user_id, created_at, updated_at,
-        ack_at, admin_closed_at, admin_closed_by_user_id, admin_note,
-        executed_at, executed_by_user_id,
-        due_at, source_type, source_id
-    `;
-    const updRes = await pool.query(updQ, [taskId, actorUserId, note]);
-
-    if (updRes.rows.length === 0) {
-      await pool.query('ROLLBACK');
-
-      const getRes = await pool.query(
-        `SELECT
-           t.*,
-           le.event_type AS last_event_type,
-           le.event_at   AS last_event_at
-         FROM core.tasks t
-         LEFT JOIN LATERAL (
-           SELECT event_type, event_at
-           FROM core.task_events
-           WHERE task_id = t.id
-           ORDER BY event_at DESC
-           LIMIT 1
-         ) le ON true
-         WHERE t.id = $1
-         LIMIT 1`,
-        [taskId]
-      );
-
-      if (getRes.rows.length === 0) {
-        return res.status(404).json({ message: 'Task nicht gefunden.' });
-      }
-      return res.json({ task: getRes.rows[0] });
-    }
-
-    const task = updRes.rows[0];
-
-    const evRes = await pool.query(
-      `INSERT INTO core.task_events (task_id, event_type, actor_user_id, meta)
-       VALUES ($1,'admin_closed',$2,$3)
-       RETURNING event_type, event_at`,
-      [task.id, actorUserId, { source: 'api', role, note }]
-    );
-
-    await pool.query('COMMIT');
-
-    return res.json({
-      task: {
-        ...task,
-        last_event_type: evRes.rows[0]?.event_type || 'admin_closed',
-        last_event_at: evRes.rows[0]?.event_at || null,
-      },
-    });
-  } catch (err) {
-    try {
-      await pool.query('ROLLBACK');
-    } catch (_) {}
-    console.error('POST /api/tasks/:id/admin-close Fehler:', err);
-    return res.status(500).json({ message: 'Serverfehler' });
-  }
+router.post('/:id/deescalate', async (req,res) => {
+  const task=await loadTask(req.params.id,req.user); if(!task)return res.status(404).json({message:'Task nicht gefunden.'});
+  if(!canManagePushTask(task,req.user,mode()))return res.status(403).json({message:'Keine Berechtigung zur Deeskalation.'});
+  if(task.status!=='active')return res.status(409).json({message:'Nur aktive Tasks können deeskaliert werden.'});
+  const reason=clean(req.body?.reason),until=new Date(req.body?.snoozed_until),level=Number(req.body?.level);
+  if(!reason||reason.length>1000||Number.isNaN(until.getTime())||until<=new Date()||!Number.isInteger(level)||level<0||level>2)return res.status(400).json({message:'Grund, zukünftiges Wiedervorlagedatum und Zielstufe 0–2 sind erforderlich.'});
+  const ids=Array.isArray(req.body?.assignment_ids)?req.body.assignment_ids:task.assignments.map((item)=>item.id);
+  await withTransaction(async(client)=>{await client.query(`UPDATE core.push_task_assignments SET escalation_level=$3,escalation_snoozed_until=$4,updated_at=now() WHERE task_id=$1 AND id=ANY($2::uuid[])`,[task.id,ids,level,until.toISOString()]);
+    await client.query(`INSERT INTO core.push_task_events (task_id,event_type,actor_user_id,details) VALUES ($1,'deescalated',$2,$3)`,[task.id,req.user.id,{reason,level,snoozed_until:until.toISOString(),assignment_ids:ids}]);});
+  res.json({task:await loadTask(task.id,req.user)});
 });
 
-module.exports = router;
+router.post('/:id/cancel', async(req,res)=>{
+  const task=await loadTask(req.params.id,req.user);if(!task)return res.status(404).json({message:'Task nicht gefunden.'});
+  if(!canManagePushTask(task,req.user,mode()))return res.status(403).json({message:'Keine Berechtigung zum Abbrechen.'});
+  if(task.status!=='active')return res.status(409).json({message:'Nur aktive Tasks können abgebrochen werden.'});
+  const reason=clean(req.body?.reason);if(!reason)return res.status(400).json({message:'Begründung ist erforderlich.'});
+  await withTransaction(async(client)=>{await client.query(`UPDATE core.push_tasks SET status='cancelled',cancelled_at=now(),updated_at=now() WHERE id=$1`,[task.id]);
+    await client.query(`INSERT INTO core.push_task_events (task_id,event_type,actor_user_id,details) VALUES ($1,'cancelled',$2,$3)`,[task.id,req.user.id,{reason}]);});
+  res.json({task:await loadTask(task.id,req.user)});
+});
+
+module.exports=router;
