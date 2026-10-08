@@ -62,7 +62,7 @@ router.post('/internal/process-escalations', async (req, res) => {
 router.use(verifyToken(), requireFeature);
 
 router.get('/users', async (req,res) => {
-  const result = await pool.query(`SELECT id,name,role,filiale FROM public.users WHERE active=true ORDER BY name`);
+  const result = await pool.query(`SELECT id,name,role,filiale FROM public.users ORDER BY name`);
   res.json({ users:result.rows.filter((user)=>canUsePushTasks(user.role,mode())) });
 });
 
@@ -89,8 +89,8 @@ router.post('/', async (req,res) => {
   if (!canCreatePushTasks(req.user.role,mode())) return res.status(403).json({ message:'Keine Berechtigung zum Erstellen.' });
   try {
     const input = normalizePushTaskInput(req.body);
-    const users = await pool.query(`SELECT id,name,role,active FROM public.users WHERE id=ANY($1::int[])`, [input.assigneeIds]);
-    if (users.rowCount !== input.assigneeIds.length || users.rows.some((user)=>!user.active || !canUsePushTasks(user.role,mode()))) {
+    const users = await pool.query(`SELECT id,name,role FROM public.users WHERE id=ANY($1::int[])`, [input.assigneeIds]);
+    if (users.rowCount !== input.assigneeIds.length || users.rows.some((user)=>!canUsePushTasks(user.role,mode()))) {
       return res.status(400).json({ message:'Im Piloten dürfen ausschließlich aktive Admin- und Supervisor-Benutzer ausgewählt werden.' });
     }
     const id = await withTransaction(async (client) => {

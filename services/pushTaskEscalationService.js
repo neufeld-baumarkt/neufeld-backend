@@ -17,8 +17,8 @@ async function processPushTaskEscalations({ pool, env = process.env, now = new D
       await client.query('BEGIN');
       const locked = await client.query(`SELECT a.*,t.title,t.description,t.status AS task_status,t.created_by_user_id,
         t.reminder_at,t.urgent_at,t.hard_escalation_at,t.due_at,
-        au.name AS assignee_name,au.email AS assignee_email,au.role AS assignee_role,au.active AS assignee_active,
-        cu.name AS creator_name,cu.email AS creator_email,cu.role AS creator_role,cu.active AS creator_active
+        au.name AS assignee_name,au.email AS assignee_email,au.role AS assignee_role,true AS assignee_active,
+        cu.name AS creator_name,cu.email AS creator_email,cu.role AS creator_role,true AS creator_active
         FROM core.push_task_assignments a JOIN core.push_tasks t ON t.id=a.task_id
         JOIN public.users au ON au.id=a.assignee_user_id JOIN public.users cu ON cu.id=t.created_by_user_id
         WHERE a.id=$1 FOR UPDATE OF a`, [candidate.id]);
@@ -26,7 +26,7 @@ async function processPushTaskEscalations({ pool, env = process.env, now = new D
       if (!row) { await client.query('ROLLBACK'); continue; }
       const targetLevel = escalationLevelFor({ ...row, status: row.task_status }, row, now);
       if (targetLevel <= Number(row.escalation_level || 0)) { await client.query('ROLLBACK'); continue; }
-      const central = await client.query(`SELECT id,name,email,role,active FROM public.users WHERE active=true AND role=ANY($1::text[])`, [['Admin','Geschäftsführer']]);
+      const central = await client.query(`SELECT id,name,email,role,true AS active FROM public.users WHERE role=ANY($1::text[])`, [['Admin','Geschäftsführer']]);
       const audience = escalationAudience(targetLevel, {
         mode,
         assignee: { id: row.assignee_user_id,name:row.assignee_name,email:row.assignee_email,role:row.assignee_role,active:row.assignee_active },
