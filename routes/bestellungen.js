@@ -8,6 +8,7 @@ const { sendOrderMail } = require('../services/mailer');
 const { generateMellerudOrderPdf } = require('../services/pdf/mellerudPdfService');
 const {
   calculateOrderPlan,
+  canManageMellerudArticleMaster,
   centsToMoney,
   isValidIsoDate,
   normalizeMellerudArticleIdentity,
@@ -22,7 +23,7 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3
 
 const normalizeText = (value) => typeof value === 'string' ? value.trim() : '';
 const canReadAllOrders = (role) => GLOBAL_ROLES.has(role);
-const canManageArticles = (role) => GLOBAL_ROLES.has(role);
+const canManageArticles = canManageMellerudArticleMaster;
 
 const businessDateBerlin = () => new Intl.DateTimeFormat('en-CA', {
   timeZone: 'Europe/Berlin', year: 'numeric', month: '2-digit', day: '2-digit',
