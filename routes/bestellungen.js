@@ -11,6 +11,7 @@ const {
   centsToMoney,
   isValidIsoDate,
   normalizeMellerudArticleIdentity,
+  normalizeMellerudArticleMaster,
   normalizeSupplierCode,
   supportsMellerudWorkflow,
 } = require('../lib/orderRules');
@@ -21,6 +22,91 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3
 
 const normalizeText = (value) => typeof value === 'string' ? value.trim() : '';
 const canReadAllOrders = (role) => GLOBAL_ROLES.has(role);
+const canManageArticles = (role) => GLOBAL_ROLES.has(role);
+
+const businessDateBerlin = () => new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'Europe/Berlin', year: 'numeric', month: '2-digit', day: '2-digit',
+}).format(new Date());
+
+const databaseDateIso = (value) => {
+  if (value instanceof Date) {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Europe/Berlin', year: 'numeric', month: '2-digit', day: '2-digit',
+    }).format(value);
+  }
+  const match = String(value || '').match(/^\d{4}-\d{2}-\d{2}/);
+  return match ? match[0] : '';
+};
+
+function articleMasterDto(row) {
+  return {
+    id: row.id,
+    supplier_article_no: row.supplier_article_no,
+    kunden_art_nr: row.kunden_art_nr,
+    ean: row.ean,
+    name: row.name,
+    ve_stueck: Number(row.ve_stueck),
+    sort_index: Number(row.sort_index),
+    aktiv: Boolean(row.aktiv),
+    ek_einzel: row.ek_einzel === null || row.ek_einzel === undefined ? null : Number(row.ek_einzel),
+    ek_pro_karton: row.ek_pro_karton === null || row.ek_pro_karton === undefined ? null : Number(row.ek_pro_karton),
+    preis_gueltig_ab: row.gueltig_ab || null,
+    preis_gueltig_bis: row.gueltig_bis || null,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}
+
+async function loadMellerudArticleMaster(client, articleId) {
+  const result = await client.query(
+    `SELECT a.id, a.supplier_article_no, a.kunden_art_nr, a.ean, a.name,
+            a.ve_stueck, a.sort_index, a.aktiv, a.created_at, a.updated_at,
+            p.ek_einzel, p.ek_pro_karton, p.gueltig_ab, p.gueltig_bis
+     FROM "order".order_supplier_articles a
+     JOIN "order".order_suppliers s ON s.id=a.supplier_id
+     LEFT JOIN LATERAL (
+       SELECT ek_einzel, ek_pro_karton, gueltig_ab, gueltig_bis
+       FROM "order".order_supplier_article_prices
+       WHERE article_id=a.id
+       ORDER BY (gueltig_bis IS NULL) DESC, gueltig_ab DESC LIMIT 1
+     ) p ON true
+     WHERE a.id=$1 AND lower(s.code)='mellerud' LIMIT 1`,
+    [articleId]
+  );
+  return result.rows[0] || null;
+}
+
+async function ensureArticleIdentityUnique(client, supplierId, article, excludeId = null) {
+  const result = await client.query(
+    `SELECT supplier_article_no, kunden_art_nr, ean
+     FROM "order".order_supplier_articles
+     WHERE supplier_id=$1 AND ($2::uuid IS NULL OR id<>$2::uuid)
+       AND (lower(supplier_article_no)=lower($3)
+         OR lower(kunden_art_nr)=lower($4)
+         OR ean=$5)
+     LIMIT 1`,
+    [supplierId, excludeId, article.supplier_article_no, article.kunden_art_nr, article.ean]
+  );
+  if (result.rows.length) {
+    const row = result.rows[0];
+    if (String(row.supplier_article_no).toLowerCase() === article.supplier_article_no.toLowerCase()) {
+      throw Object.assign(new Error('Diese Mellerud-Art.-Nr. ist bereits vergeben'), { statusCode: 409 });
+    }
+    if (String(row.kunden_art_nr || '').toLowerCase() === article.kunden_art_nr.toLowerCase()) {
+      throw Object.assign(new Error('Diese Neufeld-Art.-Nr. ist bereits vergeben'), { statusCode: 409 });
+    }
+    throw Object.assign(new Error('Diese EAN ist bereits vergeben'), { statusCode: 409 });
+  }
+}
+
+async function appendArticleAudit(client, articleId, action, beforeData, afterData, changedBy) {
+  await client.query(
+    `INSERT INTO "order".order_supplier_article_audit
+       (article_id, action, before_data, after_data, changed_by)
+     VALUES ($1,$2,$3::jsonb,$4::jsonb,$5)`,
+    [articleId, action, beforeData ? JSON.stringify(beforeData) : null, JSON.stringify(afterData), changedBy]
+  );
+}
 
 function parseOptionalInt(value) {
   if (value === undefined || value === null || value === '') return null;
@@ -342,15 +428,215 @@ async function handleArticles(req, res, includePrices) {
 router.get('/artikel', verifyToken(), (req, res) => handleArticles(req, res, false));
 router.get('/artikel-mit-ek', verifyToken(), (req, res) => handleArticles(req, res, true));
 
-router.patch('/artikel/:id', verifyToken(), async (req, res) => {
+router.get('/artikelverwaltung', verifyToken(), async (req, res) => {
   try {
-    if (!canReadAllOrders(req.user?.role)) {
+    if (!canManageArticles(req.user?.role)) {
+      return res.status(403).json({ message: 'Artikelstammdaten dürfen nur von Superusern verwaltet werden' });
+    }
+    const result = await db.query(
+      `SELECT a.id, a.supplier_article_no, a.kunden_art_nr, a.ean, a.name,
+              a.ve_stueck, a.sort_index, a.aktiv, a.created_at, a.updated_at,
+              p.ek_einzel, p.ek_pro_karton, p.gueltig_ab, p.gueltig_bis
+       FROM "order".order_supplier_articles a
+       JOIN "order".order_suppliers s ON s.id=a.supplier_id
+       LEFT JOIN LATERAL (
+         SELECT ek_einzel, ek_pro_karton, gueltig_ab, gueltig_bis
+         FROM "order".order_supplier_article_prices
+         WHERE article_id=a.id
+         ORDER BY (gueltig_bis IS NULL) DESC, gueltig_ab DESC LIMIT 1
+       ) p ON true
+       WHERE lower(s.code)='mellerud'
+       ORDER BY a.aktiv DESC, a.sort_index, a.name`
+    );
+    return res.json({ status: 'ok', count: result.rows.length, items: result.rows.map(articleMasterDto) });
+  } catch (error) {
+    console.error('GET /api/bestellungen/artikelverwaltung:', error);
+    return res.status(500).json({ message: 'Artikelstamm konnte nicht geladen werden' });
+  }
+});
+
+router.post('/artikelverwaltung', verifyToken(), async (req, res) => {
+  let client;
+  try {
+    if (!canManageArticles(req.user?.role)) {
+      return res.status(403).json({ message: 'Artikelstammdaten dürfen nur von Superusern verwaltet werden' });
+    }
+    const article = normalizeMellerudArticleMaster(req.body?.article);
+    client = await db.connect();
+    await client.query('BEGIN');
+    const supplierResult = await client.query(
+      `SELECT id FROM "order".order_suppliers WHERE lower(code)='mellerud' LIMIT 1 FOR UPDATE`
+    );
+    if (!supplierResult.rows.length) throw Object.assign(new Error('Mellerud-Lieferant wurde nicht gefunden'), { statusCode: 404 });
+    const supplierId = supplierResult.rows[0].id;
+    await ensureArticleIdentityUnique(client, supplierId, article);
+    let sortIndex = article.sort_index;
+    if (sortIndex === null) {
+      const sortResult = await client.query(
+        `SELECT COALESCE(MAX(sort_index),0)+10 AS next_sort
+         FROM "order".order_supplier_articles WHERE supplier_id=$1`,
+        [supplierId]
+      );
+      sortIndex = Number(sortResult.rows[0].next_sort);
+    }
+    const inserted = await client.query(
+      `INSERT INTO "order".order_supplier_articles
+         (supplier_id, supplier_article_no, kunden_art_nr, ean, name, ve_stueck, sort_index, aktiv)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,true) RETURNING id`,
+      [supplierId, article.supplier_article_no, article.kunden_art_nr, article.ean,
+        article.name, article.ve_stueck, sortIndex]
+    );
+    const articleId = inserted.rows[0].id;
+    await client.query(
+      `INSERT INTO "order".order_supplier_article_prices
+         (article_id, ek_einzel, ek_pro_karton, gueltig_ab, gueltig_bis, created_by)
+       VALUES ($1,$2,$3,$4::date,NULL,$5)`,
+      [articleId, article.ek_einzel, article.ek_pro_karton, businessDateBerlin(), req.user.name]
+    );
+    const created = await loadMellerudArticleMaster(client, articleId);
+    await appendArticleAudit(client, articleId, 'created', null, articleMasterDto(created), req.user.name);
+    await client.query('COMMIT');
+    client.release();
+    client = null;
+    return res.status(201).json({ status: 'ok', item: articleMasterDto(created) });
+  } catch (error) {
+    if (client) { try { await client.query('ROLLBACK'); } catch {} }
+    const status = error.statusCode || (error.code === '23505' ? 409 : 400);
+    return res.status(status).json({ message: error.code === '23505' ? 'Artikelnummer oder Sortierung ist bereits vergeben' : error.message });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+router.patch('/artikelverwaltung/:id', verifyToken(), async (req, res) => {
+  let client;
+  try {
+    if (!canManageArticles(req.user?.role)) {
+      return res.status(403).json({ message: 'Artikelstammdaten dürfen nur von Superusern verwaltet werden' });
+    }
+    const articleId = ensureUuid(req.params.id, 'Artikel-ID');
+    const article = normalizeMellerudArticleMaster(req.body?.article);
+    client = await db.connect();
+    await client.query('BEGIN');
+    const currentResult = await client.query(
+      `SELECT a.*, s.code AS supplier_code
+       FROM "order".order_supplier_articles a
+       JOIN "order".order_suppliers s ON s.id=a.supplier_id
+       WHERE a.id=$1 FOR UPDATE`,
+      [articleId]
+    );
+    const current = currentResult.rows[0];
+    if (!current || normalizeSupplierCode(current.supplier_code) !== 'mellerud') {
+      throw Object.assign(new Error('Mellerud-Artikel nicht gefunden'), { statusCode: 404 });
+    }
+    const before = await loadMellerudArticleMaster(client, articleId);
+    await ensureArticleIdentityUnique(client, current.supplier_id, article, articleId);
+    const sortIndex = article.sort_index === null ? Number(current.sort_index) : article.sort_index;
+    await client.query(
+      `UPDATE "order".order_supplier_articles
+       SET supplier_article_no=$1, kunden_art_nr=$2, ean=$3, name=$4,
+           ve_stueck=$5, sort_index=$6, updated_at=NOW()
+       WHERE id=$7`,
+      [article.supplier_article_no, article.kunden_art_nr, article.ean, article.name,
+        article.ve_stueck, sortIndex, articleId]
+    );
+    const priceResult = await client.query(
+      `SELECT * FROM "order".order_supplier_article_prices
+       WHERE article_id=$1 AND gueltig_bis IS NULL
+       ORDER BY gueltig_ab DESC LIMIT 1 FOR UPDATE`,
+      [articleId]
+    );
+    const currentPrice = priceResult.rows[0];
+    const priceChanged = !currentPrice
+      || Number(currentPrice.ek_einzel) !== article.ek_einzel
+      || Number(currentPrice.ek_pro_karton) !== article.ek_pro_karton;
+    if (priceChanged) {
+      const today = businessDateBerlin();
+      if (currentPrice && databaseDateIso(currentPrice.gueltig_ab) >= today) {
+        await client.query(
+          `UPDATE "order".order_supplier_article_prices
+           SET ek_einzel=$1, ek_pro_karton=$2 WHERE id=$3`,
+          [article.ek_einzel, article.ek_pro_karton, currentPrice.id]
+        );
+      } else {
+        if (currentPrice) {
+          await client.query(
+            `UPDATE "order".order_supplier_article_prices
+             SET gueltig_bis=($2::date - INTERVAL '1 day')::date WHERE id=$1`,
+            [currentPrice.id, today]
+          );
+        }
+        await client.query(
+          `INSERT INTO "order".order_supplier_article_prices
+             (article_id, ek_einzel, ek_pro_karton, gueltig_ab, gueltig_bis, created_by)
+           VALUES ($1,$2,$3,$4::date,NULL,$5)`,
+          [articleId, article.ek_einzel, article.ek_pro_karton, today, req.user.name]
+        );
+      }
+    }
+    const updated = await loadMellerudArticleMaster(client, articleId);
+    await appendArticleAudit(client, articleId, 'updated', articleMasterDto(before), articleMasterDto(updated), req.user.name);
+    await client.query('COMMIT');
+    client.release();
+    client = null;
+    return res.json({ status: 'ok', item: articleMasterDto(updated) });
+  } catch (error) {
+    if (client) { try { await client.query('ROLLBACK'); } catch {} }
+    const status = error.statusCode || (error.code === '23505' ? 409 : 400);
+    return res.status(status).json({ message: error.code === '23505' ? 'Artikelnummer oder Sortierung ist bereits vergeben' : error.message });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+router.patch('/artikelverwaltung/:id/status', verifyToken(), async (req, res) => {
+  let client;
+  try {
+    if (!canManageArticles(req.user?.role)) {
+      return res.status(403).json({ message: 'Artikelstammdaten dürfen nur von Superusern verwaltet werden' });
+    }
+    if (typeof req.body?.aktiv !== 'boolean') return res.status(400).json({ message: 'aktiv muss true oder false sein' });
+    const articleId = ensureUuid(req.params.id, 'Artikel-ID');
+    client = await db.connect();
+    await client.query('BEGIN');
+    const before = await loadMellerudArticleMaster(client, articleId);
+    if (!before) throw Object.assign(new Error('Mellerud-Artikel nicht gefunden'), { statusCode: 404 });
+    await client.query(
+      `UPDATE "order".order_supplier_articles SET aktiv=$1, updated_at=NOW() WHERE id=$2`,
+      [req.body.aktiv, articleId]
+    );
+    const updated = await loadMellerudArticleMaster(client, articleId);
+    await appendArticleAudit(client, articleId, req.body.aktiv ? 'activated' : 'deactivated',
+      articleMasterDto(before), articleMasterDto(updated), req.user.name);
+    await client.query('COMMIT');
+    client.release();
+    client = null;
+    return res.json({ status: 'ok', item: articleMasterDto(updated) });
+  } catch (error) {
+    if (client) { try { await client.query('ROLLBACK'); } catch {} }
+    return res.status(error.statusCode || 400).json({ message: error.message });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+router.patch('/artikel/:id', verifyToken(), async (req, res) => {
+  let client;
+  try {
+    if (!canManageArticles(req.user?.role)) {
       return res.status(403).json({ message: 'Artikelstammdaten dürfen nur von Superusern bearbeitet werden' });
     }
 
     const articleId = ensureUuid(req.params.id, 'Artikel-ID');
     const identity = normalizeMellerudArticleIdentity(req.body?.article);
-    const result = await db.query(
+    client = await db.connect();
+    await client.query('BEGIN');
+    const before = await loadMellerudArticleMaster(client, articleId);
+    if (!before) throw Object.assign(new Error('Mellerud-Artikel nicht gefunden'), { statusCode: 404 });
+    await ensureArticleIdentityUnique(client, (await client.query(
+      `SELECT supplier_id FROM "order".order_supplier_articles WHERE id=$1`, [articleId]
+    )).rows[0].supplier_id, { ...identity, ean: before.ean }, articleId);
+    const result = await client.query(
       `UPDATE "order".order_supplier_articles a
        SET supplier_article_no=$1, kunden_art_nr=$2, updated_at=NOW()
        FROM "order".order_suppliers s
@@ -360,15 +646,23 @@ router.patch('/artikel/:id', verifyToken(), async (req, res) => {
       [identity.supplier_article_no, identity.kunden_art_nr, articleId]
     );
     if (result.rows.length === 0) {
-      return res.status(404).json({ message: 'Mellerud-Artikel nicht gefunden' });
+      throw Object.assign(new Error('Mellerud-Artikel nicht gefunden'), { statusCode: 404 });
     }
+    const updated = await loadMellerudArticleMaster(client, articleId);
+    await appendArticleAudit(client, articleId, 'updated', articleMasterDto(before), articleMasterDto(updated), req.user.name);
+    await client.query('COMMIT');
+    client.release();
+    client = null;
     return res.json({ status: 'ok', item: result.rows[0] });
   } catch (error) {
+    if (client) { try { await client.query('ROLLBACK'); } catch {} }
     if (error?.code === '23505') {
       return res.status(409).json({ message: 'Diese Mellerud-Artikelnummer ist bereits vergeben' });
     }
     const statusCode = error.statusCode || 400;
     return res.status(statusCode).json({ message: error.message || 'Artikelnummern konnten nicht gespeichert werden' });
+  } finally {
+    if (client) client.release();
   }
 });
 
