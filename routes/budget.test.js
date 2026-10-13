@@ -148,7 +148,7 @@ test('rejects an existing action in the same branch with merge details', async (
   assert.ok(queries.some((query) => query.sql === 'ROLLBACK'));
 });
 
-test('merges all simple duplicate amounts into one booking after confirmation', async () => {
+test('merges simple duplicates and replaces their amount with the latest total after confirmation', async () => {
   const queries = [];
   const existing = [
     {
@@ -174,7 +174,7 @@ test('merges all simple duplicate amounts into one booking after confirmation', 
         return { rows: [{ id: existing[0].id, betrag: params[1], aktion_nr: params[2] }] };
       }
       if (normalized.includes('FROM budget.v_week_summary_global_ytd')) {
-        return { rows: [{ filiale: 'Ahaus', jahr: 2027, kw: 13, verbraucht: '175.50' }] };
+        return { rows: [{ filiale: 'Ahaus', jahr: 2027, kw: 13, verbraucht: '50.00' }] };
       }
       return { rows: [] };
     },
@@ -189,9 +189,9 @@ test('merges all simple duplicate amounts into one booking after confirmation', 
 
   assert.equal(response.statusCode, 200);
   assert.equal(response.body.merged, true);
-  assert.equal(response.body.booking.betrag, 175.5);
+  assert.equal(response.body.booking.betrag, 50);
   const update = queries.find((query) => query.sql.startsWith('UPDATE budget.bookings'));
-  assert.deepEqual(update.params, [existing[0].id, 175.5, 'A02713']);
+  assert.deepEqual(update.params, [existing[0].id, 50, 'A02713']);
   const removal = queries.find((query) => query.sql.startsWith('DELETE FROM budget.bookings'));
   assert.deepEqual(removal.params, [[existing[1].id]]);
   assert.ok(queries.some((query) => query.sql === 'COMMIT'));
@@ -311,11 +311,11 @@ test('reports branch-specific duplicates before changing any booking', async () 
   assert.ok(queries.some((query) => query.sql === 'ROLLBACK'));
 });
 
-test('sets Zentrallager and appends a new remark when an existing branch action is merged', async () => {
+test('replaces the amount, sets Zentrallager and appends a new remark when an existing branch action is merged', async () => {
   const queries = [];
   const existing = {
     id: '11111111-1111-1111-1111-111111111111',
-    betrag: '100.00',
+    betrag: '231.00',
     parent_booking_id: null,
     has_splits: false,
     beschreibung: 'Alter Hinweis',
@@ -338,7 +338,7 @@ test('sets Zentrallager and appends a new remark when an existing branch action 
 
   await handler(
     makeActionRequest({
-      filialen: [{ filiale: 'Ahaus', betrag: 50 }],
+      filialen: [{ filiale: 'Ahaus', betrag: 559.31 }],
       beschreibung: 'Neuer Hinweis',
       merge_existing_action: true,
     }),
@@ -347,7 +347,7 @@ test('sets Zentrallager and appends a new remark when an existing branch action 
 
   assert.equal(response.statusCode, 201);
   const update = queries.find((query) => query.sql.startsWith('UPDATE budget.bookings'));
-  assert.deepEqual(update.params, [existing.id, 150, 'A02713', 'Neuer Hinweis']);
+  assert.deepEqual(update.params, [existing.id, 559.31, 'A02713', 'Neuer Hinweis']);
   assert.ok(update.sql.includes("lieferant = 'Zentrallager'"));
   assert.ok(update.sql.includes("beschreibung || ' | ' || $4"));
   assert.ok(queries.some((query) => query.sql === 'COMMIT'));

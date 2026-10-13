@@ -1191,7 +1191,7 @@ router.post('/bookings/actions', verifyToken(), async (req, res) => {
 
       if (existingActions.length > 0) {
         const canonical = existingActions[0];
-        const mergedAmount = Math.round((sumBookingAmounts(existingActions) + item.betrag) * 100) / 100;
+        const mergedAmount = item.betrag;
         const updated = await client.query(
           `
             UPDATE budget.bookings
@@ -1367,7 +1367,7 @@ router.post('/bookings', verifyToken(), async (req, res) => {
         }
 
         const canonical = existingActions[0];
-        const mergedAmount = Math.round((sumBookingAmounts(existingActions) + betrag) * 100) / 100;
+        const mergedAmount = betrag;
 
         const updated = await client.query(
           `
