@@ -7,6 +7,7 @@ const jwt = require('jsonwebtoken');
 
 const pool = require('./db'); // EIN DB-Pool
 const verifyToken = require('./middleware/verifyToken'); // ✅ korrekt (bei dir: backend\middleware)
+const { runCashOpeningMigration } = require('./lib/runCashOpeningMigration');
 
 // ✅ FINAL: JWT_SECRET kommt ausschließlich aus ENV (Render)
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -215,7 +216,18 @@ app.use((req, res) => {
 
 // Port / Binding für Render
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅ Backend läuft auf Port ${PORT} (0.0.0.0)`);
-  console.log(`🧩 BUILD_TAG=${BUILD_TAG} START_TS=${START_TS}`);
+
+async function startServer() {
+  await runCashOpeningMigration(pool);
+  console.log('✅ Datenbankschema für die Kasseneinzahlung ist bereit');
+
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`✅ Backend läuft auf Port ${PORT} (0.0.0.0)`);
+    console.log(`🧩 BUILD_TAG=${BUILD_TAG} START_TS=${START_TS}`);
+  });
+}
+
+startServer().catch((error) => {
+  console.error('❌ Backend-Start abgebrochen: Kassenschema konnte nicht vorbereitet werden.', error);
+  process.exit(1);
 });
