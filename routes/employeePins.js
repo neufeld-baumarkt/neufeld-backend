@@ -10,6 +10,7 @@ const {
   fourDigitPin,
   personalPin,
 } = require('../lib/employeePinPolicy');
+const { resolveCashBranch } = require('../lib/cashModuleAccess');
 
 const router = express.Router();
 const activationAttempts = new Map();
@@ -51,9 +52,10 @@ async function assertActiveBranch(queryable, id) {
   return result.rows[0];
 }
 
-async function branchForUser(queryable, user) {
+async function branchForUser(queryable, user, req) {
   const name = String(user?.filiale || '').trim();
-  if (!name || name.toLowerCase() === 'alle') {
+  if (name.toLowerCase() === 'alle') return resolveCashBranch(queryable, req);
+  if (!name) {
     throw Object.assign(new Error('Deinem Benutzerkonto ist keine einzelne Filiale zugeordnet.'), { statusCode: 403 });
   }
   const result = await queryable.query('SELECT id,name FROM public.filialen WHERE name=$1 AND aktiv=true LIMIT 1', [name]);
@@ -201,7 +203,7 @@ router.post('/verify', verifyToken(), async (req, res) => {
       return res.status(409).json({ code: 'PIN_CHANGE_REQUIRED', message: 'Bitte zuerst einen persönlichen PIN festlegen.' });
     }
     const excludedId = req.body?.excludeEmployeeId == null ? null : positiveEmployeeId(req.body.excludeEmployeeId);
-    const branch = await branchForUser(pool, req.user);
+    const branch = await branchForUser(pool, req.user, req);
     const candidates = await pool.query(`SELECT id,display_name,pin_hash,must_change_pin,locked_until
       FROM core.filiale_pins WHERE filiale_id=$1 AND is_active=true ORDER BY id`, [branch.id]);
     let matched = null;
@@ -224,7 +226,7 @@ router.post('/verify', verifyToken(), async (req, res) => {
 
 router.get('/first-use-candidates', verifyToken(), async (req, res) => {
   try {
-    const branch = await branchForUser(pool, req.user);
+    const branch = await branchForUser(pool, req.user, req);
     const result = await pool.query(`SELECT id,display_name FROM core.filiale_pins
       WHERE filiale_id=$1 AND is_active=true AND must_change_pin=true
       ORDER BY display_name`, [branch.id]);
@@ -251,7 +253,7 @@ router.post('/activate', verifyToken(), async (req, res) => {
     if (newPin !== confirmation) throw Object.assign(new Error('Die beiden persönlichen PIN-Eingaben stimmen nicht überein.'), { statusCode: 400 });
 
     await client.query('BEGIN');
-    const branch = await branchForUser(client, req.user);
+    const branch = await branchForUser(client, req.user, req);
     const result = await client.query(`SELECT id,filiale_id,display_name,pin_hash,must_change_pin,is_active
       FROM core.filiale_pins WHERE id=$1 AND filiale_id=$2 FOR UPDATE`, [id, branch.id]);
     const employee = result.rows[0];

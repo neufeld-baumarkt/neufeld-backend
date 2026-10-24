@@ -9,6 +9,7 @@ const pool = require('./db'); // EIN DB-Pool
 const verifyToken = require('./middleware/verifyToken'); // ✅ korrekt (bei dir: backend\middleware)
 const { runCashOpeningMigration } = require('./lib/runCashOpeningMigration');
 const { runEmployeePinMigration } = require('./lib/runEmployeePinMigration');
+const { runCashClosingMigration } = require('./lib/runCashClosingMigration');
 
 // ✅ FINAL: JWT_SECRET kommt ausschließlich aus ENV (Render)
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -221,7 +222,8 @@ const PORT = process.env.PORT || 3001;
 async function startServer() {
   await runCashOpeningMigration(pool);
   await runEmployeePinMigration(pool);
-  console.log('✅ Datenbankschema für die Kasseneinzahlung ist bereit');
+  await runCashClosingMigration(pool);
+  console.log('✅ Datenbankschema für Einzählung und Abrechnung ist bereit');
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`✅ Backend läuft auf Port ${PORT} (0.0.0.0)`);

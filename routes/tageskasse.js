@@ -4,6 +4,8 @@ const jwt = require('jsonwebtoken');
 const pool = require('../db');
 const verifyToken = require('../middleware/verifyToken');
 const { validateOpeningCount } = require('../lib/cashOpeningPolicy');
+const { validateCashClosing } = require('../lib/cashClosingPolicy');
+const { canUseCashModule, isCentralRole, resolveCashBranch } = require('../lib/cashModuleAccess');
 
 const router = express.Router();
 const PIN_PROOF_TTL_SECONDS = 10 * 60;
@@ -30,13 +32,7 @@ function clearPinAttempts(req) {
 }
 
 async function resolveBranch(client, req) {
-  const branchName = String(req.user?.filiale || '').trim();
-  if (!branchName || branchName.toLowerCase() === 'alle') {
-    throw Object.assign(new Error('Deinem Benutzerkonto ist keine einzelne Filiale zugeordnet.'), { statusCode: 403 });
-  }
-  const result = await client.query('SELECT id, name FROM public.filialen WHERE name=$1 AND aktiv=true LIMIT 1', [branchName]);
-  if (!result.rowCount) throw Object.assign(new Error('Die zugeordnete Filiale ist nicht aktiv oder wurde nicht gefunden.'), { statusCode: 403 });
-  return result.rows[0];
+  return resolveCashBranch(client, req);
 }
 
 async function loadImmediatePreviousClosing(client, branchId, drawerNumber) {
@@ -60,6 +56,44 @@ function verifyPinProof(token, branchId) {
     throw Object.assign(new Error('Eine Mitarbeiter-PIN-Bestätigung ist abgelaufen. Bitte den Vorgang neu beginnen.'), { statusCode: 401 });
   }
 }
+
+function signClosingContext(employeePinId, branchId, drawerNumber) {
+  return jwt.sign({
+    type: 'cash-closing-context',
+    pinId: Number(employeePinId),
+    branchId: Number(branchId),
+    drawerNumber: Number(drawerNumber),
+  }, process.env.JWT_SECRET, { expiresIn: PIN_PROOF_TTL_SECONDS });
+}
+
+function verifyClosingContext(token, { branchId, drawerNumber, employeePinId }) {
+  try {
+    const proof = jwt.verify(String(token || ''), process.env.JWT_SECRET);
+    if (proof.type !== 'cash-closing-context'
+      || Number(proof.branchId) !== Number(branchId)
+      || Number(proof.drawerNumber) !== Number(drawerNumber)
+      || Number(proof.pinId) !== Number(employeePinId)) throw new Error('invalid closing context');
+  } catch {
+    throw Object.assign(new Error('Der Abrechnungskontext ist abgelaufen. Bitte die Abrechnung neu beginnen.'), { statusCode: 401 });
+  }
+}
+
+router.get('/branches', async (req, res) => {
+  try {
+    if (!canUseCashModule(req.user)) return res.status(403).json({ message: 'Die Tageskassenabrechnung ist während der DEV-Phase nicht freigegeben.' });
+    const assigned = String(req.user?.filiale || '').trim();
+    if (isCentralRole(req.user?.role) && assigned.toLowerCase() === 'alle') {
+      const result = await pool.query(`SELECT id,name FROM public.filialen
+        WHERE aktiv=true AND LOWER(name)<>'alle' ORDER BY name`);
+      return res.json({ branches: result.rows.map((row) => ({ id: Number(row.id), name: row.name })) });
+    }
+    const branch = await resolveBranch(pool, req);
+    return res.json({ branches: [{ id: Number(branch.id), name: branch.name }] });
+  } catch (error) {
+    console.error('GET /api/tageskasse/branches Fehler:', error);
+    return res.status(error.statusCode || 500).json({ message: error.statusCode ? error.message : 'Filialen konnten nicht geladen werden.' });
+  }
+});
 
 router.post('/pin/verify', async (req, res) => {
   try {
@@ -159,6 +193,111 @@ router.post('/opening-counts', async (req, res) => {
     await client.query('ROLLBACK').catch(() => {});
     console.error('POST /api/tageskasse/opening-counts Fehler:', error);
     return res.status(error.statusCode || 500).json({ message: error.statusCode ? error.message : 'Die Einzählung konnte nicht gespeichert werden.' });
+  } finally {
+    client.release();
+  }
+});
+
+router.post('/closing-context', async (req, res) => {
+  try {
+    const branch = await resolveBranch(pool, req);
+    const drawerNumber = Number(req.body?.drawerNumber);
+    if (![1, 2].includes(drawerNumber)) return res.status(400).json({ message: 'Bitte Lade 1 oder Lade 2 auswählen.' });
+    const employeePinId = verifyPinProof(req.body?.proofToken, branch.id);
+    const employee = await pool.query(`SELECT id,display_name FROM core.filiale_pins
+      WHERE id=$1 AND filiale_id=$2 AND is_active=true LIMIT 1`, [employeePinId, branch.id]);
+    if (!employee.rows[0]) return res.status(409).json({ message: 'Der bestätigte Mitarbeiter ist in dieser Filiale nicht mehr aktiv.' });
+    const opening = await pool.query(`SELECT o.id,o.business_date,o.drawer_number,o.opening_balance_cents,o.completed_at
+      FROM core.cash_drawer_opening_counts o
+      WHERE o.branch_id=$1 AND o.drawer_number=$2 AND o.employee_pin_id=$3
+        AND o.business_date=((CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Berlin')::date)
+        AND o.status='completed'
+        AND NOT EXISTS (SELECT 1 FROM core.cash_drawer_closings c WHERE c.opening_count_id=o.id)
+      ORDER BY o.completed_at DESC,o.id DESC LIMIT 1`, [branch.id, drawerNumber, employeePinId]);
+    const row = opening.rows[0];
+    return res.json({
+      employee: { id: Number(employee.rows[0].id), name: employee.rows[0].display_name },
+      contextProofToken: signClosingContext(employeePinId, branch.id, drawerNumber),
+      opening: row ? {
+        id: Number(row.id),
+        businessDate: row.business_date,
+        drawerNumber: Number(row.drawer_number),
+        openingBalanceCents: Number(row.opening_balance_cents),
+        completedAt: row.completed_at,
+      } : null,
+    });
+  } catch (error) {
+    console.error('POST /api/tageskasse/closing-context Fehler:', error);
+    return res.status(error.statusCode || 500).json({ message: error.statusCode ? error.message : 'Die passende Einzählung konnte nicht geprüft werden.' });
+  }
+});
+
+router.post('/closings', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const branch = await resolveBranch(client, req);
+    const employeePinId = verifyPinProof(req.body?.proofToken, branch.id);
+    const employee = await client.query(`SELECT id,display_name FROM core.filiale_pins
+      WHERE id=$1 AND filiale_id=$2 AND is_active=true LIMIT 1`, [employeePinId, branch.id]);
+    if (!employee.rows[0]) throw Object.assign(new Error('Der bestätigte Mitarbeiter ist in dieser Filiale nicht mehr aktiv.'), { statusCode: 409 });
+
+    let checked;
+    try {
+      checked = validateCashClosing(req.body);
+    } catch (validationError) {
+      throw Object.assign(validationError, { statusCode: 400 });
+    }
+    verifyClosingContext(req.body?.contextProofToken, {
+      branchId: branch.id,
+      drawerNumber: checked.drawerNumber,
+      employeePinId,
+    });
+    let opening = null;
+    if (req.body?.openingCountId != null) {
+      const openingId = Number(req.body.openingCountId);
+      if (!Number.isInteger(openingId) || openingId <= 0) throw Object.assign(new Error('Die zugeordnete Einzählung ist ungültig.'), { statusCode: 400 });
+      const result = await client.query(`SELECT o.id,o.opening_balance_cents
+        FROM core.cash_drawer_opening_counts o
+        WHERE o.id=$1 AND o.branch_id=$2 AND o.drawer_number=$3 AND o.employee_pin_id=$4
+          AND o.business_date=((CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Berlin')::date)
+          AND o.status='completed'
+          AND NOT EXISTS (SELECT 1 FROM core.cash_drawer_closings c WHERE c.opening_count_id=o.id)
+        FOR UPDATE`, [openingId, branch.id, checked.drawerNumber, employeePinId]);
+      opening = result.rows[0];
+      if (!opening) throw Object.assign(new Error('Die passende Einzählung ist nicht mehr verfügbar. Bitte den Vorgang neu beginnen.'), { statusCode: 409 });
+    } else if (req.body?.proceededWithoutOpening !== true) {
+      throw Object.assign(new Error('Die fehlende Einzählung muss ausdrücklich bestätigt werden.'), { statusCode: 400 });
+    }
+
+    const result = await client.query(`INSERT INTO core.cash_drawer_closings
+      (branch_id,business_date,drawer_number,employee_pin_id,opening_count_id,opening_balance_cents,
+       opening_present,proceeded_without_opening,counted_total_cents,full_counts,retained_coin_cents,
+       loose_change_cents,retained_note_counts,bank_note_counts,bank_amount_cents,eurocontrol_total_cents,
+       difference_cents,notification_required,notification_confirmed,recount_attempts,resolved,status,created_by_user_id)
+      VALUES ($1,((CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Berlin')::date),$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,$11,
+        $12::jsonb,$13::jsonb,$14,$15,$16,$17,$18,$19::jsonb,$20,'closed',$21)
+      RETURNING id,business_date,closed_at`, [
+      branch.id, checked.drawerNumber, employeePinId, opening?.id || null,
+      opening ? Number(opening.opening_balance_cents) : 25000, Boolean(opening), !opening,
+      checked.countedTotalCents, JSON.stringify(checked.fullCounts), checked.retainedCoinCents,
+      checked.looseChangeCents, JSON.stringify(checked.retainedNoteCounts), JSON.stringify(checked.bankNoteCounts),
+      checked.bankAmountCents, checked.bankAmountCents, checked.differenceCents,
+      checked.notificationRequired, checked.notificationRequired ? req.body.notificationConfirmed === true : false,
+      JSON.stringify(checked.recountAttempts), checked.differenceCents === 0, req.user.id,
+    ]);
+    await client.query('COMMIT');
+    return res.status(201).json({ closing: {
+      id: Number(result.rows[0].id), businessDate: result.rows[0].business_date,
+      closedAt: result.rows[0].closed_at, branch: branch.name, drawerNumber: checked.drawerNumber,
+      employee: { id: employeePinId, name: employee.rows[0].display_name },
+      bankAmountCents: checked.bankAmountCents, differenceCents: checked.differenceCents,
+      openingPresent: Boolean(opening), status: 'closed',
+    } });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('POST /api/tageskasse/closings Fehler:', error);
+    return res.status(error.statusCode || 500).json({ message: error.statusCode ? error.message : 'Die Kassenabrechnung konnte nicht gespeichert werden.' });
   } finally {
     client.release();
   }
