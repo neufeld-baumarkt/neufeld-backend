@@ -10,6 +10,7 @@ const verifyToken = require('./middleware/verifyToken'); // ✅ korrekt (bei dir
 const { runCashOpeningMigration } = require('./lib/runCashOpeningMigration');
 const { runEmployeePinMigration } = require('./lib/runEmployeePinMigration');
 const { runCashClosingMigration } = require('./lib/runCashClosingMigration');
+const { ALLOWED_CORS_HEADERS } = require('./lib/corsPolicy');
 
 // ✅ FINAL: JWT_SECRET kommt ausschließlich aus ENV (Render)
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -42,7 +43,7 @@ const corsOptions = {
     return callback(null, false);
   },
   methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-filiale', 'x-file-name'],
+  allowedHeaders: ALLOWED_CORS_HEADERS,
   credentials: false,
   optionsSuccessStatus: 204,
 };
