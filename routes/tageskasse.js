@@ -3,6 +3,7 @@ const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const pool = require('../db');
 const verifyToken = require('../middleware/verifyToken');
+const { findActivePinMatches } = require('../lib/employeePinIdentity');
 const { validateOpeningCount } = require('../lib/cashOpeningPolicy');
 const { validateCashClosing } = require('../lib/cashClosingPolicy');
 const { canUseCashModule, isCentralRole, resolveCashBranch } = require('../lib/cashModuleAccess');
@@ -110,14 +111,16 @@ router.post('/pin/verify', async (req, res) => {
     const branch = await resolveBranch(pool, req);
     const excludedId = req.body?.excludeEmployeeId == null ? null : Number(req.body.excludeEmployeeId);
     const candidates = await pool.query(`SELECT id,display_name,pin_hash,must_change_pin,locked_until
-      FROM core.filiale_pins WHERE filiale_id=$1 AND is_active=true ORDER BY id`, [branch.id]);
+      FROM core.filiale_pins WHERE is_active=true ORDER BY id`);
 
-    let matched = null;
-    for (const candidate of candidates.rows) {
-      if (candidate.must_change_pin === true) continue;
-      if (candidate.locked_until && new Date(candidate.locked_until) > new Date()) continue;
-      if (await bcrypt.compare(pin, candidate.pin_hash)) { matched = candidate; break; }
+    const matches = await findActivePinMatches(candidates.rows, pin, bcrypt.compare);
+    if (matches.length > 1) {
+      return res.status(409).json({
+        code: 'PIN_AMBIGUOUS',
+        message: 'Dieser PIN ist mehreren Mitarbeitern zugeordnet. Bitte die betroffenen PINs in der Verwaltung zurücksetzen.',
+      });
     }
+    const matched = matches[0];
     if (!matched) return res.status(401).json({ message: 'PIN ungültig.' });
     if (excludedId && Number(matched.id) === excludedId) return res.status(400).json({ message: 'Für diese Nachzählung muss eine andere Person ihren PIN eingeben.' });
 
@@ -158,7 +161,7 @@ router.post('/opening-counts', async (req, res) => {
 
     const rawAttempts = Array.isArray(req.body?.attempts) ? req.body.attempts : [];
     const proofIds = rawAttempts.map((attempt) => verifyPinProof(attempt?.proofToken, branch.id));
-    const pins = proofIds.length ? await client.query('SELECT id,display_name FROM core.filiale_pins WHERE filiale_id=$1 AND is_active=true AND id=ANY($2::bigint[])', [branch.id, proofIds]) : { rows: [] };
+    const pins = proofIds.length ? await client.query('SELECT id,display_name FROM core.filiale_pins WHERE is_active=true AND id=ANY($1::bigint[])', [proofIds]) : { rows: [] };
     const pinById = new Map(pins.rows.map((row) => [Number(row.id), row]));
     if (proofIds.some((id) => !pinById.has(id))) throw Object.assign(new Error('Mindestens eine bestätigte Mitarbeiter-PIN ist nicht mehr aktiv.'), { statusCode: 409 });
 
@@ -205,8 +208,8 @@ router.post('/closing-context', async (req, res) => {
     if (![1, 2].includes(drawerNumber)) return res.status(400).json({ message: 'Bitte Lade 1 oder Lade 2 auswählen.' });
     const employeePinId = verifyPinProof(req.body?.proofToken, branch.id);
     const employee = await pool.query(`SELECT id,display_name FROM core.filiale_pins
-      WHERE id=$1 AND filiale_id=$2 AND is_active=true LIMIT 1`, [employeePinId, branch.id]);
-    if (!employee.rows[0]) return res.status(409).json({ message: 'Der bestätigte Mitarbeiter ist in dieser Filiale nicht mehr aktiv.' });
+      WHERE id=$1 AND is_active=true LIMIT 1`, [employeePinId]);
+    if (!employee.rows[0]) return res.status(409).json({ message: 'Der bestätigte Mitarbeiter ist nicht mehr aktiv.' });
     const opening = await pool.query(`SELECT o.id,o.business_date,o.drawer_number,o.opening_balance_cents,o.completed_at
       FROM core.cash_drawer_opening_counts o
       WHERE o.branch_id=$1 AND o.drawer_number=$2 AND o.employee_pin_id=$3
@@ -239,8 +242,8 @@ router.post('/closings', async (req, res) => {
     const branch = await resolveBranch(client, req);
     const employeePinId = verifyPinProof(req.body?.proofToken, branch.id);
     const employee = await client.query(`SELECT id,display_name FROM core.filiale_pins
-      WHERE id=$1 AND filiale_id=$2 AND is_active=true LIMIT 1`, [employeePinId, branch.id]);
-    if (!employee.rows[0]) throw Object.assign(new Error('Der bestätigte Mitarbeiter ist in dieser Filiale nicht mehr aktiv.'), { statusCode: 409 });
+      WHERE id=$1 AND is_active=true LIMIT 1`, [employeePinId]);
+    if (!employee.rows[0]) throw Object.assign(new Error('Der bestätigte Mitarbeiter ist nicht mehr aktiv.'), { statusCode: 409 });
 
     let checked;
     try {

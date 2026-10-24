@@ -3,14 +3,14 @@ const bcrypt = require('bcrypt');
 
 const pool = require('../db');
 const verifyToken = require('../middleware/verifyToken');
+const { findActivePinMatches } = require('../lib/employeePinIdentity');
 const {
   DEFAULT_EMPLOYEE_PIN,
-  branchId,
+  assignmentBranchId,
   employeeName,
   fourDigitPin,
   personalPin,
 } = require('../lib/employeePinPolicy');
-const { resolveCashBranch } = require('../lib/cashModuleAccess');
 
 const router = express.Router();
 const activationAttempts = new Map();
@@ -46,28 +46,18 @@ function sendError(res, error) {
   return res.status(status).json({ message: status >= 500 ? 'Mitarbeiter-PIN-Verwaltung fehlgeschlagen.' : error.message });
 }
 
-async function assertActiveBranch(queryable, id) {
+async function assertAssignmentBranch(queryable, id) {
+  if (id == null) return { id: null, name: 'Alle' };
   const result = await queryable.query('SELECT id,name FROM public.filialen WHERE id=$1 AND aktiv=true LIMIT 1', [id]);
   if (!result.rows[0]) throw Object.assign(new Error('Die gewählte Filiale ist nicht aktiv.'), { statusCode: 400 });
-  return result.rows[0];
-}
-
-async function branchForUser(queryable, user, req) {
-  const name = String(user?.filiale || '').trim();
-  if (name.toLowerCase() === 'alle') return resolveCashBranch(queryable, req);
-  if (!name) {
-    throw Object.assign(new Error('Deinem Benutzerkonto ist keine einzelne Filiale zugeordnet.'), { statusCode: 403 });
-  }
-  const result = await queryable.query('SELECT id,name FROM public.filialen WHERE name=$1 AND aktiv=true LIMIT 1', [name]);
-  if (!result.rows[0]) throw Object.assign(new Error('Die zugeordnete Filiale ist nicht aktiv.'), { statusCode: 403 });
   return result.rows[0];
 }
 
 function publicEmployee(row) {
   return {
     id: Number(row.id),
-    filiale_id: Number(row.filiale_id),
-    filiale: row.filiale || null,
+    filiale_id: row.filiale_id == null ? null : Number(row.filiale_id),
+    filiale: row.filiale || 'Alle',
     first_name: row.first_name || '',
     last_name: row.last_name || '',
     display_name: row.display_name,
@@ -93,10 +83,10 @@ function consumeActivationAttempt(req, employeeId) {
   return entry.count <= 10;
 }
 
-async function pinAlreadyUsed(queryable, filialeId, employeeId, pin) {
+async function pinAlreadyUsed(queryable, employeeId, pin) {
   const candidates = await queryable.query(
-    'SELECT id,pin_hash FROM core.filiale_pins WHERE filiale_id=$1 AND is_active=true AND id<>$2',
-    [filialeId, employeeId]
+    'SELECT id,pin_hash FROM core.filiale_pins WHERE is_active=true AND id<>$1',
+    [employeeId]
   );
   for (const candidate of candidates.rows) {
     if (await bcrypt.compare(pin, candidate.pin_hash)) return true;
@@ -121,13 +111,16 @@ router.get('/', verifyToken(), async (req, res) => {
       pool.query(`SELECT p.id,p.filiale_id,f.name AS filiale,p.first_name,p.last_name,p.display_name,
           p.is_active,p.must_change_pin,p.last_used_at,p.created_at,p.updated_at
         FROM core.filiale_pins p
-        JOIN public.filialen f ON f.id=p.filiale_id
-        ORDER BY f.name,p.last_name NULLS LAST,p.first_name NULLS LAST,p.display_name`),
+        LEFT JOIN public.filialen f ON f.id=p.filiale_id
+        ORDER BY COALESCE(f.name,'Alle'),p.last_name NULLS LAST,p.first_name NULLS LAST,p.display_name`),
       pool.query('SELECT id,name FROM public.filialen WHERE aktiv=true ORDER BY name'),
     ]);
     return res.json({
       employees: employees.rows.map(publicEmployee),
-      filialen: branches.rows.map((row) => ({ id: Number(row.id), name: row.name })),
+      filialen: [
+        { id: 'all', name: 'Alle' },
+        ...branches.rows.map((row) => ({ id: Number(row.id), name: row.name })),
+      ],
       default_pin: DEFAULT_EMPLOYEE_PIN,
     });
   } catch (error) {
@@ -138,9 +131,9 @@ router.get('/', verifyToken(), async (req, res) => {
 router.post('/', verifyToken(), async (req, res) => {
   if (!requireAdmin(req, res)) return;
   try {
-    const filialeId = branchId(req.body?.filiale_id);
+    const filialeId = assignmentBranchId(req.body?.filiale_id);
     const name = employeeName(req.body);
-    await assertActiveBranch(pool, filialeId);
+    await assertAssignmentBranch(pool, filialeId);
     const pinHash = await bcrypt.hash(DEFAULT_EMPLOYEE_PIN, 10);
     const result = await pool.query(`INSERT INTO core.filiale_pins
       (filiale_id,first_name,last_name,display_name,pin_hash,is_active,must_change_pin,
@@ -162,9 +155,9 @@ router.patch('/:id', verifyToken(), async (req, res) => {
   if (!requireAdmin(req, res)) return;
   try {
     const id = positiveEmployeeId(req.params.id);
-    const filialeId = branchId(req.body?.filiale_id);
+    const filialeId = assignmentBranchId(req.body?.filiale_id);
     const name = employeeName(req.body);
-    await assertActiveBranch(pool, filialeId);
+    await assertAssignmentBranch(pool, filialeId);
     const result = await pool.query(`UPDATE core.filiale_pins
       SET filiale_id=$1,first_name=$2,last_name=$3,display_name=$4,updated_at=NOW()
       WHERE id=$5
@@ -203,15 +196,13 @@ router.post('/verify', verifyToken(), async (req, res) => {
       return res.status(409).json({ code: 'PIN_CHANGE_REQUIRED', message: 'Bitte zuerst einen persönlichen PIN festlegen.' });
     }
     const excludedId = req.body?.excludeEmployeeId == null ? null : positiveEmployeeId(req.body.excludeEmployeeId);
-    const branch = await branchForUser(pool, req.user, req);
     const candidates = await pool.query(`SELECT id,display_name,pin_hash,must_change_pin,locked_until
-      FROM core.filiale_pins WHERE filiale_id=$1 AND is_active=true ORDER BY id`, [branch.id]);
-    let matched = null;
-    for (const candidate of candidates.rows) {
-      if (candidate.must_change_pin === true) continue;
-      if (candidate.locked_until && new Date(candidate.locked_until) > new Date()) continue;
-      if (await bcrypt.compare(pin, candidate.pin_hash)) { matched = candidate; break; }
+      FROM core.filiale_pins WHERE is_active=true ORDER BY id`);
+    const matches = await findActivePinMatches(candidates.rows, pin, bcrypt.compare);
+    if (matches.length > 1) {
+      throw Object.assign(new Error('Dieser PIN ist mehreren Mitarbeitern zugeordnet. Bitte die betroffenen PINs in der Verwaltung zurücksetzen.'), { statusCode: 409, code: 'PIN_AMBIGUOUS' });
     }
+    const matched = matches[0];
     if (!matched) throw Object.assign(new Error('PIN ungültig.'), { statusCode: 401 });
     if (excludedId && Number(matched.id) === excludedId) {
       throw Object.assign(new Error('Für diese Nachzählung muss eine andere Person ihren PIN eingeben.'), { statusCode: 400 });
@@ -226,12 +217,11 @@ router.post('/verify', verifyToken(), async (req, res) => {
 
 router.get('/first-use-candidates', verifyToken(), async (req, res) => {
   try {
-    const branch = await branchForUser(pool, req.user, req);
     const result = await pool.query(`SELECT id,display_name FROM core.filiale_pins
-      WHERE filiale_id=$1 AND is_active=true AND must_change_pin=true
-      ORDER BY display_name`, [branch.id]);
+      WHERE is_active=true AND must_change_pin=true
+      ORDER BY display_name`);
     return res.json({
-      filiale: branch.name,
+      filiale: 'Unternehmensweit',
       employees: result.rows.map((row) => ({ id: Number(row.id), display_name: row.display_name })),
     });
   } catch (error) {
@@ -253,15 +243,15 @@ router.post('/activate', verifyToken(), async (req, res) => {
     if (newPin !== confirmation) throw Object.assign(new Error('Die beiden persönlichen PIN-Eingaben stimmen nicht überein.'), { statusCode: 400 });
 
     await client.query('BEGIN');
-    const branch = await branchForUser(client, req.user, req);
+    await client.query('LOCK TABLE core.filiale_pins IN SHARE ROW EXCLUSIVE MODE');
     const result = await client.query(`SELECT id,filiale_id,display_name,pin_hash,must_change_pin,is_active
-      FROM core.filiale_pins WHERE id=$1 AND filiale_id=$2 FOR UPDATE`, [id, branch.id]);
+      FROM core.filiale_pins WHERE id=$1 FOR UPDATE`, [id]);
     const employee = result.rows[0];
-    if (!employee || employee.is_active !== true) throw Object.assign(new Error('Mitarbeiter wurde in dieser Filiale nicht gefunden.'), { statusCode: 404 });
+    if (!employee || employee.is_active !== true) throw Object.assign(new Error('Mitarbeiter wurde nicht gefunden.'), { statusCode: 404 });
     if (employee.must_change_pin !== true) throw Object.assign(new Error('Der persönliche PIN wurde bereits eingerichtet.'), { statusCode: 409 });
     if (!(await bcrypt.compare(currentPin, employee.pin_hash))) throw Object.assign(new Error('Der Standard-PIN ist nicht korrekt.'), { statusCode: 401 });
-    if (await pinAlreadyUsed(client, branch.id, id, newPin)) {
-      throw Object.assign(new Error('Dieser PIN wird in der Filiale bereits verwendet. Bitte einen anderen wählen.'), { statusCode: 409 });
+    if (await pinAlreadyUsed(client, id, newPin)) {
+      throw Object.assign(new Error('Dieser PIN wird bereits von einem anderen Mitarbeiter verwendet. Bitte einen anderen wählen.'), { statusCode: 409 });
     }
     await client.query(`UPDATE core.filiale_pins SET pin_hash=$1,must_change_pin=false,
       failed_attempts=0,locked_until=NULL,last_failed_at=NULL,last_used_at=NOW(),updated_at=NOW()
