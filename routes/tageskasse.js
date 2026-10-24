@@ -66,14 +66,21 @@ router.post('/pin/verify', async (req, res) => {
     if (!consumePinAttempt(req)) return res.status(429).json({ message: 'Zu viele PIN-Versuche. Bitte 15 Minuten warten.' });
     const pin = String(req.body?.pin || '').trim();
     if (!/^\d{4}$/.test(pin)) return res.status(400).json({ message: 'Der Mitarbeiter-PIN muss genau vier Ziffern haben.' });
+    if (pin === '0000') {
+      return res.status(409).json({
+        code: 'PIN_CHANGE_REQUIRED',
+        message: 'Bitte zuerst einen persönlichen PIN festlegen.',
+      });
+    }
 
     const branch = await resolveBranch(pool, req);
     const excludedId = req.body?.excludeEmployeeId == null ? null : Number(req.body.excludeEmployeeId);
-    const candidates = await pool.query(`SELECT id,display_name,pin_hash,locked_until
+    const candidates = await pool.query(`SELECT id,display_name,pin_hash,must_change_pin,locked_until
       FROM core.filiale_pins WHERE filiale_id=$1 AND is_active=true ORDER BY id`, [branch.id]);
 
     let matched = null;
     for (const candidate of candidates.rows) {
+      if (candidate.must_change_pin === true) continue;
       if (candidate.locked_until && new Date(candidate.locked_until) > new Date()) continue;
       if (await bcrypt.compare(pin, candidate.pin_hash)) { matched = candidate; break; }
     }

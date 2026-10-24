@@ -8,6 +8,7 @@ const jwt = require('jsonwebtoken');
 const pool = require('./db'); // EIN DB-Pool
 const verifyToken = require('./middleware/verifyToken'); // ✅ korrekt (bei dir: backend\middleware)
 const { runCashOpeningMigration } = require('./lib/runCashOpeningMigration');
+const { runEmployeePinMigration } = require('./lib/runEmployeePinMigration');
 
 // ✅ FINAL: JWT_SECRET kommt ausschließlich aus ENV (Render)
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -184,7 +185,7 @@ const stammdatenRoutes = require('./routes/stammdaten');
 const budgetRoutes = require('./routes/budget');
 const debugRoutes = require('./routes/debug');
 const tasksRoutes = require('./routes/tasks');
-const filialePinsRoutes = require('./routes/filialePins');
+const employeePinsRoutes = require('./routes/employeePins');
 const bestellungenRoutes = require('./routes/bestellungen');
 const cashflowRoutes = require('./routes/cashflow');
 const devDbRoutes = require('./routes/devDb');
@@ -195,7 +196,7 @@ app.use('/api/reklamationen', reklamationenRoutes);
 app.use('/api/budget', budgetRoutes);
 app.use('/api/debug', debugRoutes);
 app.use('/api/tasks', tasksRoutes);
-app.use('/api/filiale-pins', filialePinsRoutes);
+app.use('/api/filiale-pins', employeePinsRoutes);
 app.use('/api/bestellungen', bestellungenRoutes);
 app.use('/api/cashflow', cashflowRoutes);
 app.use('/api/controlling', controllingRoutes);
@@ -219,6 +220,7 @@ const PORT = process.env.PORT || 3001;
 
 async function startServer() {
   await runCashOpeningMigration(pool);
+  await runEmployeePinMigration(pool);
   console.log('✅ Datenbankschema für die Kasseneinzahlung ist bereit');
 
   app.listen(PORT, '0.0.0.0', () => {
