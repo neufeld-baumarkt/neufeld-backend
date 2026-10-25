@@ -7,6 +7,7 @@ const { findActivePinMatches } = require('../lib/employeePinIdentity');
 const { validateOpeningCount } = require('../lib/cashOpeningPolicy');
 const { validateCashClosing } = require('../lib/cashClosingPolicy');
 const { validateCashCorrection } = require('../lib/cashCorrectionPolicy');
+const { requireOpeningReplacement } = require('../lib/cashDrawerSessionPolicy');
 const { participantLabels, validateSafeCountPayload, validateSafeCountType } = require('../lib/cashSafePolicy');
 const { canCorrectCashClosing, canUseCashModule, isCentralRole, resolveCashBranch } = require('../lib/cashModuleAccess');
 
@@ -112,6 +113,17 @@ function closingJson(row) {
     correctionReason: row.correction_reason || null, superseded: row.superseded === true,
     businessDayStatus: row.business_day_status || 'open',
     closedAt: row.closed_at,
+  };
+}
+
+function openingJson(row) {
+  return {
+    id:Number(row.id), businessDate:row.business_date, drawerNumber:Number(row.drawer_number),
+    employee:{ id:Number(row.employee_pin_id), name:row.employee_name },
+    finalCounter:{ id:Number(row.final_counter_pin_id), name:row.final_counter_name },
+    openingBalanceCents:Number(row.opening_balance_cents), openingDifferenceCents:Number(row.opening_difference_cents),
+    lifecycleStatus:row.lifecycle_status || 'active', replacedByOpeningId:row.replaced_by_opening_id == null ? null : Number(row.replaced_by_opening_id),
+    completedAt:row.completed_at, endedAt:row.ended_at || null,
   };
 }
 
@@ -400,6 +412,38 @@ router.get('/previous-closing', async (req, res) => {
   }
 });
 
+router.get('/day-overview', async (req, res) => {
+  try {
+    const branch = await resolveBranch(pool, req);
+    const businessDay = await ensureBusinessDayOpen(pool, branch.id);
+    const [openings, closings] = await Promise.all([
+      pool.query(`SELECT o.*,employee.display_name AS employee_name,final_counter.display_name AS final_counter_name
+        FROM core.cash_drawer_opening_counts o
+        JOIN core.filiale_pins employee ON employee.id=o.employee_pin_id
+        JOIN core.filiale_pins final_counter ON final_counter.id=o.final_counter_pin_id
+        WHERE o.branch_id=$1 AND o.business_date=$2
+        ORDER BY o.completed_at,o.id`, [branch.id,businessDay.business_date]),
+      pool.query(`SELECT c.*,responsible.display_name AS responsible_employee_name,
+          closer.display_name AS closed_by_name,day.status AS business_day_status,
+          EXISTS (SELECT 1 FROM core.cash_drawer_closings newer WHERE newer.corrects_closing_id=c.id) AS superseded
+        FROM core.cash_drawer_closings c
+        JOIN core.filiale_pins responsible ON responsible.id=c.employee_pin_id
+        LEFT JOIN core.filiale_pins closer ON closer.id=COALESCE(c.closed_by_pin_id,c.employee_pin_id)
+        LEFT JOIN core.cash_business_days day ON day.branch_id=c.branch_id AND day.business_date=c.business_date
+        WHERE c.branch_id=$1 AND c.business_date=$2
+        ORDER BY c.closed_at,c.id`, [branch.id,businessDay.business_date]),
+    ]);
+    return res.json({
+      branch:branch.name, businessDate:businessDay.business_date, businessDayStatus:businessDay.status,
+      openings:openings.rows.map(openingJson), closings:closings.rows.map(closingJson),
+      canCorrect:canCorrectCashClosing(req.user?.role),
+    });
+  } catch (error) {
+    console.error('GET /api/tageskasse/day-overview Fehler:', error);
+    return res.status(error.statusCode || 500).json({ message:error.statusCode ? error.message : 'Der laufende Geschäftstag konnte nicht geladen werden.' });
+  }
+});
+
 router.post('/opening-counts', async (req, res) => {
   const client = await pool.connect();
   try {
@@ -408,6 +452,15 @@ router.post('/opening-counts', async (req, res) => {
     await ensureBusinessDayOpen(client, branch.id);
     const drawerNumber = Number(req.body?.drawerNumber);
     if (![1, 2].includes(drawerNumber)) throw Object.assign(new Error('Bitte Lade 1 oder Lade 2 auswählen.'), { statusCode: 400 });
+    await client.query('SELECT pg_advisory_xact_lock($1,$2)', [branch.id,drawerNumber]);
+    const activeResult = await client.query(`SELECT o.id,o.drawer_number,o.employee_pin_id,employee.display_name AS employee_name,o.completed_at
+      FROM core.cash_drawer_opening_counts o
+      JOIN core.filiale_pins employee ON employee.id=o.employee_pin_id
+      WHERE o.branch_id=$1 AND o.business_date=((CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Berlin')::date)
+        AND o.drawer_number=$2 AND o.lifecycle_status='active'
+      ORDER BY o.completed_at DESC,o.id DESC LIMIT 1 FOR UPDATE OF o`, [branch.id,drawerNumber]);
+    const activeOpening = activeResult.rows[0] || null;
+    const replacedOpeningId = requireOpeningReplacement(activeOpening, req.body?.replaceActiveOpeningId);
     const previousClosing = await loadImmediatePreviousClosing(client, branch.id, drawerNumber);
 
     const rawAttempts = Array.isArray(req.body?.attempts) ? req.body.attempts : [];
@@ -424,6 +477,11 @@ router.post('/opening-counts', async (req, res) => {
     const checked = validateOpeningCount(preparedInput, previousClosing, branch.id);
     const firstEmployee = checked.attempts[0];
     const finalEmployee = checked.attempts.at(-1);
+    if (replacedOpeningId) {
+      await client.query(`UPDATE core.cash_drawer_opening_counts
+        SET lifecycle_status='replaced',ended_at=NOW()
+        WHERE id=$1 AND lifecycle_status='active'`, [replacedOpeningId]);
+    }
     const result = await client.query(`INSERT INTO core.cash_drawer_opening_counts
       (branch_id,drawer_number,employee_pin_id,final_counter_pin_id,target_cents,initial_counted_cents,
        initial_difference_cents,opening_balance_cents,opening_difference_cents,previous_closing_id,
@@ -435,6 +493,9 @@ router.post('/opening-counts', async (req, res) => {
       checked.openingDifferenceCents, checked.previousClosingId, checked.carryoverDecision,
       JSON.stringify(checked.attempts), req.user.id,
     ]);
+    if (replacedOpeningId) {
+      await client.query('UPDATE core.cash_drawer_opening_counts SET replaced_by_opening_id=$1 WHERE id=$2', [result.rows[0].id,replacedOpeningId]);
+    }
     await client.query('COMMIT');
     return res.status(201).json({ openingCount: {
       id: Number(result.rows[0].id), businessDate: result.rows[0].business_date,
@@ -442,11 +503,20 @@ router.post('/opening-counts', async (req, res) => {
       employee: { id: firstEmployee.employeePinId, name: firstEmployee.employeeName },
       openingBalanceCents: checked.openingBalanceCents, openingDifferenceCents: checked.openingDifferenceCents,
       carryoverDecision: checked.carryoverDecision, previousClosingId: checked.previousClosingId,
+      lifecycleStatus:'active', replacedOpeningId,
     } });
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('POST /api/tageskasse/opening-counts Fehler:', error);
-    return res.status(error.statusCode || 500).json({ message: error.statusCode ? error.message : 'Die Einzählung konnte nicht gespeichert werden.' });
+    return res.status(error.statusCode || 500).json({
+      message:error.statusCode ? error.message : 'Die Einzählung konnte nicht gespeichert werden.',
+      code:error.code || undefined,
+      activeOpening:error.activeOpening ? {
+        id:Number(error.activeOpening.id), drawerNumber:Number(error.activeOpening.drawer_number),
+        employee:{ id:Number(error.activeOpening.employee_pin_id), name:error.activeOpening.employee_name },
+        completedAt:error.activeOpening.completed_at,
+      } : undefined,
+    });
   } finally {
     client.release();
   }
@@ -470,6 +540,7 @@ router.post('/closing-context', async (req, res) => {
       WHERE o.branch_id=$1 AND o.drawer_number=$2 AND o.employee_pin_id=$3
         AND o.business_date=((CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Berlin')::date)
         AND o.status='completed'
+        AND o.lifecycle_status='active'
         AND NOT EXISTS (SELECT 1 FROM core.cash_drawer_closings c WHERE c.opening_count_id=o.id)
       ORDER BY o.completed_at DESC,o.id DESC LIMIT 1`, [branch.id, drawerNumber, responsibleEmployeePinId]);
     const row = opening.rows[0];
@@ -526,6 +597,7 @@ router.post('/closings', async (req, res) => {
         WHERE o.id=$1 AND o.branch_id=$2 AND o.drawer_number=$3 AND o.employee_pin_id=$4
           AND o.business_date=((CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Berlin')::date)
           AND o.status='completed'
+          AND o.lifecycle_status='active'
           AND NOT EXISTS (SELECT 1 FROM core.cash_drawer_closings c WHERE c.opening_count_id=o.id)
         FOR UPDATE`, [openingId, branch.id, checked.drawerNumber, responsibleEmployeePinId]);
       opening = result.rows[0];
@@ -550,6 +622,11 @@ router.post('/closings', async (req, res) => {
       checked.notificationRequired, checked.notificationRequired ? req.body.notificationConfirmed === true : false,
       JSON.stringify(checked.recountAttempts), checked.differenceCents === 0, req.user.id,
     ]);
+    if (opening) {
+      await client.query(`UPDATE core.cash_drawer_opening_counts
+        SET lifecycle_status='closed',ended_at=$1
+        WHERE id=$2 AND lifecycle_status='active'`, [result.rows[0].closed_at,opening.id]);
+    }
     await client.query('COMMIT');
     return res.status(201).json({ closing: {
       id: Number(result.rows[0].id), businessDate: result.rows[0].business_date,
