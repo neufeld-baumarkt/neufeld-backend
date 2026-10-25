@@ -7,7 +7,7 @@ const { findActivePinMatches } = require('../lib/employeePinIdentity');
 const { validateOpeningCount } = require('../lib/cashOpeningPolicy');
 const { validateCashClosing } = require('../lib/cashClosingPolicy');
 const { validateCashCorrection } = require('../lib/cashCorrectionPolicy');
-const { calculateSafeContext, countSafeCashCents, validateSafeCountType } = require('../lib/cashSafePolicy');
+const { participantLabels, validateSafeCountPayload, validateSafeCountType } = require('../lib/cashSafePolicy');
 const { canCorrectCashClosing, canUseCashModule, isCentralRole, resolveCashBranch } = require('../lib/cashModuleAccess');
 
 const router = express.Router();
@@ -120,31 +120,33 @@ function safeCountJson(row) {
     id:Number(row.id), businessDate:row.business_date, countType:row.count_type,
     counter:{ id:Number(row.counter_pin_id), name:row.counter_name },
     recorder:{ id:Number(row.recorder_pin_id), name:row.recorder_name },
-    previousCountId:row.previous_count_id == null ? null : Number(row.previous_count_id),
-    standardBalanceCents:Number(row.standard_balance_cents), baseBalanceCents:Number(row.base_balance_cents),
-    addedLooseChangeCents:Number(row.added_loose_change_cents), beforeSkimCents:Number(row.balance_before_skim_cents),
-    skimmedCents:Number(row.skimmed_cents), expectedBalanceCents:Number(row.expected_balance_cents),
-    countedTotalCents:Number(row.counted_total_cents), differenceCents:Number(row.difference_cents),
-    counts:row.denomination_counts || {}, status:row.status, completedAt:row.completed_at,
+    participants:[
+      { id:Number(row.counter_pin_id), name:row.counter_name, role:row.first_employee_role },
+      { id:Number(row.recorder_pin_id), name:row.recorder_name, role:row.second_employee_role },
+    ],
+    mode:row.count_mode || 'full_count',
+    previousEveningCountId:row.previous_evening_count_id == null ? null : Number(row.previous_evening_count_id),
+    fixedDrawerCents:Number(row.fixed_drawer_cents || 0), littleBerthaCents:Number(row.little_bertha_cents || 0),
+    looseMoneyCents:Number(row.loose_money_cents || 0), coinRollCounts:row.coin_roll_counts || {},
+    rollTotalCents:Number(row.coin_roll_total_cents || 0), banknoteCounts:row.banknote_counts || {},
+    banknoteTotalCents:Number(row.banknote_total_cents || 0),
+    countedTotalCents:Number(row.counted_total_cents), differenceCents:row.eurocontrol_total_cents == null ? null : Number(row.difference_cents),
+    eurocontrolTotalCents:row.eurocontrol_total_cents == null ? null : Number(row.eurocontrol_total_cents),
+    status:row.status, completedAt:row.completed_at,
   };
 }
 
 async function loadSafeContext(client, branchId, countType) {
-  const settings = await client.query(`SELECT standard_balance_cents FROM core.cash_safe_settings WHERE branch_id=$1`, [branchId]);
+  const settings = await client.query(`SELECT fixed_drawer_cents,little_bertha_cents FROM core.cash_safe_settings WHERE branch_id=$1`, [branchId]);
   if (!settings.rows[0]) throw Object.assign(new Error('Für diese Filiale ist noch kein Tresor-Standardbestand hinterlegt.'), { statusCode:409 });
-  const previous = await client.query(`SELECT id,counted_total_cents,completed_at,count_type
-    FROM core.cash_safe_counts WHERE branch_id=$1 ORDER BY completed_at DESC,id DESC LIMIT 1`, [branchId]);
-  const previousRow = previous.rows[0] || null;
-  const loose = await client.query(`SELECT COALESCE(SUM(loose_change_cents),0)::bigint AS cents
-    FROM core.cash_drawer_closings
-    WHERE branch_id=$1 AND record_kind='original'
-      AND closed_at > COALESCE($2::timestamptz,(((CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Berlin')::date)::timestamp AT TIME ZONE 'Europe/Berlin'))`,
-  [branchId,previousRow?.completed_at || null]);
-  const calculated = calculateSafeContext({
-    standardBalanceCents:Number(settings.rows[0].standard_balance_cents),
-    previousCountedCents:previousRow ? Number(previousRow.counted_total_cents) : null,
-    addedLooseChangeCents:Number(loose.rows[0].cents),
-  });
+  const previous = await client.query(`SELECT c.*,counter.display_name AS counter_name,recorder.display_name AS recorder_name
+    FROM core.cash_safe_counts c
+    JOIN core.filiale_pins counter ON counter.id=c.counter_pin_id
+    JOIN core.filiale_pins recorder ON recorder.id=c.recorder_pin_id
+    WHERE c.branch_id=$1 AND c.count_type='closing'
+      AND c.business_date<((CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Berlin')::date)
+      AND c.first_employee_role IS NOT NULL
+    ORDER BY c.business_date DESC,c.completed_at DESC,c.id DESC LIMIT 1`, [branchId]);
   const existing = await client.query(`SELECT c.*,counter.display_name AS counter_name,recorder.display_name AS recorder_name
     FROM core.cash_safe_counts c
     JOIN core.filiale_pins counter ON counter.id=c.counter_pin_id
@@ -152,8 +154,8 @@ async function loadSafeContext(client, branchId, countType) {
     WHERE c.branch_id=$1 AND c.business_date=((CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Berlin')::date) AND c.count_type=$2
     LIMIT 1`, [branchId,countType]);
   return {
-    ...calculated,
-    previousCount:previousRow ? { id:Number(previousRow.id), countedTotalCents:Number(previousRow.counted_total_cents), completedAt:previousRow.completed_at, countType:previousRow.count_type } : null,
+    settings:{ fixedDrawerCents:Number(settings.rows[0].fixed_drawer_cents), littleBerthaCents:Number(settings.rows[0].little_bertha_cents) },
+    previousEvening:previous.rows[0] ? safeCountJson(previous.rows[0]) : null,
     existingCount:existing.rows[0] ? safeCountJson(existing.rows[0]) : null,
   };
 }
@@ -193,9 +195,9 @@ router.get('/safe-counts/context', async (req, res) => {
     try { countType = validateSafeCountType(req.query?.type); }
     catch (validationError) { throw Object.assign(validationError, { statusCode:400 }); }
     const branch = await resolveBranch(pool, req);
-    await ensureBusinessDayOpen(pool, branch.id);
+    const businessDay = await ensureBusinessDayOpen(pool, branch.id);
     const context = await loadSafeContext(pool, branch.id, countType);
-    return res.json({ branch:branch.name, countType, context });
+    return res.json({ branch:branch.name, countType, context:{ ...context, businessDate:businessDay.business_date } });
   } catch (error) {
     console.error('GET /api/tageskasse/safe-counts/context Fehler:', error);
     return res.status(error.statusCode || 500).json({ message:error.statusCode ? error.message : 'Tresorkontext konnte nicht geladen werden.' });
@@ -225,14 +227,11 @@ router.post('/safe-counts', async (req, res) => {
     const branch = await resolveBranch(client, req);
     await ensureBusinessDayOpen(client, branch.id);
     let countType;
-    let countedTotalCents;
     try {
       countType = validateSafeCountType(req.body?.countType);
-      countedTotalCents = countSafeCashCents(req.body?.counts);
     } catch (validationError) {
       throw Object.assign(validationError, { statusCode:400 });
     }
-    if (countedTotalCents <= 0) throw Object.assign(new Error('Bitte zähle den Tresor vollständig.'), { statusCode:400 });
     const counterPinId = verifyPinProof(req.body?.counterProofToken, branch.id);
     const recorderPinId = verifyPinProof(req.body?.recorderProofToken, branch.id);
     if (counterPinId === recorderPinId) throw Object.assign(new Error('Zählende und eingebende Person müssen zwei unterschiedliche Mitarbeiter sein.'), { statusCode:400 });
@@ -241,27 +240,57 @@ router.post('/safe-counts', async (req, res) => {
     if (!employeeById.has(counterPinId) || !employeeById.has(recorderPinId)) throw Object.assign(new Error('Mindestens eine bestätigte Person ist nicht mehr aktiv.'), { statusCode:409 });
     const context = await loadSafeContext(client, branch.id, countType);
     if (context.existingCount) throw Object.assign(new Error('Diese Tresorzählung wurde für heute bereits verbindlich abgeschlossen.'), { statusCode:409 });
-    if (context.recommendedSkimCents > 0 && req.body?.skimConfirmed !== true) {
-      throw Object.assign(new Error('Die berechnete Abschöpfung muss vor der Zählung ausdrücklich bestätigt werden.'), { statusCode:400 });
+    let validated;
+    try {
+      validated = validateSafeCountPayload(req.body, context.settings);
+    } catch (validationError) {
+      throw Object.assign(validationError, { statusCode:400 });
     }
-    const differenceCents = countedTotalCents - context.expectedBalanceCents;
+    let figures = validated.result;
+    let previousEveningCountId = null;
+    if (validated.mode === 'confirmation') {
+      const previous = context.previousEvening;
+      if (!previous || Number(previous.id) !== Number(req.body?.previousEveningCountId)) {
+        throw Object.assign(new Error('Die bestätigte Schlusszählung des Vortags wurde nicht gefunden.'), { statusCode:409 });
+      }
+      previousEveningCountId = previous.id;
+      figures = {
+        fixedDrawerCents:previous.fixedDrawerCents, littleBerthaCents:previous.littleBerthaCents,
+        looseMoneyCents:previous.looseMoneyCents, coinRollCounts:previous.coinRollCounts,
+        rollTotalCents:previous.rollTotalCents, banknoteCounts:previous.banknoteCounts,
+        banknoteTotalCents:previous.banknoteTotalCents, countedTotalCents:previous.countedTotalCents,
+      };
+    }
+    const labels = participantLabels(countType);
+    const legacyDifference = validated.differenceCents ?? 0;
     const result = await client.query(`INSERT INTO core.cash_safe_counts
       (branch_id,count_type,counter_pin_id,recorder_pin_id,previous_count_id,standard_balance_cents,
        base_balance_cents,added_loose_change_cents,balance_before_skim_cents,skimmed_cents,
-       expected_balance_cents,counted_total_cents,difference_cents,denomination_counts,created_by_user_id)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15)
+       expected_balance_cents,counted_total_cents,difference_cents,denomination_counts,created_by_user_id,
+       count_mode,previous_evening_count_id,fixed_drawer_cents,little_bertha_cents,loose_money_cents,
+       coin_roll_counts,coin_roll_total_cents,banknote_counts,banknote_total_cents,eurocontrol_total_cents,
+       first_employee_role,second_employee_role)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16,$17,$18,$19,$20,$21::jsonb,$22,$23::jsonb,$24,$25,$26,$27)
       RETURNING id,business_date,completed_at`, [
-      branch.id,countType,counterPinId,recorderPinId,context.previousCount?.id || null,
-      context.standardBalanceCents,context.baseBalanceCents,context.addedLooseChangeCents,
-      context.beforeSkimCents,context.recommendedSkimCents,context.expectedBalanceCents,
-      countedTotalCents,differenceCents,JSON.stringify(req.body.counts || {}),req.user.id,
+      branch.id,countType,counterPinId,recorderPinId,previousEveningCountId,
+      figures.fixedDrawerCents + figures.littleBerthaCents,figures.countedTotalCents,figures.looseMoneyCents,
+      figures.countedTotalCents,0,validated.eurocontrolTotalCents ?? figures.countedTotalCents,
+      figures.countedTotalCents,legacyDifference,JSON.stringify({ rolls:figures.coinRollCounts, notes:figures.banknoteCounts }),req.user.id,
+      validated.mode,previousEveningCountId,figures.fixedDrawerCents,figures.littleBerthaCents,figures.looseMoneyCents,
+      JSON.stringify(figures.coinRollCounts),figures.rollTotalCents,JSON.stringify(figures.banknoteCounts),
+      figures.banknoteTotalCents,validated.eurocontrolTotalCents,labels[0],labels[1],
     ]);
     await client.query('COMMIT');
     return res.status(201).json({ safeCount:{
       id:Number(result.rows[0].id), businessDate:result.rows[0].business_date, completedAt:result.rows[0].completed_at,
       branch:branch.name, countType, counter:{id:counterPinId,name:employeeById.get(counterPinId).display_name},
       recorder:{id:recorderPinId,name:employeeById.get(recorderPinId).display_name},
-      ...context, countedTotalCents, differenceCents, counts:req.body.counts || {}, status:'completed',
+      participants:[
+        {id:counterPinId,name:employeeById.get(counterPinId).display_name,role:labels[0]},
+        {id:recorderPinId,name:employeeById.get(recorderPinId).display_name,role:labels[1]},
+      ],
+      mode:validated.mode,previousEveningCountId,...figures,
+      eurocontrolTotalCents:validated.eurocontrolTotalCents,differenceCents:validated.differenceCents,status:'completed',
     } });
   } catch (error) {
     await client.query('ROLLBACK').catch(()=>{});
