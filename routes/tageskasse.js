@@ -7,6 +7,7 @@ const { findActivePinMatches } = require('../lib/employeePinIdentity');
 const { validateOpeningCount } = require('../lib/cashOpeningPolicy');
 const { validateCashClosing } = require('../lib/cashClosingPolicy');
 const { validateCashCorrection } = require('../lib/cashCorrectionPolicy');
+const { calculateSafeContext, countSafeCashCents, validateSafeCountType } = require('../lib/cashSafePolicy');
 const { canCorrectCashClosing, canUseCashModule, isCentralRole, resolveCashBranch } = require('../lib/cashModuleAccess');
 
 const router = express.Router();
@@ -114,6 +115,49 @@ function closingJson(row) {
   };
 }
 
+function safeCountJson(row) {
+  return {
+    id:Number(row.id), businessDate:row.business_date, countType:row.count_type,
+    counter:{ id:Number(row.counter_pin_id), name:row.counter_name },
+    recorder:{ id:Number(row.recorder_pin_id), name:row.recorder_name },
+    previousCountId:row.previous_count_id == null ? null : Number(row.previous_count_id),
+    standardBalanceCents:Number(row.standard_balance_cents), baseBalanceCents:Number(row.base_balance_cents),
+    addedLooseChangeCents:Number(row.added_loose_change_cents), beforeSkimCents:Number(row.balance_before_skim_cents),
+    skimmedCents:Number(row.skimmed_cents), expectedBalanceCents:Number(row.expected_balance_cents),
+    countedTotalCents:Number(row.counted_total_cents), differenceCents:Number(row.difference_cents),
+    counts:row.denomination_counts || {}, status:row.status, completedAt:row.completed_at,
+  };
+}
+
+async function loadSafeContext(client, branchId, countType) {
+  const settings = await client.query(`SELECT standard_balance_cents FROM core.cash_safe_settings WHERE branch_id=$1`, [branchId]);
+  if (!settings.rows[0]) throw Object.assign(new Error('Für diese Filiale ist noch kein Tresor-Standardbestand hinterlegt.'), { statusCode:409 });
+  const previous = await client.query(`SELECT id,counted_total_cents,completed_at,count_type
+    FROM core.cash_safe_counts WHERE branch_id=$1 ORDER BY completed_at DESC,id DESC LIMIT 1`, [branchId]);
+  const previousRow = previous.rows[0] || null;
+  const loose = await client.query(`SELECT COALESCE(SUM(loose_change_cents),0)::bigint AS cents
+    FROM core.cash_drawer_closings
+    WHERE branch_id=$1 AND record_kind='original'
+      AND closed_at > COALESCE($2::timestamptz,(((CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Berlin')::date)::timestamp AT TIME ZONE 'Europe/Berlin'))`,
+  [branchId,previousRow?.completed_at || null]);
+  const calculated = calculateSafeContext({
+    standardBalanceCents:Number(settings.rows[0].standard_balance_cents),
+    previousCountedCents:previousRow ? Number(previousRow.counted_total_cents) : null,
+    addedLooseChangeCents:Number(loose.rows[0].cents),
+  });
+  const existing = await client.query(`SELECT c.*,counter.display_name AS counter_name,recorder.display_name AS recorder_name
+    FROM core.cash_safe_counts c
+    JOIN core.filiale_pins counter ON counter.id=c.counter_pin_id
+    JOIN core.filiale_pins recorder ON recorder.id=c.recorder_pin_id
+    WHERE c.branch_id=$1 AND c.business_date=((CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Berlin')::date) AND c.count_type=$2
+    LIMIT 1`, [branchId,countType]);
+  return {
+    ...calculated,
+    previousCount:previousRow ? { id:Number(previousRow.id), countedTotalCents:Number(previousRow.counted_total_cents), completedAt:previousRow.completed_at, countType:previousRow.count_type } : null,
+    existingCount:existing.rows[0] ? safeCountJson(existing.rows[0]) : null,
+  };
+}
+
 router.get('/branches', async (req, res) => {
   try {
     if (!canUseCashModule(req.user)) return res.status(403).json({ message: 'Die Tageskassenabrechnung ist während der DEV-Phase nicht freigegeben.' });
@@ -141,6 +185,90 @@ router.get('/employees', async (req, res) => {
     console.error('GET /api/tageskasse/employees Fehler:', error);
     return res.status(error.statusCode || 500).json({ message: error.statusCode ? error.message : 'Mitarbeiter konnten nicht geladen werden.' });
   }
+});
+
+router.get('/safe-counts/context', async (req, res) => {
+  try {
+    let countType;
+    try { countType = validateSafeCountType(req.query?.type); }
+    catch (validationError) { throw Object.assign(validationError, { statusCode:400 }); }
+    const branch = await resolveBranch(pool, req);
+    await ensureBusinessDayOpen(pool, branch.id);
+    const context = await loadSafeContext(pool, branch.id, countType);
+    return res.json({ branch:branch.name, countType, context });
+  } catch (error) {
+    console.error('GET /api/tageskasse/safe-counts/context Fehler:', error);
+    return res.status(error.statusCode || 500).json({ message:error.statusCode ? error.message : 'Tresorkontext konnte nicht geladen werden.' });
+  }
+});
+
+router.get('/safe-counts', async (req, res) => {
+  try {
+    const branch = await resolveBranch(pool, req);
+    const result = await pool.query(`SELECT c.*,counter.display_name AS counter_name,recorder.display_name AS recorder_name
+      FROM core.cash_safe_counts c
+      JOIN core.filiale_pins counter ON counter.id=c.counter_pin_id
+      JOIN core.filiale_pins recorder ON recorder.id=c.recorder_pin_id
+      WHERE c.branch_id=$1 AND c.business_date=((CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Berlin')::date)
+      ORDER BY c.completed_at,c.id`, [branch.id]);
+    return res.json({ branch:branch.name, counts:result.rows.map(safeCountJson) });
+  } catch (error) {
+    console.error('GET /api/tageskasse/safe-counts Fehler:', error);
+    return res.status(error.statusCode || 500).json({ message:error.statusCode ? error.message : 'Tresorzählungen konnten nicht geladen werden.' });
+  }
+});
+
+router.post('/safe-counts', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const branch = await resolveBranch(client, req);
+    await ensureBusinessDayOpen(client, branch.id);
+    let countType;
+    let countedTotalCents;
+    try {
+      countType = validateSafeCountType(req.body?.countType);
+      countedTotalCents = countSafeCashCents(req.body?.counts);
+    } catch (validationError) {
+      throw Object.assign(validationError, { statusCode:400 });
+    }
+    if (countedTotalCents <= 0) throw Object.assign(new Error('Bitte zähle den Tresor vollständig.'), { statusCode:400 });
+    const counterPinId = verifyPinProof(req.body?.counterProofToken, branch.id);
+    const recorderPinId = verifyPinProof(req.body?.recorderProofToken, branch.id);
+    if (counterPinId === recorderPinId) throw Object.assign(new Error('Zählende und eingebende Person müssen zwei unterschiedliche Mitarbeiter sein.'), { statusCode:400 });
+    const employees = await client.query(`SELECT id,display_name FROM core.filiale_pins WHERE id=ANY($1::bigint[]) AND is_active=true`, [[counterPinId,recorderPinId]]);
+    const employeeById = new Map(employees.rows.map((row)=>[Number(row.id),row]));
+    if (!employeeById.has(counterPinId) || !employeeById.has(recorderPinId)) throw Object.assign(new Error('Mindestens eine bestätigte Person ist nicht mehr aktiv.'), { statusCode:409 });
+    const context = await loadSafeContext(client, branch.id, countType);
+    if (context.existingCount) throw Object.assign(new Error('Diese Tresorzählung wurde für heute bereits verbindlich abgeschlossen.'), { statusCode:409 });
+    if (context.recommendedSkimCents > 0 && req.body?.skimConfirmed !== true) {
+      throw Object.assign(new Error('Die berechnete Abschöpfung muss vor der Zählung ausdrücklich bestätigt werden.'), { statusCode:400 });
+    }
+    const differenceCents = countedTotalCents - context.expectedBalanceCents;
+    const result = await client.query(`INSERT INTO core.cash_safe_counts
+      (branch_id,count_type,counter_pin_id,recorder_pin_id,previous_count_id,standard_balance_cents,
+       base_balance_cents,added_loose_change_cents,balance_before_skim_cents,skimmed_cents,
+       expected_balance_cents,counted_total_cents,difference_cents,denomination_counts,created_by_user_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15)
+      RETURNING id,business_date,completed_at`, [
+      branch.id,countType,counterPinId,recorderPinId,context.previousCount?.id || null,
+      context.standardBalanceCents,context.baseBalanceCents,context.addedLooseChangeCents,
+      context.beforeSkimCents,context.recommendedSkimCents,context.expectedBalanceCents,
+      countedTotalCents,differenceCents,JSON.stringify(req.body.counts || {}),req.user.id,
+    ]);
+    await client.query('COMMIT');
+    return res.status(201).json({ safeCount:{
+      id:Number(result.rows[0].id), businessDate:result.rows[0].business_date, completedAt:result.rows[0].completed_at,
+      branch:branch.name, countType, counter:{id:counterPinId,name:employeeById.get(counterPinId).display_name},
+      recorder:{id:recorderPinId,name:employeeById.get(recorderPinId).display_name},
+      ...context, countedTotalCents, differenceCents, counts:req.body.counts || {}, status:'completed',
+    } });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(()=>{});
+    console.error('POST /api/tageskasse/safe-counts Fehler:', error);
+    const duplicate = error.code === '23505' && String(error.constraint || '').includes('cash_safe_counts_slot');
+    return res.status(duplicate ? 409 : (error.statusCode || 500)).json({ message:duplicate ? 'Diese Tresorzählung wurde für heute bereits abgeschlossen.' : (error.statusCode ? error.message : 'Die Tresorzählung konnte nicht gespeichert werden.') });
+  } finally { client.release(); }
 });
 
 router.get('/closings', async (req, res) => {

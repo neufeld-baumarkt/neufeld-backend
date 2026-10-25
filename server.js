@@ -224,7 +224,7 @@ async function startServer() {
   await runCashOpeningMigration(pool);
   await runEmployeePinMigration(pool);
   await runCashClosingMigration(pool);
-  console.log('✅ Datenbankschema für Einzählung und Abrechnung ist bereit');
+  console.log('✅ Datenbankschema für Einzählung, Abrechnung und Tresorzählung ist bereit');
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`✅ Backend läuft auf Port ${PORT} (0.0.0.0)`);
