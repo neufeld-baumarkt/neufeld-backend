@@ -8,6 +8,7 @@ const { validateOpeningCount } = require('../lib/cashOpeningPolicy');
 const { validateCashClosing } = require('../lib/cashClosingPolicy');
 const { validateCashCorrection } = require('../lib/cashCorrectionPolicy');
 const { requireOpeningReplacement } = require('../lib/cashDrawerSessionPolicy');
+const { calculateBusinessDayTotals, validateBusinessDayFinalization } = require('../lib/cashBusinessDayPolicy');
 const { participantLabels, validateSafeCountPayload, validateSafeCountType } = require('../lib/cashSafePolicy');
 const { canCorrectCashClosing, canUseCashModule, isCentralRole, resolveCashBranch } = require('../lib/cashModuleAccess');
 
@@ -40,10 +41,12 @@ async function resolveBranch(client, req) {
 }
 
 async function ensureBusinessDayOpen(client, branchId, businessDate = null) {
-  const result = await client.query(`INSERT INTO core.cash_business_days (branch_id,business_date)
+  await client.query(`INSERT INTO core.cash_business_days (branch_id,business_date)
     VALUES ($1,COALESCE($2::date,(CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Berlin')::date))
-    ON CONFLICT (branch_id,business_date) DO UPDATE SET branch_id=EXCLUDED.branch_id
-    RETURNING id,business_date,status`, [branchId,businessDate]);
+    ON CONFLICT (branch_id,business_date) DO NOTHING`, [branchId,businessDate]);
+  const result = await client.query(`SELECT id,business_date,status,finalized_at,final_report
+    FROM core.cash_business_days
+    WHERE branch_id=$1 AND business_date=COALESCE($2::date,(CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Berlin')::date)`, [branchId,businessDate]);
   if (result.rows[0].status !== 'open') {
     throw Object.assign(new Error('Dieser Geschäftstag wurde bereits verbindlich abgeschlossen und ist vollständig Read-only.'), { statusCode:409 });
   }
@@ -137,6 +140,7 @@ function safeCountJson(row) {
       { id:Number(row.recorder_pin_id), name:row.recorder_name, role:row.second_employee_role },
     ],
     mode:row.count_mode || 'full_count',
+    previousCountId:row.previous_count_id == null ? null : Number(row.previous_count_id),
     previousEveningCountId:row.previous_evening_count_id == null ? null : Number(row.previous_evening_count_id),
     fixedDrawerCents:Number(row.fixed_drawer_cents || 0), littleBerthaCents:Number(row.little_bertha_cents || 0),
     looseMoneyCents:Number(row.loose_money_cents || 0), coinRollCounts:row.coin_roll_counts || {},
@@ -164,11 +168,80 @@ async function loadSafeContext(client, branchId, countType) {
     JOIN core.filiale_pins counter ON counter.id=c.counter_pin_id
     JOIN core.filiale_pins recorder ON recorder.id=c.recorder_pin_id
     WHERE c.branch_id=$1 AND c.business_date=((CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Berlin')::date) AND c.count_type=$2
-    LIMIT 1`, [branchId,countType]);
+    ORDER BY c.completed_at DESC,c.id DESC LIMIT 1`, [branchId,countType]);
   return {
     settings:{ fixedDrawerCents:Number(settings.rows[0].fixed_drawer_cents), littleBerthaCents:Number(settings.rows[0].little_bertha_cents) },
     previousEvening:previous.rows[0] ? safeCountJson(previous.rows[0]) : null,
     existingCount:existing.rows[0] ? safeCountJson(existing.rows[0]) : null,
+  };
+}
+
+async function loadBusinessDayCloseContext(client, branch, businessDay) {
+  const date = businessDay.business_date;
+  const [settingsResult, baseSafeResult, finalSafeResult] = await Promise.all([
+    client.query('SELECT standard_balance_cents FROM core.cash_safe_settings WHERE branch_id=$1', [branch.id]),
+    client.query(`SELECT c.*,counter.display_name AS counter_name,recorder.display_name AS recorder_name
+      FROM core.cash_safe_counts c
+      JOIN core.filiale_pins counter ON counter.id=c.counter_pin_id
+      JOIN core.filiale_pins recorder ON recorder.id=c.recorder_pin_id
+      WHERE c.branch_id=$1 AND (c.business_date<$2 OR (c.business_date=$2 AND c.count_type IN ('morning','handover')))
+      ORDER BY c.completed_at DESC,c.id DESC LIMIT 1`, [branch.id,date]),
+    client.query(`SELECT c.*,counter.display_name AS counter_name,recorder.display_name AS recorder_name
+      FROM core.cash_safe_counts c
+      JOIN core.filiale_pins counter ON counter.id=c.counter_pin_id
+      JOIN core.filiale_pins recorder ON recorder.id=c.recorder_pin_id
+      WHERE c.branch_id=$1 AND c.business_date=$2 AND c.count_type='closing'
+      ORDER BY c.completed_at DESC,c.id DESC LIMIT 1`, [branch.id,date]),
+  ]);
+  const baseSafe = baseSafeResult.rows[0] || null;
+  const [closingResult, openingResult, looseResult, lastCashResult] = await Promise.all([
+    client.query(`SELECT c.*,responsible.display_name AS responsible_employee_name,
+        closer.display_name AS closed_by_name,day.status AS business_day_status,
+        false AS superseded
+      FROM core.cash_drawer_closings c
+      JOIN core.filiale_pins responsible ON responsible.id=c.employee_pin_id
+      LEFT JOIN core.filiale_pins closer ON closer.id=COALESCE(c.closed_by_pin_id,c.employee_pin_id)
+      LEFT JOIN core.cash_business_days day ON day.branch_id=c.branch_id AND day.business_date=c.business_date
+      WHERE c.branch_id=$1 AND c.business_date=$2
+        AND NOT EXISTS (SELECT 1 FROM core.cash_drawer_closings newer WHERE newer.corrects_closing_id=c.id)
+      ORDER BY c.closed_at,c.id`, [branch.id,date]),
+    client.query(`SELECT o.*,employee.display_name AS employee_name,final_counter.display_name AS final_counter_name
+      FROM core.cash_drawer_opening_counts o
+      JOIN core.filiale_pins employee ON employee.id=o.employee_pin_id
+      JOIN core.filiale_pins final_counter ON final_counter.id=o.final_counter_pin_id
+      WHERE o.branch_id=$1 AND o.business_date=$2
+      ORDER BY o.completed_at,o.id`, [branch.id,date]),
+    client.query(`SELECT COALESCE(SUM(c.loose_change_cents),0)::bigint AS total
+      FROM core.cash_drawer_closings c
+      WHERE c.branch_id=$1 AND c.business_date=$2 AND c.record_kind='original'
+        AND ($3::timestamptz IS NULL OR c.closed_at>$3::timestamptz)`, [branch.id,date,baseSafe?.completed_at || null]),
+    client.query(`SELECT MAX(closed_at) AS latest FROM core.cash_drawer_closings
+      WHERE branch_id=$1 AND business_date=$2 AND record_kind='original'`, [branch.id,date]),
+  ]);
+  const settings = settingsResult.rows[0];
+  if (!settings) throw Object.assign(new Error('Für diese Filiale ist kein Tresor-Standardbestand hinterlegt.'), { statusCode:409 });
+  const finalSafeRow = finalSafeResult.rows[0] || null;
+  const closings = closingResult.rows.map(closingJson);
+  const openings = openingResult.rows.map(openingJson);
+  const standardBalanceCents = Number(settings.standard_balance_cents);
+  const totals = calculateBusinessDayTotals({
+    closings,
+    standardBalanceCents,
+    baseSafeCountCents:baseSafe ? Number(baseSafe.counted_total_cents) : standardBalanceCents,
+    looseAfterBaseCents:Number(looseResult.rows[0]?.total || 0),
+  });
+  const latestCashAt = lastCashResult.rows[0]?.latest || null;
+  const finalSafeCount = finalSafeRow ? safeCountJson(finalSafeRow) : null;
+  return {
+    branch:branch.name, businessDate:date, businessDayStatus:businessDay.status,
+    closings, openings,
+    activeOpenings:openings.filter((item)=>item.lifecycleStatus==='active'),
+    replacedOpenings:openings.filter((item)=>item.lifecycleStatus==='replaced'),
+    baseSafeCount:baseSafe ? safeCountJson(baseSafe) : null,
+    finalSafeCount,
+    finalSafeCountIsCurrent:Boolean(finalSafeCount && (!latestCashAt || new Date(finalSafeCount.completedAt)>=new Date(latestCashAt))),
+    latestCashAt,
+    totals,
   };
 }
 
@@ -251,7 +324,8 @@ router.post('/safe-counts', async (req, res) => {
     const employeeById = new Map(employees.rows.map((row)=>[Number(row.id),row]));
     if (!employeeById.has(counterPinId) || !employeeById.has(recorderPinId)) throw Object.assign(new Error('Mindestens eine bestätigte Person ist nicht mehr aktiv.'), { statusCode:409 });
     const context = await loadSafeContext(client, branch.id, countType);
-    if (context.existingCount) throw Object.assign(new Error('Diese Tresorzählung wurde für heute bereits verbindlich abgeschlossen.'), { statusCode:409 });
+    const repeatClosing = countType === 'closing' && context.existingCount && req.body?.repeatClosingConfirmed === true;
+    if (context.existingCount && !repeatClosing) throw Object.assign(new Error('Diese Tresorzählung wurde für heute bereits verbindlich abgeschlossen.'), { statusCode:409 });
     let validated;
     try {
       validated = validateSafeCountPayload(req.body, context.settings);
@@ -260,12 +334,14 @@ router.post('/safe-counts', async (req, res) => {
     }
     let figures = validated.result;
     let previousEveningCountId = null;
+    let previousCountId = repeatClosing ? context.existingCount.id : null;
     if (validated.mode === 'confirmation') {
       const previous = context.previousEvening;
       if (!previous || Number(previous.id) !== Number(req.body?.previousEveningCountId)) {
         throw Object.assign(new Error('Die bestätigte Schlusszählung des Vortags wurde nicht gefunden.'), { statusCode:409 });
       }
       previousEveningCountId = previous.id;
+      previousCountId = previous.id;
       figures = {
         fixedDrawerCents:previous.fixedDrawerCents, littleBerthaCents:previous.littleBerthaCents,
         looseMoneyCents:previous.looseMoneyCents, coinRollCounts:previous.coinRollCounts,
@@ -284,7 +360,7 @@ router.post('/safe-counts', async (req, res) => {
        first_employee_role,second_employee_role)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16,$17,$18,$19,$20,$21::jsonb,$22,$23::jsonb,$24,$25,$26,$27)
       RETURNING id,business_date,completed_at`, [
-      branch.id,countType,counterPinId,recorderPinId,previousEveningCountId,
+      branch.id,countType,counterPinId,recorderPinId,previousCountId,
       figures.fixedDrawerCents + figures.littleBerthaCents,figures.countedTotalCents,figures.looseMoneyCents,
       figures.countedTotalCents,0,validated.eurocontrolTotalCents ?? figures.countedTotalCents,
       figures.countedTotalCents,legacyDifference,JSON.stringify({ rolls:figures.coinRollCounts, notes:figures.banknoteCounts }),req.user.id,
@@ -310,6 +386,85 @@ router.post('/safe-counts', async (req, res) => {
     const duplicate = error.code === '23505' && String(error.constraint || '').includes('cash_safe_counts_slot');
     return res.status(duplicate ? 409 : (error.statusCode || 500)).json({ message:duplicate ? 'Diese Tresorzählung wurde für heute bereits abgeschlossen.' : (error.statusCode ? error.message : 'Die Tresorzählung konnte nicht gespeichert werden.') });
   } finally { client.release(); }
+});
+
+router.get('/day-close/context', async (req, res) => {
+  try {
+    const branch = await resolveBranch(pool, req);
+    const businessDay = await ensureBusinessDayOpen(pool, branch.id);
+    const context = await loadBusinessDayCloseContext(pool, branch, businessDay);
+    return res.json({ context });
+  } catch (error) {
+    console.error('GET /api/tageskasse/day-close/context Fehler:', error);
+    return res.status(error.statusCode || 500).json({ message:error.statusCode ? error.message : 'Der Tagesabschluss konnte nicht vorbereitet werden.' });
+  }
+});
+
+router.post('/day-close/finalize', async (req, res) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const branch = await resolveBranch(client, req);
+    const businessDay = await ensureBusinessDayOpen(client, branch.id);
+    await client.query('SELECT pg_advisory_xact_lock($1,$2)', [branch.id,424242]);
+    const lockedDay = await client.query('SELECT * FROM core.cash_business_days WHERE id=$1 FOR UPDATE', [businessDay.id]);
+    if (lockedDay.rows[0].status !== 'open') throw Object.assign(new Error('Dieser Geschäftstag wurde bereits verbindlich abgeschlossen.'), { statusCode:409 });
+    const context = await loadBusinessDayCloseContext(client, branch, lockedDay.rows[0]);
+    try { validateBusinessDayFinalization(req.body || {}, context); }
+    catch (validationError) { throw Object.assign(validationError, { statusCode:400 }); }
+    const finalizedAt = new Date().toISOString();
+    const report = {
+      branch:branch.name, businessDate:context.businessDate, finalizedAt,
+      totals:context.totals,
+      closings:context.closings,
+      replacedOpenings:context.replacedOpenings,
+      finalSafeCount:context.finalSafeCount,
+      eurocontrolCashTotalCents:Number(req.body.eurocontrolCashTotalCents),
+      bankPayoutConfirmed:true, safeBagConfirmed:true,
+    };
+    const result = await client.query(`UPDATE core.cash_business_days
+      SET status='finalized',finalized_at=$1,finalized_by_user_id=$2,final_report=$3::jsonb
+      WHERE id=$4 AND status='open'
+      RETURNING id,business_date,status,finalized_at,final_report`, [finalizedAt,req.user.id,JSON.stringify(report),businessDay.id]);
+    if (!result.rows[0]) throw Object.assign(new Error('Der Geschäftstag wurde zwischenzeitlich bereits abgeschlossen.'), { statusCode:409 });
+    await client.query('COMMIT');
+    return res.status(201).json({ report:result.rows[0].final_report });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(()=>{});
+    console.error('POST /api/tageskasse/day-close/finalize Fehler:', error);
+    return res.status(error.statusCode || 500).json({ message:error.statusCode ? error.message : 'Der Geschäftstag konnte nicht abgeschlossen werden.' });
+  } finally { client.release(); }
+});
+
+router.get('/business-days', async (req, res) => {
+  try {
+    const branch = await resolveBranch(pool, req);
+    const result = await pool.query(`SELECT business_date,status,finalized_at,final_report
+      FROM core.cash_business_days WHERE branch_id=$1 AND status='finalized'
+      ORDER BY business_date DESC LIMIT 120`, [branch.id]);
+    return res.json({ days:result.rows.map((row)=>({
+      businessDate:row.business_date,status:row.status,finalizedAt:row.finalized_at,
+      totals:row.final_report?.totals || {}, closingCount:Array.isArray(row.final_report?.closings) ? row.final_report.closings.length : 0,
+    })) });
+  } catch (error) {
+    console.error('GET /api/tageskasse/business-days Fehler:', error);
+    return res.status(error.statusCode || 500).json({ message:error.statusCode ? error.message : 'Abgeschlossene Geschäftstage konnten nicht geladen werden.' });
+  }
+});
+
+router.get('/business-days/:date', async (req, res) => {
+  try {
+    const businessDate = String(req.params.date || '');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(businessDate)) return res.status(400).json({ message:'Das Datum ist ungültig.' });
+    const branch = await resolveBranch(pool, req);
+    const result = await pool.query(`SELECT final_report FROM core.cash_business_days
+      WHERE branch_id=$1 AND business_date=$2 AND status='finalized'`, [branch.id,businessDate]);
+    if (!result.rows[0]) return res.status(404).json({ message:'Für dieses Datum wurde kein abgeschlossener Tagesbericht gefunden.' });
+    return res.json({ report:result.rows[0].final_report });
+  } catch (error) {
+    console.error('GET /api/tageskasse/business-days/:date Fehler:', error);
+    return res.status(error.statusCode || 500).json({ message:error.statusCode ? error.message : 'Der Tagesbericht konnte nicht geladen werden.' });
+  }
 });
 
 router.get('/closings', async (req, res) => {
@@ -415,7 +570,12 @@ router.get('/previous-closing', async (req, res) => {
 router.get('/day-overview', async (req, res) => {
   try {
     const branch = await resolveBranch(pool, req);
-    const businessDay = await ensureBusinessDayOpen(pool, branch.id);
+    await pool.query(`INSERT INTO core.cash_business_days (branch_id,business_date)
+      VALUES ($1,(CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Berlin')::date)
+      ON CONFLICT (branch_id,business_date) DO NOTHING`, [branch.id]);
+    const dayResult = await pool.query(`SELECT id,business_date,status,finalized_at,final_report
+      FROM core.cash_business_days WHERE branch_id=$1 AND business_date=(CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Berlin')::date`, [branch.id]);
+    const businessDay = dayResult.rows[0];
     const [openings, closings] = await Promise.all([
       pool.query(`SELECT o.*,employee.display_name AS employee_name,final_counter.display_name AS final_counter_name
         FROM core.cash_drawer_opening_counts o
@@ -435,6 +595,7 @@ router.get('/day-overview', async (req, res) => {
     ]);
     return res.json({
       branch:branch.name, businessDate:businessDay.business_date, businessDayStatus:businessDay.status,
+      finalizedAt:businessDay.finalized_at || null, finalReport:businessDay.final_report || null,
       openings:openings.rows.map(openingJson), closings:closings.rows.map(closingJson),
       canCorrect:canCorrectCashClosing(req.user?.role),
     });
