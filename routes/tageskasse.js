@@ -185,8 +185,8 @@ async function loadBusinessDayCloseContext(client, branch, businessDay) {
       FROM core.cash_safe_counts c
       JOIN core.filiale_pins counter ON counter.id=c.counter_pin_id
       JOIN core.filiale_pins recorder ON recorder.id=c.recorder_pin_id
-      WHERE c.branch_id=$1 AND (c.business_date<$2 OR (c.business_date=$2 AND c.count_type IN ('morning','handover')))
-      ORDER BY c.completed_at DESC,c.id DESC LIMIT 1`, [branch.id,date]),
+      WHERE c.branch_id=$1 AND ((c.business_date<$2 AND c.count_type='closing') OR (c.business_date=$2 AND c.count_type='morning'))
+      ORDER BY c.business_date DESC,c.completed_at DESC,c.id DESC LIMIT 1`, [branch.id,date]),
     client.query(`SELECT c.*,counter.display_name AS counter_name,recorder.display_name AS recorder_name
       FROM core.cash_safe_counts c
       JOIN core.filiale_pins counter ON counter.id=c.counter_pin_id
@@ -426,6 +426,8 @@ router.post('/day-close/finalize', async (req, res) => {
       replacedOpenings:context.replacedOpenings,
       finalSafeCount:context.finalSafeCount,
       eurocontrolCashTotalCents:Number(req.body.eurocontrolCashTotalCents),
+      looseChangePayoutConfirmed:context.totals.looseChangePayoutCents === 0 || req.body.looseChangePayoutConfirmed === true,
+      additionalSafeSkimConfirmed:context.totals.additionalSafeSkimCents === 0 || req.body.additionalSafeSkimConfirmed === true,
       bankPayoutConfirmed:true, safeBagConfirmed:true,
     };
     const result = await client.query(`UPDATE core.cash_business_days
