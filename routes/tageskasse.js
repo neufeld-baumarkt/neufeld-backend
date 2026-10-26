@@ -12,6 +12,7 @@ const { calculateBusinessDayTotals, validateBusinessDayFinalization } = require(
 const { participantLabels, validateSafeCountPayload, validateSafeCountType } = require('../lib/cashSafePolicy');
 const { canCorrectCashClosing, canUseCashModule, isCentralRole, resolveCashBranch } = require('../lib/cashModuleAccess');
 const { resolveCashBusinessDate } = require('../lib/cashBusinessDatePolicy');
+const { visibleCashEmployees } = require('../lib/cashEmployeeVisibility');
 
 const router = express.Router();
 const PIN_PROOF_TTL_SECONDS = 10 * 60;
@@ -265,10 +266,11 @@ router.get('/branches', async (req, res) => {
 
 router.get('/employees', async (req, res) => {
   try {
-    await resolveBranch(pool, req);
-    const result = await pool.query(`SELECT id,display_name FROM core.filiale_pins
+    const branch = await resolveBranch(pool, req);
+    const result = await pool.query(`SELECT id,display_name,filiale_id FROM core.filiale_pins
       WHERE is_active=true ORDER BY LOWER(display_name),id`);
-    return res.json({ employees: result.rows.map((row)=>({ id:Number(row.id), name:row.display_name })) });
+    return res.json({ employees: visibleCashEmployees(result.rows, branch.id)
+      .map((row)=>({ id:Number(row.id), name:row.display_name })) });
   } catch (error) {
     console.error('GET /api/tageskasse/employees Fehler:', error);
     return res.status(error.statusCode || 500).json({ message: error.statusCode ? error.message : 'Mitarbeiter konnten nicht geladen werden.' });
