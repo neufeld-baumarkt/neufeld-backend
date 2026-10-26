@@ -13,6 +13,7 @@ const { participantLabels, validateSafeCountPayload, validateSafeCountType } = r
 const { canCorrectCashClosing, canUseCashModule, isCentralRole, resolveCashBranch } = require('../lib/cashModuleAccess');
 const { resolveCashBusinessDate } = require('../lib/cashBusinessDatePolicy');
 const { visibleCashEmployees } = require('../lib/cashEmployeeVisibility');
+const { validateDepositReceipt } = require('../lib/depositReceiptPolicy');
 
 const router = express.Router();
 // A complete physical recount can legitimately take longer than ten minutes.
@@ -21,6 +22,10 @@ const PIN_PROOF_TTL_SECONDS = 2 * 60 * 60;
 const attemptsByActor = new Map();
 
 router.use(verifyToken());
+router.use('/deposit-receipts', (_req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store');
+  next();
+});
 
 function pinRateKey(req) {
   return `${req.user?.id || 'unknown'}:${req.ip || 'unknown'}`;
@@ -38,6 +43,33 @@ function consumePinAttempt(req) {
 
 function clearPinAttempts(req) {
   attemptsByActor.delete(pinRateKey(req));
+}
+
+function receiptBusinessDayIds(value) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 20) return null;
+  const ids = value.map(Number);
+  const uniqueIds = [...new Set(ids)];
+  return uniqueIds.length === ids.length && ids.every((id) => Number.isSafeInteger(id) && id > 0)
+    ? ids
+    : null;
+}
+
+async function verifyReceiptEmployee(client, pinValue) {
+  const pin = String(pinValue || '').trim();
+  if (!/^\d{4}$/.test(pin)) {
+    throw Object.assign(new Error('Der Mitarbeiter-PIN muss genau vier Ziffern haben.'), { statusCode:400 });
+  }
+  if (pin === '0000') {
+    throw Object.assign(new Error('Bitte zuerst einen persönlichen PIN festlegen.'), { statusCode:409 });
+  }
+  const candidates = await client.query(`SELECT id,display_name,pin_hash,must_change_pin,locked_until
+    FROM core.filiale_pins WHERE is_active=true ORDER BY id`);
+  const matches = await findActivePinMatches(candidates.rows, pin, bcrypt.compare);
+  if (matches.length > 1) {
+    throw Object.assign(new Error('Dieser PIN ist nicht eindeutig. Bitte die PIN-Verwaltung öffnen.'), { statusCode:409 });
+  }
+  if (!matches[0]) throw Object.assign(new Error('PIN ungültig.'), { statusCode:401 });
+  return { id:Number(matches[0].id), name:matches[0].display_name };
 }
 
 async function resolveBranch(client, req) {
@@ -445,6 +477,120 @@ router.post('/day-close/finalize', async (req, res) => {
     await client.query('ROLLBACK').catch(()=>{});
     console.error('POST /api/tageskasse/day-close/finalize Fehler:', error);
     return res.status(error.statusCode || 500).json({ message:error.statusCode ? error.message : 'Der Geschäftstag konnte nicht abgeschlossen werden.' });
+  } finally { client.release(); }
+});
+
+router.get('/deposit-receipts/open', async (req, res) => {
+  try {
+    if (!canUseCashModule(req.user)) {
+      return res.status(403).json({ message:'Die Tageskassenabrechnung ist während der DEV-Phase nicht freigegeben.' });
+    }
+    const branch = await resolveBranch(pool, req);
+    const result = await pool.query(`SELECT day.id,
+        TO_CHAR(day.business_date,'YYYY-MM-DD') AS business_date,
+        COALESCE((day.final_report->'totals'->>'bankPayoutCents')::bigint,0) AS expected_deposit_cents
+      FROM core.cash_business_days day
+      WHERE day.branch_id=$1 AND day.status='finalized'
+        AND COALESCE((day.final_report->'totals'->>'bankPayoutCents')::bigint,0)>0
+        AND NOT EXISTS (
+          SELECT 1 FROM core.cash_deposit_receipt_business_days link
+          WHERE link.business_day_id=day.id
+        )
+      ORDER BY day.business_date,day.id`, [branch.id]);
+    return res.json({
+      branch:branch.name,
+      closings:result.rows.map((row) => ({
+        id:Number(row.id),
+        businessDate:row.business_date,
+        expectedDepositCents:Number(row.expected_deposit_cents),
+      })),
+    });
+  } catch (error) {
+    console.error('GET /api/tageskasse/deposit-receipts/open Fehler:', error);
+    return res.status(error.statusCode || 500).json({
+      message:error.statusCode ? error.message : 'Offene Einzahlungsbelege konnten nicht geladen werden.',
+    });
+  }
+});
+
+router.post('/deposit-receipts/confirm', async (req, res) => {
+  if (!canUseCashModule(req.user)) {
+    return res.status(403).json({ message:'Die Tageskassenabrechnung ist während der DEV-Phase nicht freigegeben.' });
+  }
+  const ids = receiptBusinessDayIds(req.body?.closingIds);
+  const validation = validateDepositReceipt(req.body || {});
+  if (!ids) validation.errors.unshift('Mindestens ein gültiger Tagesabschluss muss ausgewählt werden.');
+  if (validation.errors.length) return res.status(400).json({ message:validation.errors.join(' ') });
+  if (!consumePinAttempt(req)) return res.status(429).json({ message:'Zu viele PIN-Versuche. Bitte 15 Minuten warten.' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const branch = await resolveBranch(client, req);
+    const employee = await verifyReceiptEmployee(client, req.body?.pin);
+    const days = await client.query(`SELECT day.id,
+        TO_CHAR(day.business_date,'YYYY-MM-DD') AS business_date,
+        COALESCE((day.final_report->'totals'->>'bankPayoutCents')::bigint,0) AS expected_deposit_cents
+      FROM core.cash_business_days day
+      WHERE day.id=ANY($1::bigint[]) AND day.branch_id=$2 AND day.status='finalized'
+      ORDER BY day.business_date,day.id FOR UPDATE`, [ids,branch.id]);
+    if (days.rows.length !== ids.length) {
+      throw Object.assign(new Error('Mindestens ein ausgewählter Tagesabschluss ist nicht verfügbar.'), { statusCode:409 });
+    }
+    const linked = await client.query(`SELECT business_day_id
+      FROM core.cash_deposit_receipt_business_days
+      WHERE business_day_id=ANY($1::bigint[])`, [ids]);
+    if (linked.rowCount) {
+      throw Object.assign(new Error('Mindestens ein Tagesabschluss besitzt bereits einen Einzahlungsbeleg.'), { statusCode:409 });
+    }
+    const expectedTotalCents = days.rows.reduce((sum, row) => sum + Number(row.expected_deposit_cents), 0);
+    if (expectedTotalCents !== validation.normalized.receiptTotalCents) {
+      throw Object.assign(new Error('Belegsumme und ausgewählte Tagesabschlüsse stimmen nicht überein.'), { statusCode:409 });
+    }
+    const receipt = await client.query(`INSERT INTO core.cash_deposit_receipts
+      (branch_id,deposit_date,deposit_time,transaction_number,terminal_number,purpose,
+       banknote_counts,receipt_total_cents,ocr_confidence,archive_mode,
+       confirmed_by_pin_id,confirmed_by_name,image_retained)
+      VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,'manual_onedrive',$10,$11,false)
+      RETURNING id,deposit_date,deposit_time,transaction_number,terminal_number,purpose,
+        banknote_counts,receipt_total_cents,ocr_confidence,archive_mode,
+        confirmed_by_name,confirmed_at,image_retained`, [
+      branch.id,
+      validation.normalized.depositDate,
+      validation.normalized.depositTime,
+      validation.normalized.transactionNumber,
+      validation.normalized.terminalNumber,
+      validation.normalized.purpose,
+      JSON.stringify(validation.normalized.banknoteCounts),
+      validation.normalized.receiptTotalCents,
+      validation.normalized.ocrConfidence,
+      employee.id,
+      employee.name,
+    ]);
+    for (const id of ids) {
+      await client.query(`INSERT INTO core.cash_deposit_receipt_business_days (receipt_id,business_day_id)
+        VALUES ($1,$2)`, [receipt.rows[0].id,id]);
+    }
+    await client.query(`UPDATE core.filiale_pins
+      SET failed_attempts=0,locked_until=NULL,last_failed_at=NULL,last_used_at=NOW()
+      WHERE id=$1`, [employee.id]);
+    await client.query('COMMIT');
+    clearPinAttempts(req);
+    return res.status(201).json({
+      receipt:receipt.rows[0],
+      closings:days.rows.map((row) => ({
+        id:Number(row.id),
+        businessDate:row.business_date,
+        expectedDepositCents:Number(row.expected_deposit_cents),
+      })),
+    });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    if (error?.code === '23505') return res.status(409).json({ message:'Dieser Beleg wurde bereits erfasst.' });
+    console.error('POST /api/tageskasse/deposit-receipts/confirm Fehler:', error);
+    return res.status(error.statusCode || 500).json({
+      message:error.statusCode ? error.message : 'Einzahlungsbeleg konnte nicht gespeichert werden.',
+    });
   } finally { client.release(); }
 });
 
