@@ -15,7 +15,9 @@ const { resolveCashBusinessDate } = require('../lib/cashBusinessDatePolicy');
 const { visibleCashEmployees } = require('../lib/cashEmployeeVisibility');
 
 const router = express.Router();
-const PIN_PROOF_TTL_SECONDS = 10 * 60;
+// A complete physical recount can legitimately take longer than ten minutes.
+// Keep the proof bounded, but long enough for one uninterrupted cash workflow.
+const PIN_PROOF_TTL_SECONDS = 2 * 60 * 60;
 const attemptsByActor = new Map();
 
 router.use(verifyToken());
