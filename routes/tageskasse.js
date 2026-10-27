@@ -14,6 +14,7 @@ const { canCorrectCashClosing, canUseCashModule, isCentralRole, resolveCashBranc
 const { resolveCashBusinessDate } = require('../lib/cashBusinessDatePolicy');
 const { visibleCashEmployees } = require('../lib/cashEmployeeVisibility');
 const { validateDepositReceipt } = require('../lib/depositReceiptPolicy');
+const { signClosingContext, verifyClosingContext } = require('../lib/cashClosingContextProof');
 
 const router = express.Router();
 // A complete physical recount can legitimately take longer than ten minutes.
@@ -108,29 +109,6 @@ function verifyPinProof(token, branchId) {
     return Number(proof.pinId);
   } catch {
     throw Object.assign(new Error('Eine Mitarbeiter-PIN-Bestätigung ist abgelaufen. Bitte den Vorgang neu beginnen.'), { statusCode: 401 });
-  }
-}
-
-function signClosingContext(closedByPinId, responsibleEmployeePinId, branchId, drawerNumber) {
-  return jwt.sign({
-    type: 'cash-closing-context',
-    closedByPinId: Number(closedByPinId),
-    responsibleEmployeePinId: Number(responsibleEmployeePinId),
-    branchId: Number(branchId),
-    drawerNumber: Number(drawerNumber),
-  }, process.env.JWT_SECRET, { expiresIn: PIN_PROOF_TTL_SECONDS });
-}
-
-function verifyClosingContext(token, { branchId, drawerNumber, closedByPinId, responsibleEmployeePinId }) {
-  try {
-    const proof = jwt.verify(String(token || ''), process.env.JWT_SECRET);
-    if (proof.type !== 'cash-closing-context'
-      || Number(proof.branchId) !== Number(branchId)
-      || Number(proof.drawerNumber) !== Number(drawerNumber)
-      || Number(proof.closedByPinId) !== Number(closedByPinId)
-      || Number(proof.responsibleEmployeePinId) !== Number(responsibleEmployeePinId)) throw new Error('invalid closing context');
-  } catch {
-    throw Object.assign(new Error('Der Abrechnungskontext ist abgelaufen. Bitte die Abrechnung neu beginnen.'), { statusCode: 401 });
   }
 }
 
@@ -890,7 +868,7 @@ router.post('/closing-context', async (req, res) => {
     return res.json({
       employee: { id: responsibleEmployeePinId, name: employeeById.get(responsibleEmployeePinId).display_name },
       closedBy: { id: closedByPinId, name: employeeById.get(closedByPinId).display_name },
-      contextProofToken: signClosingContext(closedByPinId, responsibleEmployeePinId, branch.id, drawerNumber),
+      contextProofToken: signClosingContext(closedByPinId, responsibleEmployeePinId, branch.id, drawerNumber, process.env.JWT_SECRET),
       opening: row ? {
         id: Number(row.id),
         businessDate: row.business_date,
@@ -912,13 +890,8 @@ router.post('/closings', async (req, res) => {
     const branch = await resolveBranch(client, req);
     const businessDate = resolveCashBusinessDate(req);
     await ensureBusinessDayOpen(client, branch.id, businessDate);
-    const closedByPinId = verifyPinProof(req.body?.proofToken, branch.id);
-    const responsibleEmployeePinId = req.body?.responsibleEmployeeId == null ? closedByPinId : Number(req.body.responsibleEmployeeId);
+    const responsibleEmployeePinId = Number(req.body?.responsibleEmployeeId);
     if (!Number.isInteger(responsibleEmployeePinId) || responsibleEmployeePinId <= 0) throw Object.assign(new Error('Bitte wähle den verantwortlichen Kassierer aus.'), { statusCode:400 });
-    const employees = await client.query(`SELECT id,display_name FROM core.filiale_pins
-      WHERE id=ANY($1::bigint[]) AND is_active=true`, [[closedByPinId,responsibleEmployeePinId]]);
-    const employeeById = new Map(employees.rows.map((row)=>[Number(row.id),row]));
-    if (!employeeById.has(closedByPinId) || !employeeById.has(responsibleEmployeePinId)) throw Object.assign(new Error('Mindestens eine beteiligte Person ist nicht mehr aktiv.'), { statusCode:409 });
 
     let checked;
     try {
@@ -926,12 +899,16 @@ router.post('/closings', async (req, res) => {
     } catch (validationError) {
       throw Object.assign(validationError, { statusCode: 400 });
     }
-    verifyClosingContext(req.body?.contextProofToken, {
+    const closingContext = verifyClosingContext(req.body?.contextProofToken, {
       branchId: branch.id,
       drawerNumber: checked.drawerNumber,
-      closedByPinId,
       responsibleEmployeePinId,
-    });
+    }, process.env.JWT_SECRET);
+    const closedByPinId = closingContext.closedByPinId;
+    const employees = await client.query(`SELECT id,display_name FROM core.filiale_pins
+      WHERE id=ANY($1::bigint[]) AND is_active=true`, [[closedByPinId,responsibleEmployeePinId]]);
+    const employeeById = new Map(employees.rows.map((row)=>[Number(row.id),row]));
+    if (!employeeById.has(closedByPinId) || !employeeById.has(responsibleEmployeePinId)) throw Object.assign(new Error('Mindestens eine beteiligte Person ist nicht mehr aktiv.'), { statusCode:409 });
     let opening = null;
     if (req.body?.openingCountId != null) {
       const openingId = Number(req.body.openingCountId);
