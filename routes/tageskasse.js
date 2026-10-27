@@ -8,7 +8,7 @@ const { validateOpeningCount } = require('../lib/cashOpeningPolicy');
 const { validateCashClosing } = require('../lib/cashClosingPolicy');
 const { validateCashCorrection } = require('../lib/cashCorrectionPolicy');
 const { requireOpeningReplacement } = require('../lib/cashDrawerSessionPolicy');
-const { calculateBusinessDayTotals, validateBusinessDayFinalization } = require('../lib/cashBusinessDayPolicy');
+const { calculateBusinessDayTotals, validateBusinessDayFinalization, normalizeV2FinalizationMetadata } = require('../lib/cashBusinessDayPolicy');
 const { participantLabels, validateSafeCountPayload, validateSafeCountType } = require('../lib/cashSafePolicy');
 const { canCorrectCashClosing, canUseCashModule, isCentralRole, resolveCashBranch } = require('../lib/cashModuleAccess');
 const { resolveCashBusinessDate } = require('../lib/cashBusinessDatePolicy');
@@ -454,9 +454,29 @@ router.post('/day-close/finalize', async (req, res) => {
     const context = await loadBusinessDayCloseContext(client, branch, lockedDay.rows[0]);
     try { validateBusinessDayFinalization(req.body || {}, context); }
     catch (validationError) { throw Object.assign(validationError, { statusCode:400 }); }
+    let metadata;
+    try { metadata = normalizeV2FinalizationMetadata(req.body || {}); }
+    catch (validationError) { throw Object.assign(validationError, { statusCode:400 }); }
+    let approvals = [];
+    if (metadata.workflowVersion === 'v2') {
+      const approvalPinIds = metadata.approvalProofTokens.map((token) => verifyPinProof(token, branch.id));
+      if (new Set(approvalPinIds).size !== 2) {
+        throw Object.assign(new Error('Der V2-Abschluss muss von zwei unterschiedlichen Personen bestätigt werden.'), { statusCode:400 });
+      }
+      const approvalRows = await client.query(`SELECT id,display_name FROM core.filiale_pins
+        WHERE id=ANY($1::bigint[]) AND is_active=true`, [approvalPinIds]);
+      const approvalById = new Map(approvalRows.rows.map((row) => [Number(row.id), row.display_name]));
+      if (approvalById.size !== 2) {
+        throw Object.assign(new Error('Mindestens eine bestätigte Person ist nicht mehr aktiv.'), { statusCode:409 });
+      }
+      approvals = approvalPinIds.map((id) => ({ id, name:approvalById.get(id) }));
+    }
     const finalizedAt = new Date().toISOString();
     const report = {
       branch:branch.name, businessDate:context.businessDate, finalizedAt,
+      workflowVersion:metadata.workflowVersion,
+      dailyMetrics:metadata.dailyMetrics,
+      approvals,
       totals:context.totals,
       closings:context.closings,
       replacedOpenings:context.replacedOpenings,
