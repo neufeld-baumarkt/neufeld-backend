@@ -17,6 +17,7 @@
 // - Saldo wird serverseitig über cashflow.kategorien.typ berechnet
 
 const express = require('express');
+const crypto = require('crypto');
 const router = express.Router();
 
 const pool = require('../db');
@@ -438,18 +439,25 @@ router.post('/buchungen', verifyToken(), requireCashflowAccess, async (req, res)
       }
     }
 
-    const targets =
-      payload.filiale === 'Unternehmen' && !isEinnahme
-        ? splitAmountToFilialen(payload.betrag)
-        : [{ filiale: payload.filiale, betrag: payload.betrag }];
+    const isUnternehmenssplit =
+      payload.filiale === 'Unternehmen' && !isEinnahme;
+
+    const targets = isUnternehmenssplit
+      ? splitAmountToFilialen(payload.betrag)
+      : [{ filiale: payload.filiale, betrag: payload.betrag }];
+
+    const buchungsgruppeId = isUnternehmenssplit
+      ? crypto.randomUUID()
+      : null;
 
     const insertedRows = [];
-
-    await pool.query('BEGIN');
+    const client = await pool.connect();
 
     try {
+      await client.query('BEGIN');
+
       for (const target of targets) {
-        const result = await pool.query(
+        const result = await client.query(
           `
           INSERT INTO cashflow.buchungen (
             jahr,
@@ -468,7 +476,8 @@ router.post('/buchungen', verifyToken(), requireCashflowAccess, async (req, res)
             rechnungsnummer,
             rechnungsdatum,
             avis_nummer,
-            zahlungsart
+            zahlungsart,
+            buchungsgruppe_id
           )
           VALUES (
             $1,
@@ -487,7 +496,8 @@ router.post('/buchungen', verifyToken(), requireCashflowAccess, async (req, res)
             NULL,
             NULL,
             NULL,
-            NULL
+            NULL,
+            $10
           )
           RETURNING
             id,
@@ -509,7 +519,8 @@ router.post('/buchungen', verifyToken(), requireCashflowAccess, async (req, res)
             rechnungsnummer,
             rechnungsdatum,
             avis_nummer,
-            zahlungsart
+            zahlungsart,
+            buchungsgruppe_id
           `,
           [
             payload.jahr,
@@ -519,10 +530,11 @@ router.post('/buchungen', verifyToken(), requireCashflowAccess, async (req, res)
             payload.eintragTyp === 'feiertag' ? 0 : target.betrag,
             erstelltVon,
             target.filiale,
-            payload.filiale === 'Unternehmen' && !isEinnahme
+            isUnternehmenssplit
               ? payload.notiz || 'Unternehmensverteilung'
               : payload.notiz,
             payload.eintragTyp,
+            buchungsgruppeId,
           ]
         );
 
@@ -533,15 +545,22 @@ router.post('/buchungen', verifyToken(), requireCashflowAccess, async (req, res)
         });
       }
 
-      await pool.query('COMMIT');
+      await client.query('COMMIT');
     } catch (err) {
-      await pool.query('ROLLBACK');
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackErr) {
+        console.error('Rollback-Fehler POST /api/cashflow/buchungen:', rollbackErr);
+      }
+
       throw err;
+    } finally {
+      client.release();
     }
 
     return res.status(201).json({
       message:
-        payload.filiale === 'Unternehmen' && !isEinnahme
+        isUnternehmenssplit
           ? 'Cashflow-Unternehmensbuchung verteilt gespeichert.'
           : 'Cashflow-Buchung gespeichert.',
       buchung: insertedRows[0],
@@ -569,74 +588,94 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
   const payload = parseUpdateBuchungPayload(req, res);
   if (payload === null) return;
 
+  let client;
+
   try {
-  const currentResult = await pool.query(
-    `
-    SELECT
-      b.status,
-      b.betrag,
-      b.planbetrag,
-      b.eintrag_typ,
-      k.typ
-    FROM cashflow.buchungen b
-    JOIN cashflow.kategorien k
-      ON k.id = b.kategorie_id
-    WHERE b.id = $1
-    `,
-    [id]
-  );
+    client = await pool.connect();
+    await client.query('BEGIN');
 
-  if (currentResult.rowCount === 0) {
-    return res.status(404).json({
-      message: 'Cashflow-Buchung nicht gefunden.',
-    });
-  }
+    const currentResult = await client.query(
+      `
+      SELECT
+        b.status,
+        b.betrag,
+        b.planbetrag,
+        b.eintrag_typ,
+        b.buchungsgruppe_id,
+        k.typ
+      FROM cashflow.buchungen b
+      JOIN cashflow.kategorien k
+        ON k.id = b.kategorie_id
+      WHERE b.id = $1
+      FOR UPDATE OF b
+      `,
+      [id]
+    );
 
-  const current = currentResult.rows[0];
+    if (currentResult.rowCount === 0) {
+      await client.query('ROLLBACK');
 
-  const isEinnahme = current.typ === 'Einnahme';
-
-  const hasInvoiceFieldUpdate =
-    payload.updateRechnungsnummer ||
-    payload.updateRechnungsdatum ||
-    payload.updateAvisNummer ||
-    payload.updateZahlungsart;
-
-  if (isEinnahme && hasInvoiceFieldUpdate) {
-    return res.status(400).json({
-      message: 'Rechnungsdaten sind ausschließlich bei Ausgaben zulässig.',
-    });
-  }
-
-  const effectiveEintragTyp = payload.updateEintragTyp
-    ? payload.eintragTyp
-    : current.eintrag_typ;
-
-  if (payload.updateBetrag && effectiveEintragTyp === 'betrag') {
-    if (isEinnahme && payload.betrag <= 0) {
-      return res.status(400).json({
-        message: 'Einnahmen müssen größer 0 sein.',
+      return res.status(404).json({
+        message: 'Cashflow-Buchung nicht gefunden.',
       });
     }
 
-    if (!isEinnahme && payload.betrag === 0) {
+    const current = currentResult.rows[0];
+    const isEinnahme = current.typ === 'Einnahme';
+
+    const hasInvoiceFieldUpdate =
+      payload.updateRechnungsnummer ||
+      payload.updateRechnungsdatum ||
+      payload.updateAvisNummer ||
+      payload.updateZahlungsart;
+
+    if (isEinnahme && hasInvoiceFieldUpdate) {
+      await client.query('ROLLBACK');
+
       return res.status(400).json({
-        message: 'Ausgaben und Gutschriften müssen ungleich 0 sein.',
+        message: 'Rechnungsdaten sind ausschließlich bei Ausgaben zulässig.',
       });
     }
-  }
 
-  const statuswechselZuGebucht =
-    isEinnahme &&
-    current.status === 'angekuendigt' &&
-    payload.status === 'gebucht';
+    const effectiveEintragTyp = payload.updateEintragTyp
+      ? payload.eintragTyp
+      : current.eintrag_typ;
 
-  const result = await pool.query(
+    if (payload.updateBetrag && effectiveEintragTyp === 'betrag') {
+      if (isEinnahme && payload.betrag <= 0) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          message: 'Einnahmen müssen größer 0 sein.',
+        });
+      }
+
+      if (!isEinnahme && payload.betrag === 0) {
+        await client.query('ROLLBACK');
+
+        return res.status(400).json({
+          message: 'Ausgaben und Gutschriften müssen ungleich 0 sein.',
+        });
+      }
+    }
+
+    const hasGroupedFieldUpdate =
+      payload.updateNotiz || hasInvoiceFieldUpdate;
+
+    const updateSharedFieldsOnSelectedRow =
+      current.buchungsgruppe_id === null;
+
+    const statuswechselZuGebucht =
+      isEinnahme &&
+      current.status === 'angekuendigt' &&
+      payload.status === 'gebucht';
+
+    const updateResult = await client.query(
       `
       UPDATE cashflow.buchungen b
       SET
         status = CASE WHEN $2::boolean THEN $3 ELSE b.status END,
-        notiz = CASE WHEN $4::boolean THEN $5 ELSE b.notiz END,
+        notiz = CASE WHEN $4::boolean AND $26::boolean THEN $5 ELSE b.notiz END,
         filiale = CASE WHEN $6::boolean THEN $7 ELSE b.filiale END,
         eintrag_typ = CASE WHEN $8::boolean THEN $9 ELSE b.eintrag_typ END,
         jahr = CASE WHEN $10::boolean THEN $11 ELSE b.jahr END,
@@ -647,10 +686,10 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
           WHEN $16::boolean THEN $17
           ELSE b.betrag
         END,
-        rechnungsnummer = CASE WHEN $18::boolean THEN $19 ELSE b.rechnungsnummer END,
-        rechnungsdatum = CASE WHEN $20::boolean THEN $21::date ELSE b.rechnungsdatum END,
-        avis_nummer = CASE WHEN $22::boolean THEN $23 ELSE b.avis_nummer END,
-        zahlungsart = CASE WHEN $24::boolean THEN $25 ELSE b.zahlungsart END,
+        rechnungsnummer = CASE WHEN $18::boolean AND $26::boolean THEN $19 ELSE b.rechnungsnummer END,
+        rechnungsdatum = CASE WHEN $20::boolean AND $26::boolean THEN $21::date ELSE b.rechnungsdatum END,
+        avis_nummer = CASE WHEN $22::boolean AND $26::boolean THEN $23 ELSE b.avis_nummer END,
+        zahlungsart = CASE WHEN $24::boolean AND $26::boolean THEN $25 ELSE b.zahlungsart END,
         geaendert_am = NOW()
       FROM cashflow.kategorien k
       WHERE b.id = $1
@@ -658,30 +697,7 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
         AND k.aktiv = true
       RETURNING
         b.id,
-        b.jahr,
-        b.kw,
-        b.datum,
-        b.tag,
-        b.kategorie_id,
-        k.name AS kategorie,
-        k.typ,
-        b.betrag,
-        b.quelle,
-        b.quelle_zeile,
-        b.erstellt_von,
-        b.erstellt_am,
-        b.geaendert_am,
-        b.filiale,
-        b.status,
-        b.notiz,
-        b.eintrag_typ,
-        b.planbetrag,
-        b.abweichung_betrag,
-        b.abweichung_prozent,
-        b.rechnungsnummer,
-        b.rechnungsdatum,
-        b.avis_nummer,
-        b.zahlungsart
+        b.betrag
       `,
       [
         id,
@@ -709,61 +725,130 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
         payload.avisNummer,
         payload.updateZahlungsart,
         payload.zahlungsart,
+        updateSharedFieldsOnSelectedRow,
       ]
     );
 
-    if (result.rowCount === 0) {
+    if (updateResult.rowCount === 0) {
+      await client.query('ROLLBACK');
+
       return res.status(404).json({
         message: 'Cashflow-Buchung nicht gefunden.',
       });
     }
 
+    if (current.buchungsgruppe_id !== null && hasGroupedFieldUpdate) {
+      await client.query(
+        `
+        UPDATE cashflow.buchungen
+        SET
+          notiz = CASE WHEN $2::boolean THEN $3 ELSE notiz END,
+          rechnungsnummer = CASE WHEN $4::boolean THEN $5 ELSE rechnungsnummer END,
+          rechnungsdatum = CASE WHEN $6::boolean THEN $7::date ELSE rechnungsdatum END,
+          avis_nummer = CASE WHEN $8::boolean THEN $9 ELSE avis_nummer END,
+          zahlungsart = CASE WHEN $10::boolean THEN $11 ELSE zahlungsart END,
+          geaendert_am = NOW()
+        WHERE buchungsgruppe_id = $1
+        `,
+        [
+          current.buchungsgruppe_id,
+          payload.updateNotiz,
+          payload.notiz,
+          payload.updateRechnungsnummer,
+          payload.rechnungsnummer,
+          payload.updateRechnungsdatum,
+          payload.rechnungsdatum ?? null,
+          payload.updateAvisNummer,
+          payload.avisNummer,
+          payload.updateZahlungsart,
+          payload.zahlungsart,
+        ]
+      );
+    }
+
     if (statuswechselZuGebucht) {
-  const neuerBetrag = Number(result.rows[0].betrag);
-  const planbetrag = Number(current.betrag);
-  const abweichungBetrag = neuerBetrag - planbetrag;
-  const abweichungProzent =
-    planbetrag > 0 ? (abweichungBetrag / planbetrag) * 100 : null;
+      const neuerBetrag = Number(updateResult.rows[0].betrag);
+      const planbetrag = Number(current.betrag);
+      const abweichungBetrag = neuerBetrag - planbetrag;
+      const abweichungProzent =
+        planbetrag > 0 ? (abweichungBetrag / planbetrag) * 100 : null;
 
-  const forecastResult = await pool.query(
-    `
-    UPDATE cashflow.buchungen
-    SET
-      planbetrag = $2,
-      abweichung_betrag = $3,
-      abweichung_prozent = $4,
-      geaendert_am = NOW()
-    WHERE id = $1
-    RETURNING
-      planbetrag,
-      abweichung_betrag,
-      abweichung_prozent
-    `,
-    [
-      id,
-      planbetrag,
-      abweichungBetrag,
-      abweichungProzent,
-    ]
-  );
+      await client.query(
+        `
+        UPDATE cashflow.buchungen
+        SET
+          planbetrag = $2,
+          abweichung_betrag = $3,
+          abweichung_prozent = $4,
+          geaendert_am = NOW()
+        WHERE id = $1
+        `,
+        [id, planbetrag, abweichungBetrag, abweichungProzent]
+      );
+    }
 
-  result.rows[0].planbetrag = forecastResult.rows[0].planbetrag;
-  result.rows[0].abweichung_betrag =
-    forecastResult.rows[0].abweichung_betrag;
-  result.rows[0].abweichung_prozent =
-    forecastResult.rows[0].abweichung_prozent;
-}
+    const result = await client.query(
+      `
+      SELECT
+        b.id,
+        b.jahr,
+        b.kw,
+        b.datum,
+        b.tag,
+        b.kategorie_id,
+        k.name AS kategorie,
+        k.typ,
+        b.betrag,
+        b.quelle,
+        b.quelle_zeile,
+        b.erstellt_von,
+        b.erstellt_am,
+        b.geaendert_am,
+        b.filiale,
+        b.status,
+        b.notiz,
+        b.eintrag_typ,
+        b.planbetrag,
+        b.abweichung_betrag,
+        b.abweichung_prozent,
+        b.rechnungsnummer,
+        b.rechnungsdatum,
+        b.avis_nummer,
+        b.zahlungsart,
+        b.buchungsgruppe_id
+      FROM cashflow.buchungen b
+      JOIN cashflow.kategorien k
+        ON k.id = b.kategorie_id
+      WHERE b.id = $1
+      `,
+      [id]
+    );
+
+    await client.query('COMMIT');
 
     return res.json({
-      message: 'Cashflow-Buchung aktualisiert.',
+      message:
+        current.buchungsgruppe_id !== null && hasGroupedFieldUpdate
+          ? 'Cashflow-Buchung und gemeinsame Rechnungsdaten aktualisiert.'
+          : 'Cashflow-Buchung aktualisiert.',
       buchung: result.rows[0],
     });
   } catch (err) {
+    if (client) {
+      try {
+        await client.query('ROLLBACK');
+      } catch (rollbackErr) {
+        console.error('Rollback-Fehler PATCH /api/cashflow/buchungen/:id:', rollbackErr);
+      }
+    }
+
     console.error('Fehler PATCH /api/cashflow/buchungen/:id:', err);
 
     return res.status(500).json({
       message: 'Serverfehler beim Aktualisieren der Cashflow-Buchung.',
     });
+  } finally {
+    if (client) client.release();
   }
 });
 
@@ -807,7 +892,8 @@ router.delete('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req
         b.rechnungsnummer,
         b.rechnungsdatum,
         b.avis_nummer,
-        b.zahlungsart
+        b.zahlungsart,
+        b.buchungsgruppe_id
       `,
       [id]
     );
@@ -863,6 +949,7 @@ router.get('/buchungen/suche', verifyToken(), requireCashflowAccess, async (req,
         b.rechnungsdatum,
         b.avis_nummer,
         b.zahlungsart,
+        b.buchungsgruppe_id,
         b.erstellt_von,
         b.erstellt_am,
         b.geaendert_am
@@ -913,6 +1000,7 @@ router.get('/buchungen/suche', verifyToken(), requireCashflowAccess, async (req,
         kategorie: row.kategorie,
         status: row.status,
         zahlungsart: row.zahlungsart,
+        buchungsgruppe_id: row.buchungsgruppe_id,
       })),
     }));
 
@@ -929,6 +1017,7 @@ router.get('/buchungen/suche', verifyToken(), requireCashflowAccess, async (req,
         kategorie: row.kategorie,
         status: row.status,
         zahlungsart: row.zahlungsart,
+        buchungsgruppe_id: row.buchungsgruppe_id,
       }));
 
     return res.json({
@@ -977,6 +1066,7 @@ router.post('/buchungen/:id/buchen', verifyToken(), requireCashflowAccess, async
         b.filiale,
         b.status,
         b.zahlungsart,
+        b.buchungsgruppe_id,
         b.geaendert_am
       `,
       [id]
@@ -1061,6 +1151,7 @@ router.post('/avis/:avisNummer/buchen', verifyToken(), requireCashflowAccess, as
         b.filiale,
         b.status,
         b.zahlungsart,
+        b.buchungsgruppe_id,
         b.geaendert_am
       `,
       [avisNummer]
@@ -1207,7 +1298,8 @@ router.get('/buchungen', verifyToken(), requireCashflowAccess, async (req, res) 
         b.rechnungsnummer,
         b.rechnungsdatum,
         b.avis_nummer,
-        b.zahlungsart
+        b.zahlungsart,
+        b.buchungsgruppe_id
       FROM cashflow.buchungen b
       JOIN cashflow.kategorien k
         ON k.id = b.kategorie_id
