@@ -192,6 +192,7 @@ const bestellungenRoutes = require('./routes/bestellungen');
 const cashflowRoutes = require('./routes/cashflow');
 const devDbRoutes = require('./routes/devDb');
 const controllingRoutes = require('./routes/controlling');
+const safeCountsRoutes = require('./routes/safeCounts');
 const tageskasseRoutes = require('./routes/tageskasse');
 
 app.use('/api/reklamationen', reklamationenRoutes);
@@ -202,6 +203,7 @@ app.use('/api/filiale-pins', employeePinsRoutes);
 app.use('/api/bestellungen', bestellungenRoutes);
 app.use('/api/cashflow', cashflowRoutes);
 app.use('/api/controlling', controllingRoutes);
+app.use('/api/tageskasse/safe-counts', safeCountsRoutes);
 app.use('/api/tageskasse', tageskasseRoutes);
 app.use('/api/dev-db', devDbRoutes);
 app.use('/api', stammdatenRoutes);
