@@ -7,6 +7,9 @@ const jwt = require('jsonwebtoken');
 
 const pool = require('./db'); // EIN DB-Pool
 const verifyToken = require('./middleware/verifyToken'); // ✅ korrekt (bei dir: backend\middleware)
+const { createAuthHandlers } = require('./lib/auth');
+const { createMaintenanceGate } = require('./lib/maintenanceControl');
+const { createMaintenanceRouter } = require('./routes/maintenance');
 const { runCashOpeningMigration } = require('./lib/runCashOpeningMigration');
 const { runEmployeePinMigration } = require('./lib/runEmployeePinMigration');
 const { runCashClosingMigration } = require('./lib/runCashClosingMigration');
@@ -17,6 +20,8 @@ const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) {
   throw new Error('JWT_SECRET is not set in environment variables');
 }
+verifyToken.configureDefault({ pool, jwtSecret: JWT_SECRET });
+const authHandlers = createAuthHandlers({ pool, jwtSecret: JWT_SECRET });
 
 const app = express();
 
@@ -76,39 +81,11 @@ app.get('/api/ping', (req, res) => {
   res.json({ message: 'pong', timestamp: new Date().toISOString() });
 });
 
+app.use('/api/maintenance', createMaintenanceRouter({ pool }));
+app.use(createMaintenanceGate({ pool }));
 // ✅ Public: Login (ohne Token)
-app.post('/api/login', async (req, res) => {
-  const { name, password } = req.body;
-
-  if (!name || !password) {
-    return res.status(400).json({ message: 'Name und Passwort erforderlich' });
-  }
-
-  try {
-    const result = await pool.query('SELECT * FROM users WHERE name = $1', [name]);
-    if (result.rows.length === 0) {
-      return res.status(401).json({ message: 'Benutzer nicht gefunden' });
-    }
-
-    const user = result.rows[0];
-    const isMatch = await bcrypt.compare(password, user.password);
-
-    if (!isMatch) {
-      return res.status(401).json({ message: 'Falsches Passwort' });
-    }
-
-    const token = jwt.sign(
-      { id: user.id, name: user.name, role: user.role, filiale: user.filiale },
-      JWT_SECRET,
-      { expiresIn: '8h' }
-    );
-
-    res.json({ token, name: user.name, role: user.role, filiale: user.filiale });
-  } catch (err) {
-    console.error('Login-Fehler:', err);
-    res.status(500).json({ message: 'Serverfehler' });
-  }
-});
+app.post('/api/login', authHandlers.login);
+app.get('/api/session', verifyToken({ allowForcePasswordChange: true }), authHandlers.session);
 
 // ──────────────────────────────────────────────────────────────────────────────
 // USERS (PRIVATE) – aus Backup übernommen (robust umgesetzt)
@@ -202,6 +179,7 @@ app.use('/api/filiale-pins', employeePinsRoutes);
 app.use('/api/bestellungen', bestellungenRoutes);
 app.use('/api/cashflow', cashflowRoutes);
 app.use('/api/controlling', controllingRoutes);
+app.use('/api/tageskasse/safe-counts', require('./routes/safeCounts'));
 app.use('/api/tageskasse', tageskasseRoutes);
 app.use('/api/dev-db', devDbRoutes);
 app.use('/api', stammdatenRoutes);
