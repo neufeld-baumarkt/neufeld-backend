@@ -4,8 +4,6 @@ const bcrypt = require('bcrypt');
 const pool = require('../db');
 const verifyToken = require('../middleware/verifyToken');
 const { findActivePinMatches } = require('../lib/employeePinIdentity');
-const { visibleCashEmployees } = require('../lib/cashEmployeeVisibility');
-const { createEmployeePinProof } = require('../lib/employeePinProof');
 const {
   DEFAULT_EMPLOYEE_PIN,
   assignmentBranchId,
@@ -211,8 +209,7 @@ router.post('/verify', verifyToken(), async (req, res) => {
     }
     verificationAttempts.delete(attempt.key);
     await pool.query('UPDATE core.filiale_pins SET last_used_at=NOW(),updated_at=NOW() WHERE id=$1', [matched.id]);
-    const employee = { id: Number(matched.id), name: matched.display_name };
-    return res.json({ employee: { ...employee, proofToken: createEmployeePinProof(employee) } });
+    return res.json({ employee: { id: Number(matched.id), name: matched.display_name } });
   } catch (error) {
     return sendError(res, error);
   }
@@ -226,30 +223,6 @@ router.get('/first-use-candidates', verifyToken(), async (req, res) => {
     return res.json({
       filiale: 'Unternehmensweit',
       employees: result.rows.map((row) => ({ id: Number(row.id), display_name: row.display_name })),
-    });
-  } catch (error) {
-    return sendError(res, error);
-  }
-});
-
-router.get('/cash-candidates', verifyToken(), async (req, res) => {
-  try {
-    const branchName = String(req.query?.branch || '').trim();
-    if (!branchName) throw Object.assign(new Error('Filiale fehlt.'), { statusCode: 400 });
-
-    const [branchResult, employeeResult] = await Promise.all([
-      pool.query('SELECT id,name FROM public.filialen WHERE aktiv=true AND LOWER(name)=LOWER($1) LIMIT 1', [branchName]),
-      pool.query(`SELECT id,display_name,filiale_id FROM core.filiale_pins
-        WHERE is_active=true AND must_change_pin=false
-        ORDER BY LOWER(display_name),id`),
-    ]);
-    const branch = branchResult.rows[0];
-    if (!branch) throw Object.assign(new Error('Filiale wurde nicht gefunden.'), { statusCode: 404 });
-
-    return res.json({
-      filiale: branch.name,
-      employees: visibleCashEmployees(employeeResult.rows, branch.id)
-        .map((row) => ({ id: Number(row.id), display_name: row.display_name })),
     });
   } catch (error) {
     return sendError(res, error);
