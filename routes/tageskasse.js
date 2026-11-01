@@ -17,7 +17,7 @@ const { validateDepositReceipt } = require('../lib/depositReceiptPolicy');
 const { signClosingContext, verifyClosingContext } = require('../lib/cashClosingContextProof');
 const { normalizeClosePayload, normalizeDraftKey, normalizeDraftPayload, normalizeWorkflowType } = require('../lib/workflowDraftPolicy');
 const { openingPreview, closingPreview, safePreview, dayClosePreview } = require('../lib/cashWorkflowCalculationPolicy');
-const { completeDayCloseDraft } = require('../lib/dayCloseDraft');
+const { deleteBusinessDayDrafts, lockDraftBusinessDay } = require('../lib/dayCloseDraft');
 
 const router = express.Router();
 // A complete physical recount can legitimately take longer than ten minutes.
@@ -170,14 +170,20 @@ router.get('/workflow-drafts/:workflowType/:draftKey', async (req,res)=>{
 });
 
 router.put('/workflow-drafts/:workflowType/:draftKey', async (req,res)=>{
+  const client=await pool.connect();
   try {
-    const branch=await resolveBranch(pool,req); const businessDate=resolveCashBusinessDate(req);
+    await client.query('BEGIN');
+    const branch=await resolveBranch(client,req); const businessDate=resolveCashBusinessDate(req);
     const workflowType=normalizeWorkflowType(req.params.workflowType); const draftKey=normalizeDraftKey(req.params.draftKey); const payload=normalizeDraftPayload(req.body);
     if(req.runtimeControl?.mode==='draining'&&payload.expectedRevision===0) throw Object.assign(new Error('Wartung wird vorbereitet. Es kann kein neuer Kassenprozess begonnen werden.'),{statusCode:503});
-    const result=await pool.query(`INSERT INTO controlling.cash_workflow_drafts (filiale_id,business_date,workflow_type,draft_key,stage,state,created_by_user_id,updated_by_user_id) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$7) ON CONFLICT (filiale_id,business_date,workflow_type,draft_key) WHERE status='active' DO UPDATE SET stage=EXCLUDED.stage,state=EXCLUDED.state,updated_by_user_id=EXCLUDED.updated_by_user_id,updated_at=NOW(),revision=controlling.cash_workflow_drafts.revision+1 WHERE controlling.cash_workflow_drafts.revision=$8 RETURNING *`,[branch.id,businessDate,workflowType,draftKey,payload.stage,payload.serialized,req.user.id,payload.expectedRevision]);
+    const dayStatus=await lockDraftBusinessDay(client,{branchId:branch.id,businessDate});
+    if(dayStatus==='finalized') throw Object.assign(new Error('Dieser Geschäftstag ist bereits verbindlich abgeschlossen.'),{statusCode:409});
+    const result=await client.query(`INSERT INTO controlling.cash_workflow_drafts (filiale_id,business_date,workflow_type,draft_key,stage,state,created_by_user_id,updated_by_user_id) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$7) ON CONFLICT (filiale_id,business_date,workflow_type,draft_key) WHERE status='active' DO UPDATE SET stage=EXCLUDED.stage,state=EXCLUDED.state,updated_by_user_id=EXCLUDED.updated_by_user_id,updated_at=NOW(),revision=controlling.cash_workflow_drafts.revision+1 WHERE controlling.cash_workflow_drafts.revision=$8 RETURNING *`,[branch.id,businessDate,workflowType,draftKey,payload.stage,payload.serialized,req.user.id,payload.expectedRevision]);
     if(!result.rows[0]) throw Object.assign(new Error('Der Entwurf wurde inzwischen auf einem anderen Gerät geändert. Bitte neu laden.'),{statusCode:409});
+    await client.query('COMMIT');
     return res.json({draft:workflowDraftJson(result.rows[0])});
-  } catch(error){return res.status(error.statusCode||500).json({message:error.statusCode?error.message:'Entwurf konnte nicht gespeichert werden.'});}
+  } catch(error){await client.query('ROLLBACK').catch(()=>{}); return res.status(error.statusCode||500).json({message:error.statusCode?error.message:'Entwurf konnte nicht gespeichert werden.'});}
+  finally {client.release();}
 });
 
 router.post('/workflow-drafts/:workflowType/:draftKey/close', async (req,res)=>{
@@ -562,10 +568,9 @@ router.post('/day-close/finalize', async (req, res) => {
       WHERE id=$4 AND status='open'
       RETURNING id,business_date,status,finalized_at,final_report`, [finalizedAt,req.user.id,JSON.stringify(report),businessDay.id]);
     if (!result.rows[0]) throw Object.assign(new Error('Der Geschäftstag wurde zwischenzeitlich bereits abgeschlossen.'), { statusCode:409 });
-    await completeDayCloseDraft(client, {
+    await deleteBusinessDayDrafts(client, {
       branchId:branch.id,
       businessDate,
-      userId:req.user.id,
     });
     await client.query('COMMIT');
     return res.status(201).json({ report:result.rows[0].final_report });
