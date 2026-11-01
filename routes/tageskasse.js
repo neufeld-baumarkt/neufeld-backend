@@ -16,6 +16,7 @@ const { visibleCashEmployees } = require('../lib/cashEmployeeVisibility');
 const { validateDepositReceipt } = require('../lib/depositReceiptPolicy');
 const { signClosingContext, verifyClosingContext } = require('../lib/cashClosingContextProof');
 const { normalizeClosePayload, normalizeDraftKey, normalizeDraftPayload, normalizeWorkflowType } = require('../lib/workflowDraftPolicy');
+const { openingPreview, closingPreview, safePreview, dayClosePreview } = require('../lib/cashWorkflowCalculationPolicy');
 
 const router = express.Router();
 // A complete physical recount can legitimately take longer than ten minutes.
@@ -114,7 +115,7 @@ function verifyPinProof(token, branchId) {
 }
 
 function closingJson(row) {
-  return {
+  const closing = {
     id: Number(row.id), businessDate: row.business_date, drawerNumber: Number(row.drawer_number),
     responsibleEmployee: { id: Number(row.employee_pin_id), name: row.responsible_employee_name },
     closedBy: { id: Number(row.closed_by_pin_id || row.employee_pin_id), name: row.closed_by_name || row.responsible_employee_name },
@@ -132,6 +133,25 @@ function closingJson(row) {
     businessDayStatus: row.business_day_status || 'open',
     closedAt: row.closed_at,
   };
+  return enrichClosingDisplay(closing);
+}
+
+function denominationAmounts(counts = {}) {
+  return Object.fromEntries(Object.entries(counts || {}).map(([denomination,quantity])=>[denomination,Number(denomination)*Number(quantity||0)]));
+}
+
+function enrichClosingDisplay(closing = {}) {
+  return { ...closing,
+    fullCountAmounts:denominationAmounts(closing.fullCounts),
+    bankNoteAmounts:denominationAmounts(closing.bankNoteCounts),
+    depositContributionCents:Number(closing.bankAmountCents||0)+Number(closing.looseChangeCents||0),
+  };
+}
+
+function enrichFinalReport(report) {
+  if (!report || typeof report !== 'object') return report;
+  const closings=Array.isArray(report.closings)?report.closings.map(enrichClosingDisplay):[];
+  return { ...report,closings,totalClosingDifferenceCents:closings.reduce((sum,item)=>sum+Number(item.differenceCents||0),0) };
 }
 
 function workflowDraftJson(row) {
@@ -167,6 +187,42 @@ router.post('/workflow-drafts/:workflowType/:draftKey/close', async (req,res)=>{
     if(!result.rows[0]) throw Object.assign(new Error('Der Entwurf wurde inzwischen geändert oder bereits geschlossen. Bitte neu laden.'),{statusCode:409});
     return res.json({draft:{id:result.rows[0].id,status:result.rows[0].status,revision:Number(result.rows[0].revision),closedAt:result.rows[0].closed_at}});
   } catch(error){return res.status(error.statusCode||500).json({message:error.statusCode?error.message:'Entwurf konnte nicht geschlossen werden.'});}
+});
+
+router.post('/calculations/opening', async (req,res)=>{
+  try {
+    const branch=await resolveBranch(pool,req); const businessDate=resolveCashBusinessDate(req);
+    const drawerNumber=Number(req.body?.drawerNumber);
+    const previousClosing=[1,2].includes(drawerNumber)
+      ? await loadImmediatePreviousClosing(pool,branch.id,drawerNumber,businessDate)
+      : null;
+    return res.json({ calculation:openingPreview({ ...req.body,branchId:branch.id,drawerNumber,previousClosing }) });
+  } catch(error){return res.status(error.statusCode||400).json({message:error.message||'Die Einzählung konnte nicht berechnet werden.'});}
+});
+
+router.post('/calculations/closing', async (req,res)=>{
+  try { return res.json({ calculation:closingPreview(req.body) }); }
+  catch(error){return res.status(error.statusCode||400).json({message:error.message||'Die Kassenabrechnung konnte nicht berechnet werden.'});}
+});
+
+router.post('/calculations/safe-count', async (req,res)=>{
+  try {
+    const countType=validateSafeCountType(req.body?.countType); const branch=await resolveBranch(pool,req);
+    const context=await loadSafeContext(pool,branch.id,countType,resolveCashBusinessDate(req));
+    return res.json({ calculation:safePreview({ ...req.body,settings:context.settings }) });
+  } catch(error){return res.status(error.statusCode||400).json({message:error.message||'Die Tresorzählung konnte nicht berechnet werden.'});}
+});
+
+router.post('/calculations/day-close', async (req,res)=>{
+  try {
+    let context;
+    if (req.body?.demoContext && typeof req.body.demoContext === 'object') context=req.body.demoContext;
+    else {
+      const branch=await resolveBranch(pool,req); const businessDay=await ensureBusinessDayOpen(pool,branch.id,resolveCashBusinessDate(req));
+      context=await loadBusinessDayCloseContext(pool,branch,businessDay);
+    }
+    return res.json({ calculation:dayClosePreview({ ...req.body,context }) });
+  } catch(error){return res.status(error.statusCode||400).json({message:error.message||'Der Tagesabschluss konnte nicht berechnet werden.'});}
 });
 
 function openingJson(row) {
@@ -652,7 +708,7 @@ router.get('/business-days/:date', async (req, res) => {
     const result = await pool.query(`SELECT final_report FROM core.cash_business_days
       WHERE branch_id=$1 AND business_date=$2 AND status='finalized'`, [branch.id,businessDate]);
     if (!result.rows[0]) return res.status(404).json({ message:'Für dieses Datum wurde kein abgeschlossener Tagesbericht gefunden.' });
-    return res.json({ report:result.rows[0].final_report });
+    return res.json({ report:enrichFinalReport(result.rows[0].final_report) });
   } catch (error) {
     console.error('GET /api/tageskasse/business-days/:date Fehler:', error);
     return res.status(error.statusCode || 500).json({ message:error.statusCode ? error.message : 'Der Tagesbericht konnte nicht geladen werden.' });
@@ -789,7 +845,7 @@ router.get('/day-overview', async (req, res) => {
     ]);
     return res.json({
       branch:branch.name, businessDate:businessDay.business_date, businessDayStatus:businessDay.status,
-      finalizedAt:businessDay.finalized_at || null, finalReport:businessDay.final_report || null,
+      finalizedAt:businessDay.finalized_at || null, finalReport:enrichFinalReport(businessDay.final_report) || null,
       openings:openings.rows.map(openingJson), closings:closings.rows.map(closingJson),
       canCorrect:canCorrectCashClosing(req.user?.role),
     });
