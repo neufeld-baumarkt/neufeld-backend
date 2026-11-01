@@ -17,6 +17,7 @@ const { validateDepositReceipt } = require('../lib/depositReceiptPolicy');
 const { signClosingContext, verifyClosingContext } = require('../lib/cashClosingContextProof');
 const { normalizeClosePayload, normalizeDraftKey, normalizeDraftPayload, normalizeWorkflowType } = require('../lib/workflowDraftPolicy');
 const { openingPreview, closingPreview, safePreview, dayClosePreview } = require('../lib/cashWorkflowCalculationPolicy');
+const { completeDayCloseDraft } = require('../lib/dayCloseDraft');
 
 const router = express.Router();
 // A complete physical recount can legitimately take longer than ten minutes.
@@ -561,6 +562,11 @@ router.post('/day-close/finalize', async (req, res) => {
       WHERE id=$4 AND status='open'
       RETURNING id,business_date,status,finalized_at,final_report`, [finalizedAt,req.user.id,JSON.stringify(report),businessDay.id]);
     if (!result.rows[0]) throw Object.assign(new Error('Der Geschäftstag wurde zwischenzeitlich bereits abgeschlossen.'), { statusCode:409 });
+    await completeDayCloseDraft(client, {
+      branchId:branch.id,
+      businessDate,
+      userId:req.user.id,
+    });
     await client.query('COMMIT');
     return res.status(201).json({ report:result.rows[0].final_report });
   } catch (error) {
