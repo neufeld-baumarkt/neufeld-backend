@@ -56,10 +56,22 @@ function createMaintenanceRouter({ pool }) {
     try {
       const [control, processes, details] = await Promise.all([
         readRuntimeControl(pool), countActiveCashProcesses(pool),
-        pool.query(`SELECT d.workflow_type,d.business_date,f.name AS branch,d.updated_at
-          FROM controlling.cash_workflow_drafts d
-          JOIN public.filialen f ON f.id=d.filiale_id
-          WHERE d.status='active' ORDER BY d.updated_at DESC LIMIT 50`),
+        pool.query(`SELECT * FROM (
+            SELECT 'draft' AS process_kind,d.workflow_type,d.business_date,
+              f.name AS branch,NULL::smallint AS drawer_number,d.updated_at
+            FROM controlling.cash_workflow_drafts d
+            JOIN public.filialen f ON f.id=d.filiale_id
+            WHERE d.status='active'
+            UNION ALL
+            SELECT 'open_drawer' AS process_kind,'drawer_opening' AS workflow_type,
+              o.business_date,f.name AS branch,o.drawer_number,o.updated_at
+            FROM core.cash_drawer_opening_counts o
+            JOIN public.filialen f ON f.id=o.branch_id
+            WHERE o.status='completed' AND o.lifecycle_status='active' AND NOT EXISTS (
+              SELECT 1 FROM core.cash_drawer_closings c
+              WHERE c.opening_count_id=o.id
+            )
+          ) processes ORDER BY updated_at DESC LIMIT 50`),
       ]);
       return res.json({ ...publicRuntimeStatus(control, processes), processes: details.rows });
     } catch (error) { return res.status(500).json({ message: 'Wartungsbereitschaft konnte nicht geprüft werden.' }); }
