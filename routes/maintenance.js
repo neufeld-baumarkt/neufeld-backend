@@ -64,7 +64,7 @@ function createMaintenanceRouter({ pool }) {
             WHERE d.status='active'
             UNION ALL
             SELECT 'open_drawer' AS process_kind,'drawer_opening' AS workflow_type,
-              o.business_date,f.name AS branch,o.drawer_number,o.updated_at
+              o.business_date,f.name AS branch,o.drawer_number,o.completed_at AS updated_at
             FROM core.cash_drawer_opening_counts o
             JOIN public.filialen f ON f.id=o.branch_id
             WHERE o.status='completed' AND o.lifecycle_status='active' AND NOT EXISTS (
