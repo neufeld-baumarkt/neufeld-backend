@@ -179,8 +179,10 @@ app.use('/api/filiale-pins', employeePinsRoutes);
 app.use('/api/bestellungen', bestellungenRoutes);
 app.use('/api/cashflow', cashflowRoutes);
 app.use('/api/controlling', controllingRoutes);
-app.use('/api/tageskasse/safe-counts', require('./routes/safeCounts'));
 app.use('/api/tageskasse', tageskasseRoutes);
+// Keep the legacy safe-count router as a fallback only. V2.1 owns the
+// /safe-counts endpoints and must be allowed to handle them first.
+app.use('/api/tageskasse/safe-counts', require('./routes/safeCounts'));
 app.use('/api/dev-db', devDbRoutes);
 app.use('/api', stammdatenRoutes);
 
