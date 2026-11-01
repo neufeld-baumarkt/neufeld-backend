@@ -166,7 +166,8 @@ const debugRoutes = require('./routes/debug');
 const tasksRoutes = require('./routes/tasks');
 const employeePinsRoutes = require('./routes/employeePins');
 const bestellungenRoutes = require('./routes/bestellungen');
-const cashflowRoutes = require('./routes/cashflow');
+// Temporary diagnostic route for the verified 23-column production schema.
+const cashflowRoutes = require('./routes/cashflowLegacyDiagnostic');
 const devDbRoutes = require('./routes/devDb');
 const controllingRoutes = require('./routes/controlling');
 const tageskasseRoutes = require('./routes/tageskasse');
