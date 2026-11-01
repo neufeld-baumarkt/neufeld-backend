@@ -15,6 +15,7 @@ const { resolveCashBusinessDate } = require('../lib/cashBusinessDatePolicy');
 const { visibleCashEmployees } = require('../lib/cashEmployeeVisibility');
 const { validateDepositReceipt } = require('../lib/depositReceiptPolicy');
 const { signClosingContext, verifyClosingContext } = require('../lib/cashClosingContextProof');
+const { normalizeClosePayload, normalizeDraftKey, normalizeDraftPayload, normalizeWorkflowType } = require('../lib/workflowDraftPolicy');
 
 const router = express.Router();
 // A complete physical recount can legitimately take longer than ten minutes.
@@ -132,6 +133,41 @@ function closingJson(row) {
     closedAt: row.closed_at,
   };
 }
+
+function workflowDraftJson(row) {
+  return row ? { id:row.id, workflowType:row.workflow_type, draftKey:row.draft_key, stage:row.stage,
+    state:row.state||{}, revision:Number(row.revision), savedAt:row.updated_at } : null;
+}
+
+router.get('/workflow-drafts/:workflowType/:draftKey', async (req,res)=>{
+  try {
+    const branch=await resolveBranch(pool,req); const businessDate=resolveCashBusinessDate(req);
+    const workflowType=normalizeWorkflowType(req.params.workflowType); const draftKey=normalizeDraftKey(req.params.draftKey);
+    const result=await pool.query(`SELECT * FROM controlling.cash_workflow_drafts WHERE filiale_id=$1 AND business_date=$2 AND workflow_type=$3 AND draft_key=$4 AND status='active' ORDER BY updated_at DESC LIMIT 1`,[branch.id,businessDate,workflowType,draftKey]);
+    return res.json({draft:workflowDraftJson(result.rows[0])});
+  } catch(error){return res.status(error.statusCode||500).json({message:error.statusCode?error.message:'Entwurf konnte nicht geladen werden.'});}
+});
+
+router.put('/workflow-drafts/:workflowType/:draftKey', async (req,res)=>{
+  try {
+    const branch=await resolveBranch(pool,req); const businessDate=resolveCashBusinessDate(req);
+    const workflowType=normalizeWorkflowType(req.params.workflowType); const draftKey=normalizeDraftKey(req.params.draftKey); const payload=normalizeDraftPayload(req.body);
+    if(req.runtimeControl?.mode==='draining'&&payload.expectedRevision===0) throw Object.assign(new Error('Wartung wird vorbereitet. Es kann kein neuer Kassenprozess begonnen werden.'),{statusCode:503});
+    const result=await pool.query(`INSERT INTO controlling.cash_workflow_drafts (filiale_id,business_date,workflow_type,draft_key,stage,state,created_by_user_id,updated_by_user_id) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$7) ON CONFLICT (filiale_id,business_date,workflow_type,draft_key) WHERE status='active' DO UPDATE SET stage=EXCLUDED.stage,state=EXCLUDED.state,updated_by_user_id=EXCLUDED.updated_by_user_id,updated_at=NOW(),revision=controlling.cash_workflow_drafts.revision+1 WHERE controlling.cash_workflow_drafts.revision=$8 RETURNING *`,[branch.id,businessDate,workflowType,draftKey,payload.stage,payload.serialized,req.user.id,payload.expectedRevision]);
+    if(!result.rows[0]) throw Object.assign(new Error('Der Entwurf wurde inzwischen auf einem anderen Gerät geändert. Bitte neu laden.'),{statusCode:409});
+    return res.json({draft:workflowDraftJson(result.rows[0])});
+  } catch(error){return res.status(error.statusCode||500).json({message:error.statusCode?error.message:'Entwurf konnte nicht gespeichert werden.'});}
+});
+
+router.post('/workflow-drafts/:workflowType/:draftKey/close', async (req,res)=>{
+  try {
+    const branch=await resolveBranch(pool,req); const businessDate=resolveCashBusinessDate(req);
+    const workflowType=normalizeWorkflowType(req.params.workflowType); const draftKey=normalizeDraftKey(req.params.draftKey); const payload=normalizeClosePayload(req.body);
+    const result=await pool.query(`UPDATE controlling.cash_workflow_drafts SET status=$5,closed_at=NOW(),updated_at=NOW(),updated_by_user_id=$6,revision=revision+1 WHERE filiale_id=$1 AND business_date=$2 AND workflow_type=$3 AND draft_key=$4 AND status='active' AND revision=$7 RETURNING id,status,revision,closed_at`,[branch.id,businessDate,workflowType,draftKey,payload.status,req.user.id,payload.expectedRevision]);
+    if(!result.rows[0]) throw Object.assign(new Error('Der Entwurf wurde inzwischen geändert oder bereits geschlossen. Bitte neu laden.'),{statusCode:409});
+    return res.json({draft:{id:result.rows[0].id,status:result.rows[0].status,revision:Number(result.rows[0].revision),closedAt:result.rows[0].closed_at}});
+  } catch(error){return res.status(error.statusCode||500).json({message:error.statusCode?error.message:'Entwurf konnte nicht geschlossen werden.'});}
+});
 
 function openingJson(row) {
   return {
