@@ -22,6 +22,11 @@ const router = express.Router();
 
 const pool = require('../db');
 const verifyToken = require('../middleware/verifyToken');
+const {
+  calculatePaymentAmount,
+  calculatePlannedAmount,
+  normalizeSkontoRate,
+} = require('../lib/cashflowInvoicePayments');
 
 const ALLOWED_ROLES = new Set(['Admin', 'Supervisor', 'Geschäftsführer']);
 const ALLOWED_TAGS = new Set(['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So']);
@@ -202,6 +207,8 @@ function parseFastBookingPayload(req, res) {
   }
 
   let betrag = 0;
+  let rechnungsbetragBrutto = null;
+  let skontoProzent = 0;
 
   if (eintragTyp === 'betrag') {
     betrag = Number(req.body?.betrag);
@@ -211,6 +218,17 @@ function parseFastBookingPayload(req, res) {
         message: 'Ungültiger Betrag. Erwartet wird eine Zahl ungleich 0.',
       });
       return null;
+    }
+
+    if (req.body?.rechnungsbetrag_brutto !== undefined) {
+      rechnungsbetragBrutto = Number(req.body.rechnungsbetrag_brutto);
+      try {
+        skontoProzent = normalizeSkontoRate(req.body?.skonto_prozent) ?? 0;
+        betrag = calculatePlannedAmount(rechnungsbetragBrutto, skontoProzent);
+      } catch (error) {
+        res.status(400).json({ message: error.message });
+        return null;
+      }
     }
   }
 
@@ -225,6 +243,8 @@ function parseFastBookingPayload(req, res) {
     kategorieId,
     filiale,
     betrag,
+    rechnungsbetragBrutto,
+    skontoProzent,
     eintragTyp,
     notiz,
   };
@@ -273,13 +293,37 @@ function parseUpdateBuchungPayload(req, res) {
 
   const rechnungsnummer = normalizeOptionalText(req.body?.rechnungsnummer);
   const rechnungsdatumParsed = parseOptionalIsoDate(req.body?.rechnungsdatum);
+  const datumParsed = parseOptionalIsoDate(req.body?.datum);
   const avisNummer = normalizeOptionalText(req.body?.avis_nummer);
   const zahlungsart = normalizeOptionalText(req.body?.zahlungsart);
+  const grossProvided = req.body?.rechnungsbetrag_brutto !== undefined;
+  const grossAmount = grossProvided && req.body.rechnungsbetrag_brutto !== null
+    ? Number(req.body.rechnungsbetrag_brutto)
+    : null;
+  const skontoProvided = req.body?.skonto_prozent !== undefined;
+  let skontoProzent;
+
+  try {
+    skontoProzent = skontoProvided
+      ? normalizeSkontoRate(req.body.skonto_prozent)
+      : undefined;
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+    return null;
+  }
 
   if (rechnungsdatumParsed.provided && Number.isNaN(rechnungsdatumParsed.value)) {
     res.status(400).json({
       message: 'Ungültiges Rechnungsdatum. Erwartet wird YYYY-MM-DD.',
     });
+    return null;
+  }
+  if (datumParsed.provided && Number.isNaN(datumParsed.value)) {
+    res.status(400).json({ message: 'Ungültiges Buchungsdatum. Erwartet wird YYYY-MM-DD.' });
+    return null;
+  }
+  if (grossProvided && grossAmount !== null && (!Number.isFinite(grossAmount) || grossAmount === 0)) {
+    res.status(400).json({ message: 'Ungültiger Original-Rechnungsbetrag.' });
     return null;
   }
 
@@ -360,6 +404,9 @@ function parseUpdateBuchungPayload(req, res) {
     !rechnungsdatumParsed.provided &&
     avisNummer === undefined &&
     zahlungsart === undefined
+    && !datumParsed.provided
+    && !grossProvided
+    && !skontoProvided
   ) {
     res.status(400).json({
       message: 'Keine gültigen Änderungsdaten übergeben.',
@@ -387,11 +434,17 @@ function parseUpdateBuchungPayload(req, res) {
     rechnungsdatum: rechnungsdatumParsed.value,
     avisNummer,
     zahlungsart,
+    datum: datumParsed.value,
+    grossAmount,
+    skontoProzent,
     updateBetrag: betragProvided,
     updateRechnungsnummer: rechnungsnummer !== undefined,
     updateRechnungsdatum: rechnungsdatumParsed.provided,
     updateAvisNummer: avisNummer !== undefined,
     updateZahlungsart: zahlungsart !== undefined,
+    updateDatum: datumParsed.provided,
+    updateGrossAmount: grossProvided,
+    updateSkonto: skontoProvided,
   };
 }
 
@@ -445,6 +498,11 @@ router.post('/buchungen', verifyToken(), requireCashflowAccess, async (req, res)
     const targets = isUnternehmenssplit
       ? splitAmountToFilialen(payload.betrag)
       : [{ filiale: payload.filiale, betrag: payload.betrag }];
+    const grossTargets = payload.rechnungsbetragBrutto === null
+      ? []
+      : isUnternehmenssplit
+        ? splitAmountToFilialen(payload.rechnungsbetragBrutto)
+        : [{ filiale: payload.filiale, betrag: payload.rechnungsbetragBrutto }];
 
     const buchungsgruppeId = isUnternehmenssplit
       ? crypto.randomUUID()
@@ -477,7 +535,9 @@ router.post('/buchungen', verifyToken(), requireCashflowAccess, async (req, res)
             rechnungsdatum,
             avis_nummer,
             zahlungsart,
-            buchungsgruppe_id
+            buchungsgruppe_id,
+            rechnungsbetrag_brutto,
+            skonto_prozent
           )
           VALUES (
             $1,
@@ -497,7 +557,9 @@ router.post('/buchungen', verifyToken(), requireCashflowAccess, async (req, res)
             NULL,
             NULL,
             NULL,
-            $10
+            $10,
+            $11,
+            $12
           )
           RETURNING
             id,
@@ -520,7 +582,12 @@ router.post('/buchungen', verifyToken(), requireCashflowAccess, async (req, res)
             rechnungsdatum,
             avis_nummer,
             zahlungsart,
-            buchungsgruppe_id
+            buchungsgruppe_id,
+            rechnungsbetrag_brutto,
+            skonto_prozent,
+            skonto_genutzt,
+            zahlungsdatum,
+            zahlbetrag
           `,
           [
             payload.jahr,
@@ -535,6 +602,8 @@ router.post('/buchungen', verifyToken(), requireCashflowAccess, async (req, res)
               : payload.notiz,
             payload.eintragTyp,
             buchungsgruppeId,
+            grossTargets.find((item) => item.filiale === target.filiale)?.betrag ?? null,
+            payload.skontoProzent,
           ]
         );
 
@@ -602,6 +671,8 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
         b.planbetrag,
         b.eintrag_typ,
         b.buchungsgruppe_id,
+        b.rechnungsbetrag_brutto,
+        b.skonto_prozent,
         k.typ
       FROM cashflow.buchungen b
       JOIN cashflow.kategorien k
@@ -627,7 +698,9 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
       payload.updateRechnungsnummer ||
       payload.updateRechnungsdatum ||
       payload.updateAvisNummer ||
-      payload.updateZahlungsart;
+      payload.updateZahlungsart ||
+      payload.updateGrossAmount ||
+      payload.updateSkonto;
 
     if (isEinnahme && hasInvoiceFieldUpdate) {
       await client.query('ROLLBACK');
@@ -737,6 +810,37 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
       });
     }
 
+    if (payload.updateDatum) {
+      await client.query(
+        'UPDATE cashflow.buchungen SET datum = $2::date, geaendert_am = NOW() WHERE id = $1',
+        [id, payload.datum]
+      );
+    }
+
+    if (payload.updateGrossAmount || payload.updateSkonto) {
+      const effectiveGross = payload.updateGrossAmount
+        ? payload.grossAmount
+        : current.rechnungsbetrag_brutto;
+      const effectiveSkonto = payload.updateSkonto
+        ? payload.skontoProzent
+        : Number(current.skonto_prozent || 0);
+      const plannedAmount = effectiveGross === null
+        ? null
+        : calculatePlannedAmount(effectiveGross, effectiveSkonto);
+      const targetColumn = current.buchungsgruppe_id === null ? 'id' : 'buchungsgruppe_id';
+      const targetValue = current.buchungsgruppe_id === null ? id : current.buchungsgruppe_id;
+
+      await client.query(
+        `UPDATE cashflow.buchungen
+         SET rechnungsbetrag_brutto = $2,
+             skonto_prozent = $3,
+             betrag = CASE WHEN status = 'angekuendigt' AND $4::numeric IS NOT NULL THEN $4 ELSE betrag END,
+             geaendert_am = NOW()
+         WHERE ${targetColumn} = $1`,
+        [targetValue, effectiveGross, effectiveSkonto, plannedAmount]
+      );
+    }
+
     if (current.buchungsgruppe_id !== null && hasGroupedFieldUpdate) {
       await client.query(
         `
@@ -747,6 +851,8 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
           rechnungsdatum = CASE WHEN $6::boolean THEN $7::date ELSE rechnungsdatum END,
           avis_nummer = CASE WHEN $8::boolean THEN $9 ELSE avis_nummer END,
           zahlungsart = CASE WHEN $10::boolean THEN $11 ELSE zahlungsart END,
+          rechnungsbetrag_brutto = CASE WHEN $12::boolean THEN $13 ELSE rechnungsbetrag_brutto END,
+          skonto_prozent = CASE WHEN $14::boolean THEN $15 ELSE skonto_prozent END,
           geaendert_am = NOW()
         WHERE buchungsgruppe_id = $1
         `,
@@ -762,6 +868,10 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
           payload.avisNummer,
           payload.updateZahlungsart,
           payload.zahlungsart,
+          payload.updateGrossAmount,
+          payload.grossAmount,
+          payload.updateSkonto,
+          payload.skontoProzent,
         ]
       );
     }
@@ -815,7 +925,12 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
         b.rechnungsdatum,
         b.avis_nummer,
         b.zahlungsart,
-        b.buchungsgruppe_id
+        b.buchungsgruppe_id,
+        b.rechnungsbetrag_brutto,
+        b.skonto_prozent,
+        b.skonto_genutzt,
+        b.zahlungsdatum,
+        b.zahlbetrag
       FROM cashflow.buchungen b
       JOIN cashflow.kategorien k
         ON k.id = b.kategorie_id
@@ -921,11 +1036,15 @@ router.delete('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req
 // GET /api/cashflow/buchungen/suche?suchwert=...
 router.get('/buchungen/suche', verifyToken(), requireCashflowAccess, async (req, res) => {
   const suchwert = String(req.query?.suchwert || '').trim();
+  const suchtyp = String(req.query?.typ || 'rechnung').trim();
 
   if (!suchwert) {
     return res.status(400).json({
       message: 'suchwert fehlt.',
     });
+  }
+  if (!['rechnung', 'avis'].includes(suchtyp)) {
+    return res.status(400).json({ message: 'Ungültiger Suchtyp.' });
   }
 
   try {
@@ -950,6 +1069,11 @@ router.get('/buchungen/suche', verifyToken(), requireCashflowAccess, async (req,
         b.avis_nummer,
         b.zahlungsart,
         b.buchungsgruppe_id,
+        b.rechnungsbetrag_brutto,
+        b.skonto_prozent,
+        b.skonto_genutzt,
+        b.zahlungsdatum,
+        b.zahlbetrag,
         b.erstellt_von,
         b.erstellt_am,
         b.geaendert_am
@@ -958,17 +1082,15 @@ router.get('/buchungen/suche', verifyToken(), requireCashflowAccess, async (req,
         ON k.id = b.kategorie_id
       WHERE k.aktiv = true
         AND k.typ = 'Ausgabe'
-        AND (
-          b.avis_nummer = $1
-          OR b.rechnungsnummer = $1
-        )
+        AND (($2 = 'avis' AND b.avis_nummer = $1)
+          OR ($2 = 'rechnung' AND b.rechnungsnummer = $1))
       ORDER BY
         b.avis_nummer NULLS LAST,
         b.rechnungsdatum NULLS LAST,
         b.rechnungsnummer NULLS LAST,
         b.id
       `,
-      [suchwert]
+      [suchwert, suchtyp]
     );
 
     const avisMap = new Map();
@@ -991,37 +1113,16 @@ router.get('/buchungen/suche', verifyToken(), requireCashflowAccess, async (req,
         .reduce((sum, row) => sum + Number(row.betrag || 0), 0)
         .toFixed(2),
       status: deriveGroupedStatus(rows),
-      rechnungen: rows.map((row) => ({
-        id: row.id,
-        rechnungsnummer: row.rechnungsnummer,
-        rechnungsdatum: row.rechnungsdatum,
-        betrag: row.betrag,
-        filiale: row.filiale,
-        kategorie: row.kategorie,
-        status: row.status,
-        zahlungsart: row.zahlungsart,
-        buchungsgruppe_id: row.buchungsgruppe_id,
-      })),
+      rechnungen: rows.map((row) => ({ ...row, typ: 'rechnung' })),
     }));
 
     const rechnungsTreffer = result.rows
       .filter((row) => row.rechnungsnummer === suchwert)
-      .map((row) => ({
-        typ: 'rechnung',
-        id: row.id,
-        rechnungsnummer: row.rechnungsnummer,
-        rechnungsdatum: row.rechnungsdatum,
-        avis_nummer: row.avis_nummer,
-        betrag: row.betrag,
-        filiale: row.filiale,
-        kategorie: row.kategorie,
-        status: row.status,
-        zahlungsart: row.zahlungsart,
-        buchungsgruppe_id: row.buchungsgruppe_id,
-      }));
+      .map((row) => ({ ...row, typ: 'rechnung' }));
 
     return res.json({
       suchwert,
+      suchtyp,
       anzahl_treffer: avisTreffer.length + rechnungsTreffer.length,
       avis: avisTreffer,
       rechnungen: rechnungsTreffer,
@@ -1032,6 +1133,107 @@ router.get('/buchungen/suche', verifyToken(), requireCashflowAccess, async (req,
     return res.status(500).json({
       message: 'Serverfehler bei der Suche nach Avis oder Rechnungsnummer.',
     });
+  }
+});
+
+// GET /api/cashflow/buchungen/ueberweisungen?alle=1
+router.get('/buchungen/ueberweisungen', verifyToken(), requireCashflowAccess, async (req, res) => {
+  const includeBooked = String(req.query?.alle || '') === '1';
+
+  try {
+    const result = await pool.query(
+      `SELECT
+         b.id, b.jahr, b.kw, b.datum, b.tag, b.kategorie_id,
+         k.name AS kategorie, b.betrag, b.filiale, b.status, b.notiz,
+         b.eintrag_typ, b.rechnungsnummer, b.rechnungsdatum, b.avis_nummer,
+         b.zahlungsart, b.buchungsgruppe_id, b.rechnungsbetrag_brutto,
+         b.skonto_prozent, b.skonto_genutzt, b.zahlungsdatum, b.zahlbetrag,
+         b.erstellt_von, b.erstellt_am, b.geaendert_am
+       FROM cashflow.buchungen b
+       JOIN cashflow.kategorien k ON k.id = b.kategorie_id
+       WHERE k.aktiv = true
+         AND k.typ = 'Ausgabe'
+         AND b.zahlungsart = 'ueberweisung'
+         AND ($1::boolean OR b.status = 'angekuendigt')
+       ORDER BY COALESCE(b.datum, make_date(b.jahr, 1, 1)) ASC, b.jahr, b.kw, b.rechnungsnummer NULLS LAST`,
+      [includeBooked]
+    );
+
+    return res.json({
+      anzahl: result.rowCount,
+      alle: includeBooked,
+      ueberweisungen: result.rows,
+    });
+  } catch (err) {
+    console.error('Fehler GET /api/cashflow/buchungen/ueberweisungen:', err);
+    return res.status(500).json({ message: 'Überweisungen konnten nicht geladen werden.' });
+  }
+});
+
+// POST /api/cashflow/buchungen/:id/bezahlen
+router.post('/buchungen/:id/bezahlen', verifyToken(), requireCashflowAccess, async (req, res) => {
+  const id = String(req.params?.id || '').trim();
+  const zahlungsdatum = parseOptionalIsoDate(req.body?.zahlungsdatum);
+  const skontoGenutzt = req.body?.skonto_genutzt;
+
+  if (!isValidUuid(id)) {
+    return res.status(400).json({ message: 'Ungültige Buchungs-ID.' });
+  }
+  if (!zahlungsdatum.provided || !zahlungsdatum.value || Number.isNaN(zahlungsdatum.value)) {
+    return res.status(400).json({ message: 'Ein gültiges Überweisungsdatum ist erforderlich.' });
+  }
+  if (typeof skontoGenutzt !== 'boolean') {
+    return res.status(400).json({ message: 'Skonto genutzt muss mit Ja oder Nein angegeben werden.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const currentResult = await client.query(
+      `SELECT b.*, k.typ
+       FROM cashflow.buchungen b
+       JOIN cashflow.kategorien k ON k.id = b.kategorie_id
+       WHERE b.id = $1 AND k.aktiv = true AND k.typ = 'Ausgabe'
+       FOR UPDATE OF b`,
+      [id]
+    );
+
+    if (currentResult.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Ausgabenbuchung nicht gefunden.' });
+    }
+
+    const current = currentResult.rows[0];
+    if (current.zahlungsart !== 'ueberweisung') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'Die Buchung ist nicht als Überweisung gekennzeichnet.' });
+    }
+
+    const zahlbetrag = calculatePaymentAmount({
+      grossAmount: current.rechnungsbetrag_brutto,
+      plannedAmount: current.betrag,
+      skontoRate: current.skonto_prozent || 0,
+      useSkonto: skontoGenutzt,
+    });
+    const result = await client.query(
+      `UPDATE cashflow.buchungen
+       SET status = 'gebucht', zahlungsdatum = $2::date, zahlbetrag = $3,
+           skonto_genutzt = $4, betrag = $3, geaendert_am = NOW()
+       WHERE id = $1
+       RETURNING *`,
+      [id, zahlungsdatum.value, zahlbetrag, skontoGenutzt]
+    );
+    await client.query('COMMIT');
+
+    return res.json({ message: 'Überweisung wurde als bezahlt markiert.', buchung: result.rows[0] });
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (rollbackErr) {
+      console.error('Rollback-Fehler POST /api/cashflow/buchungen/:id/bezahlen:', rollbackErr);
+    }
+    console.error('Fehler POST /api/cashflow/buchungen/:id/bezahlen:', err);
+    return res.status(500).json({ message: 'Überweisung konnte nicht gebucht werden.' });
+  } finally {
+    client.release();
   }
 });
 
@@ -1299,7 +1501,12 @@ router.get('/buchungen', verifyToken(), requireCashflowAccess, async (req, res) 
         b.rechnungsdatum,
         b.avis_nummer,
         b.zahlungsart,
-        b.buchungsgruppe_id
+        b.buchungsgruppe_id,
+        b.rechnungsbetrag_brutto,
+        b.skonto_prozent,
+        b.skonto_genutzt,
+        b.zahlungsdatum,
+        b.zahlbetrag
       FROM cashflow.buchungen b
       JOIN cashflow.kategorien k
         ON k.id = b.kategorie_id
