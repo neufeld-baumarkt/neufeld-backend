@@ -18,6 +18,7 @@ const { signClosingContext, verifyClosingContext } = require('../lib/cashClosing
 const { normalizeClosePayload, normalizeDraftKey, normalizeDraftPayload, normalizeWorkflowType } = require('../lib/workflowDraftPolicy');
 const { openingPreview, closingPreview, safePreview, dayClosePreview } = require('../lib/cashWorkflowCalculationPolicy');
 const { deleteBusinessDayDrafts, lockDraftBusinessDay } = require('../lib/dayCloseDraft');
+const { matchesCompletedFinalization, normalizeBabReconciliation } = require('../lib/dayCloseFinalizePolicy');
 
 const router = express.Router();
 // A complete physical recount can legitimately take longer than ten minutes.
@@ -80,17 +81,22 @@ async function resolveBranch(client, req) {
   return resolveCashBranch(client, req);
 }
 
-async function ensureBusinessDayOpen(client, branchId, businessDate = null) {
+async function ensureBusinessDay(client, branchId, businessDate = null) {
   await client.query(`INSERT INTO core.cash_business_days (branch_id,business_date)
     VALUES ($1,COALESCE($2::date,(CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Berlin')::date))
     ON CONFLICT (branch_id,business_date) DO NOTHING`, [branchId,businessDate]);
   const result = await client.query(`SELECT id,business_date,status,finalized_at,final_report
     FROM core.cash_business_days
     WHERE branch_id=$1 AND business_date=COALESCE($2::date,(CURRENT_TIMESTAMP AT TIME ZONE 'Europe/Berlin')::date)`, [branchId,businessDate]);
-  if (result.rows[0].status !== 'open') {
+  return result.rows[0];
+}
+
+async function ensureBusinessDayOpen(client, branchId, businessDate = null) {
+  const businessDay = await ensureBusinessDay(client, branchId, businessDate);
+  if (businessDay.status !== 'open') {
     throw Object.assign(new Error('Dieser Geschäftstag wurde bereits verbindlich abgeschlossen und ist vollständig Read-only.'), { statusCode:409 });
   }
-  return result.rows[0];
+  return businessDay;
 }
 
 async function loadImmediatePreviousClosing(client, branchId, drawerNumber, businessDate) {
@@ -434,8 +440,13 @@ router.post('/safe-counts', async (req, res) => {
     } catch (validationError) {
       throw Object.assign(validationError, { statusCode:400 });
     }
-    const counterPinId = verifyPinProof(req.body?.counterProofToken, branch.id);
-    const recorderPinId = verifyPinProof(req.body?.recorderProofToken, branch.id);
+    if (countType === 'closing' && req.body?.dayCloseWorkflow !== true) {
+      throw Object.assign(new Error('Die Abendzählung ist ausschließlich in der Tagesabrechnung möglich.'), { statusCode:400 });
+    }
+    const counterToken = countType === 'handover' ? req.body?.handoverFromProofToken : req.body?.counterProofToken;
+    const recorderToken = countType === 'handover' ? req.body?.handoverToProofToken : req.body?.recorderProofToken;
+    const counterPinId = verifyPinProof(counterToken, branch.id);
+    const recorderPinId = verifyPinProof(recorderToken, branch.id);
     if (counterPinId === recorderPinId) throw Object.assign(new Error('Zählende und eingebende Person müssen zwei unterschiedliche Mitarbeiter sein.'), { statusCode:400 });
     const employees = await client.query(`SELECT id,display_name FROM core.filiale_pins WHERE id=ANY($1::bigint[]) AND is_active=true`, [[counterPinId,recorderPinId]]);
     const employeeById = new Map(employees.rows.map((row)=>[Number(row.id),row]));
@@ -524,10 +535,17 @@ router.post('/day-close/finalize', async (req, res) => {
     await client.query('BEGIN');
     const branch = await resolveBranch(client, req);
     const businessDate = resolveCashBusinessDate(req);
-    const businessDay = await ensureBusinessDayOpen(client, branch.id, businessDate);
+    const businessDay = await ensureBusinessDay(client, branch.id, businessDate);
     await client.query('SELECT pg_advisory_xact_lock($1,$2)', [branch.id,424242]);
     const lockedDay = await client.query('SELECT * FROM core.cash_business_days WHERE id=$1 FOR UPDATE', [businessDay.id]);
-    if (lockedDay.rows[0].status !== 'open') throw Object.assign(new Error('Dieser Geschäftstag wurde bereits verbindlich abgeschlossen.'), { statusCode:409 });
+    if (lockedDay.rows[0].status !== 'open') {
+      const existingReport = lockedDay.rows[0].final_report;
+      if (!matchesCompletedFinalization(existingReport, req.body || {})) {
+        throw Object.assign(new Error('Dieser Geschäftstag wurde bereits verbindlich abgeschlossen.'), { statusCode:409 });
+      }
+      await client.query('COMMIT');
+      return res.json({ report:existingReport, alreadyFinalized:true });
+    }
     const context = await loadBusinessDayCloseContext(client, branch, lockedDay.rows[0]);
     try { validateBusinessDayFinalization(req.body || {}, context); }
     catch (validationError) { throw Object.assign(validationError, { statusCode:400 }); }
@@ -548,11 +566,15 @@ router.post('/day-close/finalize', async (req, res) => {
       }
       approvals = approvalPinIds.map((id) => ({ id, name:approvalById.get(id) }));
     }
+    const babReconciliation = metadata.workflowVersion === 'v2'
+      ? normalizeBabReconciliation(req.body?.babReconciliation, context.totals.cashRevenueCents)
+      : null;
     const finalizedAt = new Date().toISOString();
     const report = {
       branch:branch.name, businessDate:context.businessDate, finalizedAt,
       workflowVersion:metadata.workflowVersion,
       dailyMetrics:metadata.dailyMetrics,
+      babReconciliation,
       approvals,
       totals:context.totals,
       closings:context.closings,
