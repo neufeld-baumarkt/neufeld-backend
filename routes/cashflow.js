@@ -1461,6 +1461,47 @@ router.get('/jahresuebersicht', verifyToken(), requireCashflowAccess, async (req
   }
 });
 
+router.get('/bab-tagesberichte', verifyToken(), requireCashflowAccess, async (req, res) => {
+  const jahr = parseJahrParam(req, res);
+  if (jahr === null) return;
+  const bisKw = parseBisKwParam(req, res);
+  if (bisKw === false) return;
+
+  try {
+    const params = [jahr];
+    let weekFilter = '';
+    if (bisKw !== null) {
+      params.push(bisKw);
+      weekFilter = `AND EXTRACT(WEEK FROM day.business_date) <= $${params.length}`;
+    }
+    const result = await pool.query(`SELECT day.id,TO_CHAR(day.business_date,'YYYY-MM-DD') AS business_date,
+        branch.name AS branch,day.final_report->'babReport' AS bab_report
+      FROM core.cash_business_days day
+      JOIN public.filialen branch ON branch.id=day.branch_id
+      WHERE day.status='finalized'
+        AND EXTRACT(ISOYEAR FROM day.business_date)=$1
+        ${weekFilter}
+        AND day.final_report ? 'babReport'
+      ORDER BY day.business_date DESC,branch.name`, params);
+    return res.json({
+      jahr,
+      bisKw,
+      reports:result.rows.map((row) => ({
+        id:Number(row.id),
+        businessDate:row.business_date,
+        branch:row.branch,
+        eurocontrolTargetCents:Number(row.bab_report.eurocontrolTargetCents),
+        roundedCents:Number(row.bab_report.roundedCents),
+        safeSkimCents:Number(row.bab_report.safeSkimCents),
+        bookedCents:Number(row.bab_report.bookedCents),
+      })),
+    });
+  } catch (error) {
+    console.error('GET /api/cashflow/bab-tagesberichte Fehler:', error);
+    return res.status(500).json({ message:'BaB-Tagesberichte konnten nicht geladen werden.' });
+  }
+});
+
 // GET /api/cashflow/buchungen?jahr=2024
 router.get('/buchungen', verifyToken(), requireCashflowAccess, async (req, res) => {
   const jahr = parseJahrParam(req, res);

@@ -8,7 +8,7 @@ const { validateOpeningCount } = require('../lib/cashOpeningPolicy');
 const { validateCashClosing } = require('../lib/cashClosingPolicy');
 const { validateCashCorrection } = require('../lib/cashCorrectionPolicy');
 const { requireOpeningReplacement } = require('../lib/cashDrawerSessionPolicy');
-const { calculateBusinessDayTotals, validateBusinessDayFinalization, normalizeV2FinalizationMetadata } = require('../lib/cashBusinessDayPolicy');
+const { buildBabReport, calculateBusinessDayTotals, validateBusinessDayFinalization, normalizeV2FinalizationMetadata } = require('../lib/cashBusinessDayPolicy');
 const { participantLabels, validateSafeCountPayload, validateSafeCountType } = require('../lib/cashSafePolicy');
 const { canCorrectCashClosing, canUseCashModule, isCentralRole, resolveCashBranch } = require('../lib/cashModuleAccess');
 const { resolveCashBusinessDate } = require('../lib/cashBusinessDatePolicy');
@@ -575,6 +575,7 @@ router.post('/day-close/finalize', async (req, res) => {
       workflowVersion:metadata.workflowVersion,
       dailyMetrics:metadata.dailyMetrics,
       babReconciliation,
+      babReport:buildBabReport(context.totals),
       approvals,
       totals:context.totals,
       closings:context.closings,
@@ -725,7 +726,8 @@ router.get('/business-days', async (req, res) => {
       ORDER BY business_date DESC LIMIT 120`, [branch.id]);
     return res.json({ days:result.rows.map((row)=>({
       businessDate:row.business_date,status:row.status,finalizedAt:row.finalized_at,
-      totals:row.final_report?.totals || {}, closingCount:Array.isArray(row.final_report?.closings) ? row.final_report.closings.length : 0,
+      totals:row.final_report?.totals || {}, babReport:row.final_report?.babReport || null,
+      closingCount:Array.isArray(row.final_report?.closings) ? row.final_report.closings.length : 0,
     })) });
   } catch (error) {
     console.error('GET /api/tageskasse/business-days Fehler:', error);
