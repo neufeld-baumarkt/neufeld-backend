@@ -567,7 +567,7 @@ router.post('/day-close/finalize', async (req, res) => {
       approvals = approvalPinIds.map((id) => ({ id, name:approvalById.get(id) }));
     }
     const babReconciliation = metadata.workflowVersion === 'v2'
-      ? normalizeBabReconciliation(req.body?.babReconciliation, context.totals.cashRevenueCents)
+      ? normalizeBabReconciliation(req.body?.babReconciliation, Number(req.body.eurocontrolCashTotalCents))
       : null;
     const finalizedAt = new Date().toISOString();
     const report = {
