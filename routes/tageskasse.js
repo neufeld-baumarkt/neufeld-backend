@@ -18,7 +18,7 @@ const { signClosingContext, verifyClosingContext } = require('../lib/cashClosing
 const { normalizeClosePayload, normalizeDraftKey, normalizeDraftPayload, normalizeWorkflowType } = require('../lib/workflowDraftPolicy');
 const { openingPreview, closingPreview, safePreview, dayClosePreview } = require('../lib/cashWorkflowCalculationPolicy');
 const { deleteBusinessDayDrafts, lockDraftBusinessDay } = require('../lib/dayCloseDraft');
-const { matchesCompletedFinalization, normalizeBabReconciliation } = require('../lib/dayCloseFinalizePolicy');
+const { matchesCompletedFinalization } = require('../lib/dayCloseFinalizePolicy');
 
 const router = express.Router();
 // A complete physical recount can legitimately take longer than ten minutes.
@@ -131,7 +131,7 @@ function closingJson(row) {
     openingBalanceCents: Number(row.opening_balance_cents), countedTotalCents: Number(row.counted_total_cents),
     fullCounts: row.full_counts || {}, retainedCoinCents: Number(row.retained_coin_cents),
     looseChangeCents: Number(row.loose_change_cents), bankNoteCounts: row.bank_note_counts || {},
-    bankAmountCents: Number(row.bank_amount_cents), differenceCents: Number(row.difference_cents),
+    bankAmountCents: Number(row.bank_amount_cents), eurocontrolTotalCents:Number(row.eurocontrol_total_cents), differenceCents: Number(row.difference_cents),
     notificationRequired: row.notification_required === true, notificationConfirmed: row.notification_confirmed === true,
     recountAttempts: row.recount_attempts || [], resolved: row.resolved === true, status: row.status,
     recordKind: row.record_kind || 'original', revisionNumber: Number(row.revision_number || 1),
@@ -566,22 +566,19 @@ router.post('/day-close/finalize', async (req, res) => {
       }
       approvals = approvalPinIds.map((id) => ({ id, name:approvalById.get(id) }));
     }
-    const babReconciliation = metadata.workflowVersion === 'v2'
-      ? normalizeBabReconciliation(req.body?.babReconciliation, context.totals.cashRevenueCents)
-      : null;
     const finalizedAt = new Date().toISOString();
     const report = {
       branch:branch.name, businessDate:context.businessDate, finalizedAt,
       workflowVersion:metadata.workflowVersion,
       dailyMetrics:metadata.dailyMetrics,
-      babReconciliation,
+      babReconciliation:null,
       babReport:buildBabReport(context.totals),
       approvals,
       totals:context.totals,
       closings:context.closings,
       replacedOpenings:context.replacedOpenings,
       finalSafeCount:context.finalSafeCount,
-      eurocontrolCashTotalCents:Number(req.body.eurocontrolCashTotalCents),
+      eurocontrolCashTotalCents:context.totals.cashRevenueCents,
       looseChangePayoutConfirmed:context.totals.looseChangePayoutCents === 0 || req.body.looseChangePayoutConfirmed === true,
       additionalSafeSkimConfirmed:context.totals.additionalSafeSkimCents === 0 || req.body.additionalSafeSkimConfirmed === true,
       bankPayoutConfirmed:true, safeBagConfirmed:true,
@@ -1066,7 +1063,7 @@ router.post('/closings', async (req, res) => {
       opening ? Number(opening.opening_balance_cents) : 25000, Boolean(opening), !opening,
       checked.countedTotalCents, JSON.stringify(checked.fullCounts), checked.retainedCoinCents,
       checked.looseChangeCents, JSON.stringify(checked.retainedNoteCounts), JSON.stringify(checked.bankNoteCounts),
-      checked.bankAmountCents, checked.bankAmountCents, checked.differenceCents,
+      checked.bankAmountCents, checked.eurocontrolTotalCents, checked.differenceCents,
       checked.notificationRequired, checked.notificationRequired ? req.body.notificationConfirmed === true : false,
       JSON.stringify(checked.recountAttempts), checked.differenceCents === 0, req.user.id, businessDate,
     ]);
@@ -1081,7 +1078,7 @@ router.post('/closings', async (req, res) => {
       closedAt: result.rows[0].closed_at, branch: branch.name, drawerNumber: checked.drawerNumber,
       employee: { id: responsibleEmployeePinId, name: employeeById.get(responsibleEmployeePinId).display_name },
       closedBy: { id: closedByPinId, name: employeeById.get(closedByPinId).display_name },
-      bankAmountCents: checked.bankAmountCents, differenceCents: checked.differenceCents,
+      bankAmountCents: checked.bankAmountCents, eurocontrolTotalCents:checked.eurocontrolTotalCents, differenceCents: checked.differenceCents,
       openingPresent: Boolean(opening), status: 'closed',
     } });
   } catch (error) {
