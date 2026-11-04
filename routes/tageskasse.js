@@ -11,7 +11,7 @@ const { requireOpeningReplacement } = require('../lib/cashDrawerSessionPolicy');
 const { buildBabReport, calculateBusinessDayTotals, validateBusinessDayFinalization, normalizeV2FinalizationMetadata } = require('../lib/cashBusinessDayPolicy');
 const { participantLabels, validateSafeCountPayload, validateSafeCountType } = require('../lib/cashSafePolicy');
 const { canCorrectCashClosing, canUseCashModule, isCentralRole, resolveCashBranch } = require('../lib/cashModuleAccess');
-const { resolveCashBusinessDate } = require('../lib/cashBusinessDatePolicy');
+const { normalizeCashBusinessDate, resolveCashBusinessDate } = require('../lib/cashBusinessDatePolicy');
 const { visibleCashEmployees } = require('../lib/cashEmployeeVisibility');
 const { validateDepositReceipt } = require('../lib/depositReceiptPolicy');
 const { signClosingContext, verifyClosingContext } = require('../lib/cashClosingContextProof');
@@ -1115,7 +1115,7 @@ router.post('/closings/:id/corrections', async (req, res) => {
     if (!source) throw Object.assign(new Error('Die zu korrigierende Abrechnung wurde nicht gefunden.'), { statusCode:404 });
     if (source.superseded) throw Object.assign(new Error('Diese Abrechnung wurde bereits korrigiert. Bitte öffne die neueste Revision.'), { statusCode:409 });
     const requestedDate = resolveCashBusinessDate(req);
-    if (String(source.business_date).slice(0,10) !== requestedDate) {
+    if (normalizeCashBusinessDate(source.business_date) !== requestedDate) {
       throw Object.assign(new Error('Die Korrektur gehört nicht zum ausgewählten Geschäftstag.'), { statusCode:409 });
     }
     await ensureBusinessDayOpen(client, branch.id, source.business_date);
