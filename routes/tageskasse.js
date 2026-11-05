@@ -580,18 +580,20 @@ router.post('/day-close/finalize', async (req, res) => {
       approvals = approvalPinIds.map((id) => ({ id, name:approvalById.get(id) }));
     }
     const finalizedAt = new Date().toISOString();
+    const eurocontrolCashTotalCents = metadata.dailyMetrics?.eurocontrolBankCents ?? req.body.eurocontrolCashTotalCents;
+    const babReport = buildBabReport(context.totals, eurocontrolCashTotalCents);
     const report = {
       branch:branch.name, businessDate:context.businessDate, finalizedAt,
       workflowVersion:metadata.workflowVersion,
       dailyMetrics:metadata.dailyMetrics,
       babReconciliation:null,
-      babReport:buildBabReport(context.totals),
+      babReport,
       approvals,
       totals:context.totals,
       closings:context.closings,
       replacedOpenings:context.replacedOpenings,
       finalSafeCount:context.finalSafeCount,
-      eurocontrolCashTotalCents:context.totals.cashRevenueCents,
+      eurocontrolCashTotalCents:babReport.eurocontrolTargetCents,
       looseChangePayoutConfirmed:context.totals.looseChangePayoutCents === 0 || req.body.looseChangePayoutConfirmed === true,
       additionalSafeSkimConfirmed:context.totals.additionalSafeSkimCents === 0 || req.body.additionalSafeSkimConfirmed === true,
       bankPayoutConfirmed:true, safeBagConfirmed:true,
