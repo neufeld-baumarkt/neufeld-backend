@@ -5,7 +5,7 @@ const pool = require('../db');
 const verifyToken = require('../middleware/verifyToken');
 const { findActivePinMatches } = require('../lib/employeePinIdentity');
 const { validateOpeningCount } = require('../lib/cashOpeningPolicy');
-const { validateCashClosing } = require('../lib/cashClosingPolicy');
+const { cumulativeBabTotalCents, validateCashClosing, validateCumulativeBabCheck } = require('../lib/cashClosingPolicy');
 const { validateCashCorrection } = require('../lib/cashCorrectionPolicy');
 const { requireOpeningReplacement } = require('../lib/cashDrawerSessionPolicy');
 const { buildBabReport, calculateBusinessDayTotals, validateBusinessDayFinalization, normalizeV2FinalizationMetadata } = require('../lib/cashBusinessDayPolicy');
@@ -107,6 +107,15 @@ async function loadImmediatePreviousClosing(client, branchId, drawerNumber, busi
   return result.rows[0] || null;
 }
 
+async function loadAccumulatedBabCents(client, branchId, businessDate) {
+  const result = await client.query(`SELECT COALESCE(SUM(c.bank_amount_cents+c.loose_change_cents),0)::bigint AS total
+    FROM core.cash_drawer_closings c
+    WHERE c.branch_id=$1 AND c.business_date=$2 AND c.status='closed'
+      AND NOT EXISTS (SELECT 1 FROM core.cash_drawer_closings newer WHERE newer.corrects_closing_id=c.id)`,
+  [branchId,businessDate]);
+  return Number(result.rows[0]?.total || 0);
+}
+
 function signPinProof(pinRow, branchId) {
   return jwt.sign({ type: 'cash-pin-proof', pinId: Number(pinRow.id), branchId: Number(branchId) }, process.env.JWT_SECRET, { expiresIn: PIN_PROOF_TTL_SECONDS });
 }
@@ -132,6 +141,10 @@ function closingJson(row) {
     fullCounts: row.full_counts || {}, retainedCoinCents: Number(row.retained_coin_cents),
     looseChangeCents: Number(row.loose_change_cents), bankNoteCounts: row.bank_note_counts || {},
     bankAmountCents: Number(row.bank_amount_cents), eurocontrolTotalCents:Number(row.eurocontrol_total_cents), differenceCents: Number(row.difference_cents),
+    cumulativeBabExpectedCents:row.bab_running_expected_cents == null ? null : Number(row.bab_running_expected_cents),
+    cumulativeBabEurocontrolCents:row.bab_running_eurocontrol_cents == null ? null : Number(row.bab_running_eurocontrol_cents),
+    cumulativeBabDifferenceCents:row.bab_running_difference_cents == null ? null : Number(row.bab_running_difference_cents),
+    cumulativeBabMatches:row.bab_running_matches == null ? null : row.bab_running_matches === true,
     notificationRequired: row.notification_required === true, notificationConfirmed: row.notification_confirmed === true,
     recountAttempts: row.recount_attempts || [], resolved: row.resolved === true, status: row.status,
     recordKind: row.record_kind || 'original', revisionNumber: Number(row.revision_number || 1),
@@ -567,18 +580,20 @@ router.post('/day-close/finalize', async (req, res) => {
       approvals = approvalPinIds.map((id) => ({ id, name:approvalById.get(id) }));
     }
     const finalizedAt = new Date().toISOString();
+    const eurocontrolCashTotalCents = metadata.dailyMetrics?.eurocontrolBankCents ?? req.body.eurocontrolCashTotalCents;
+    const babReport = buildBabReport(context.totals, eurocontrolCashTotalCents);
     const report = {
       branch:branch.name, businessDate:context.businessDate, finalizedAt,
       workflowVersion:metadata.workflowVersion,
       dailyMetrics:metadata.dailyMetrics,
       babReconciliation:null,
-      babReport:buildBabReport(context.totals),
+      babReport,
       approvals,
       totals:context.totals,
       closings:context.closings,
       replacedOpenings:context.replacedOpenings,
       finalSafeCount:context.finalSafeCount,
-      eurocontrolCashTotalCents:context.totals.cashRevenueCents,
+      eurocontrolCashTotalCents:babReport.eurocontrolTargetCents,
       looseChangePayoutConfirmed:context.totals.looseChangePayoutCents === 0 || req.body.looseChangePayoutConfirmed === true,
       additionalSafeSkimConfirmed:context.totals.additionalSafeSkimCents === 0 || req.body.additionalSafeSkimConfirmed === true,
       bankPayoutConfirmed:true, safeBagConfirmed:true,
@@ -989,10 +1004,12 @@ router.post('/closing-context', async (req, res) => {
         AND NOT EXISTS (SELECT 1 FROM core.cash_drawer_closings c WHERE c.opening_count_id=o.id)
       ORDER BY o.completed_at DESC,o.id DESC LIMIT 1`, [branch.id, drawerNumber, responsibleEmployeePinId, businessDate]);
     const row = opening.rows[0];
+    const previousBabTotalCents = await loadAccumulatedBabCents(pool, branch.id, businessDate);
     return res.json({
       employee: { id: responsibleEmployeePinId, name: employeeById.get(responsibleEmployeePinId).display_name },
       closedBy: { id: closedByPinId, name: employeeById.get(closedByPinId).display_name },
       contextProofToken: signClosingContext(closedByPinId, responsibleEmployeePinId, branch.id, drawerNumber, process.env.JWT_SECRET),
+      previousBabTotalCents,
       opening: row ? {
         id: Number(row.id),
         businessDate: row.business_date,
@@ -1014,6 +1031,7 @@ router.post('/closings', async (req, res) => {
     const branch = await resolveBranch(client, req);
     const businessDate = resolveCashBusinessDate(req);
     await ensureBusinessDayOpen(client, branch.id, businessDate);
+    await client.query('SELECT pg_advisory_xact_lock($1,$2)', [branch.id,0]);
     const responsibleEmployeePinId = Number(req.body?.responsibleEmployeeId);
     if (!Number.isInteger(responsibleEmployeePinId) || responsibleEmployeePinId <= 0) throw Object.assign(new Error('Bitte wähle den verantwortlichen Kassierer aus.'), { statusCode:400 });
 
@@ -1051,13 +1069,20 @@ router.post('/closings', async (req, res) => {
       throw Object.assign(new Error('Die fehlende Einzählung muss ausdrücklich bestätigt werden.'), { statusCode: 400 });
     }
 
+    const previousBabTotalCents = await loadAccumulatedBabCents(client, branch.id, businessDate);
+    const cumulativeBabCents = cumulativeBabTotalCents(previousBabTotalCents, checked.bankAmountCents, checked.looseChangeCents);
+    let cumulativeBabCheck;
+    try { cumulativeBabCheck = validateCumulativeBabCheck(req.body, cumulativeBabCents); }
+    catch (validationError) { throw Object.assign(validationError, { statusCode:400 }); }
+
     const result = await client.query(`INSERT INTO core.cash_drawer_closings
       (branch_id,business_date,drawer_number,employee_pin_id,closed_by_pin_id,opening_count_id,opening_balance_cents,
        opening_present,proceeded_without_opening,counted_total_cents,full_counts,retained_coin_cents,
        loose_change_cents,retained_note_counts,bank_note_counts,bank_amount_cents,eurocontrol_total_cents,
-       difference_cents,notification_required,notification_confirmed,recount_attempts,resolved,status,created_by_user_id)
+       difference_cents,notification_required,notification_confirmed,recount_attempts,resolved,status,created_by_user_id,
+       bab_running_expected_cents,bab_running_eurocontrol_cents,bab_running_difference_cents,bab_running_matches)
       VALUES ($1,$23,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,
-        $13::jsonb,$14::jsonb,$15,$16,$17,$18,$19,$20::jsonb,$21,'closed',$22)
+        $13::jsonb,$14::jsonb,$15,$16,$17,$18,$19,$20::jsonb,$21,'closed',$22,$24,$25,$26,$27)
       RETURNING id,business_date,closed_at`, [
       branch.id, checked.drawerNumber, responsibleEmployeePinId, closedByPinId, opening?.id || null,
       opening ? Number(opening.opening_balance_cents) : 25000, Boolean(opening), !opening,
@@ -1066,6 +1091,8 @@ router.post('/closings', async (req, res) => {
       checked.bankAmountCents, checked.eurocontrolTotalCents, checked.differenceCents,
       checked.notificationRequired, checked.notificationRequired ? req.body.notificationConfirmed === true : false,
       JSON.stringify(checked.recountAttempts), checked.differenceCents === 0, req.user.id, businessDate,
+      cumulativeBabCheck.expectedCents, cumulativeBabCheck.eurocontrolCents,
+      cumulativeBabCheck.differenceCents, cumulativeBabCheck.matches,
     ]);
     if (opening) {
       await client.query(`UPDATE core.cash_drawer_opening_counts
@@ -1078,7 +1105,8 @@ router.post('/closings', async (req, res) => {
       closedAt: result.rows[0].closed_at, branch: branch.name, drawerNumber: checked.drawerNumber,
       employee: { id: responsibleEmployeePinId, name: employeeById.get(responsibleEmployeePinId).display_name },
       closedBy: { id: closedByPinId, name: employeeById.get(closedByPinId).display_name },
-      bankAmountCents: checked.bankAmountCents, eurocontrolTotalCents:checked.eurocontrolTotalCents, differenceCents: checked.differenceCents,
+      bankAmountCents: checked.bankAmountCents, eurocontrolTotalCents:checked.eurocontrolTotalCents,
+      cumulativeBabCents, cumulativeBabCheck, differenceCents: checked.differenceCents,
       openingPresent: Boolean(opening), status: 'closed',
     } });
   } catch (error) {
@@ -1122,9 +1150,10 @@ router.post('/closings/:id/corrections', async (req, res) => {
        opening_present,proceeded_without_opening,counted_total_cents,full_counts,retained_coin_cents,loose_change_cents,
        retained_note_counts,bank_note_counts,bank_amount_cents,eurocontrol_total_cents,difference_cents,
        notification_required,notification_confirmed,recount_attempts,resolved,status,created_by_user_id,
-       record_kind,corrects_closing_id,correction_reason,revision_number)
+       record_kind,corrects_closing_id,correction_reason,revision_number,
+       bab_running_expected_cents,bab_running_eurocontrol_cents,bab_running_difference_cents,bab_running_matches)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12,$13,$14::jsonb,$15::jsonb,$16,$17,$18,$19,$20,
-        $21::jsonb,$22,'closed',$23,'correction',$24,$25,$26)
+        $21::jsonb,$22,'closed',$23,'correction',$24,$25,$26,$27,$28,$29,$30)
       RETURNING id,business_date,closed_at`, [
       source.branch_id,source.business_date,source.drawer_number,source.employee_pin_id,closedByPinId,
       source.opening_count_id,source.opening_balance_cents,source.opening_present,source.proceeded_without_opening,
@@ -1133,7 +1162,8 @@ router.post('/closings/:id/corrections', async (req, res) => {
       source.eurocontrol_total_cents,checked.differenceCents,checked.notificationRequired,
       checked.notificationRequired ? req.body.notificationConfirmed === true : false,
       JSON.stringify(source.recount_attempts || []),checked.differenceCents===0,req.user.id,source.id,checked.reason,
-      Number(source.revision_number || 1)+1,
+      Number(source.revision_number || 1)+1,source.bab_running_expected_cents,source.bab_running_eurocontrol_cents,
+      source.bab_running_difference_cents,source.bab_running_matches,
     ]);
     await client.query('COMMIT');
     return res.status(201).json({ correction:{
