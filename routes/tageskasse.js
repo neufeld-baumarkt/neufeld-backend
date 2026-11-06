@@ -19,6 +19,7 @@ const { normalizeClosePayload, normalizeDraftKey, normalizeDraftPayload, normali
 const { openingPreview, closingPreview, safePreview, dayClosePreview } = require('../lib/cashWorkflowCalculationPolicy');
 const { deleteBusinessDayDrafts, lockDraftBusinessDay } = require('../lib/dayCloseDraft');
 const { matchesCompletedFinalization } = require('../lib/dayCloseFinalizePolicy');
+const { saveWorkflowDraftRevision } = require('../lib/workflowDraftPersistence');
 
 const router = express.Router();
 // A complete physical recount can legitimately take longer than ten minutes.
@@ -197,10 +198,10 @@ router.put('/workflow-drafts/:workflowType/:draftKey', async (req,res)=>{
     if(req.runtimeControl?.mode==='draining'&&payload.expectedRevision===0) throw Object.assign(new Error('Wartung wird vorbereitet. Es kann kein neuer Kassenprozess begonnen werden.'),{statusCode:503});
     const dayStatus=await lockDraftBusinessDay(client,{branchId:branch.id,businessDate});
     if(dayStatus==='finalized') throw Object.assign(new Error('Dieser Geschäftstag ist bereits verbindlich abgeschlossen.'),{statusCode:409});
-    const result=await client.query(`INSERT INTO controlling.cash_workflow_drafts (filiale_id,business_date,workflow_type,draft_key,stage,state,created_by_user_id,updated_by_user_id) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$7) ON CONFLICT (filiale_id,business_date,workflow_type,draft_key) WHERE status='active' DO UPDATE SET stage=EXCLUDED.stage,state=EXCLUDED.state,updated_by_user_id=EXCLUDED.updated_by_user_id,updated_at=NOW(),revision=controlling.cash_workflow_drafts.revision+1 WHERE controlling.cash_workflow_drafts.revision=$8 RETURNING *`,[branch.id,businessDate,workflowType,draftKey,payload.stage,payload.serialized,req.user.id,payload.expectedRevision]);
-    if(!result.rows[0]) throw Object.assign(new Error('Der Entwurf wurde inzwischen auf einem anderen Gerät geändert. Bitte neu laden.'),{statusCode:409});
+    const saved=await saveWorkflowDraftRevision(client,{branchId:branch.id,businessDate,workflowType,draftKey,stage:payload.stage,serializedState:payload.serialized,userId:req.user.id,expectedRevision:payload.expectedRevision});
+    if(!saved.row) throw Object.assign(new Error('Der Entwurf wurde inzwischen auf einem anderen Gerät geändert. Bitte neu laden.'),{statusCode:409});
     await client.query('COMMIT');
-    return res.json({draft:workflowDraftJson(result.rows[0])});
+    return res.json({draft:workflowDraftJson(saved.row)});
   } catch(error){await client.query('ROLLBACK').catch(()=>{}); return res.status(error.statusCode||500).json({message:error.statusCode?error.message:'Entwurf konnte nicht gespeichert werden.'});}
   finally {client.release();}
 });
