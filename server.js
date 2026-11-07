@@ -171,6 +171,7 @@ const bestellungenRoutes = require('./routes/bestellungen');
 const cashflowRoutes = require('./routes/cashflow');
 const devDbRoutes = require('./routes/devDb');
 const controllingRoutes = require('./routes/controlling');
+const { createQlikImportRouter } = require('./routes/qlik');
 const tageskasseRoutes = require('./routes/tageskasse');
 
 app.use('/api/reklamationen', reklamationenRoutes);
@@ -181,6 +182,7 @@ app.use('/api/filiale-pins', employeePinsRoutes);
 app.use('/api/bestellungen', bestellungenRoutes);
 app.use('/api/cashflow', cashflowRoutes);
 app.use('/api/controlling', controllingRoutes);
+app.use('/api/qlik', createQlikImportRouter({ pool, secret: process.env.QLIK_IMPORT_SECRET }));
 app.use('/api/tageskasse', tageskasseRoutes);
 // Keep the legacy safe-count router as a fallback only. V2.1 owns the
 // /safe-counts endpoints and must be allowed to handle them first.
