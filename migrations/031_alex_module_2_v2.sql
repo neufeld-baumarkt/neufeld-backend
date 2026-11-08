@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS controlling.qlik_payment_type_mappings (
   UNIQUE (payment_type_original, version)
 );
 
-CREATE UNIQUE INDEX ux_qlik_payment_type_mappings_active
+CREATE UNIQUE INDEX IF NOT EXISTS ux_qlik_payment_type_mappings_active
   ON controlling.qlik_payment_type_mappings (lower(payment_type_original))
   WHERE active;
 
@@ -58,7 +58,7 @@ ALTER TABLE controlling.payment_days
   ADD CONSTRAINT payment_days_deferred_until_check
     CHECK (review_status = 'VERTAGT' OR deferred_until IS NULL);
 
-CREATE INDEX idx_payment_days_v2_review_queue
+CREATE INDEX IF NOT EXISTS idx_payment_days_v2_review_queue
   ON controlling.payment_days (review_status, datum DESC, payment_type_id)
   WHERE review_status IN ('OFFEN', 'IN_PRUEFUNG', 'VERTAGT');
 
@@ -71,7 +71,7 @@ CREATE TABLE IF NOT EXISTS controlling.payment_day_qlik_sources (
   PRIMARY KEY (payment_day_id, qlik_import_row_id)
 );
 
-CREATE INDEX idx_payment_day_qlik_sources_mapping
+CREATE INDEX IF NOT EXISTS idx_payment_day_qlik_sources_mapping
   ON controlling.payment_day_qlik_sources (mapping_id, payment_day_id);
 
 ALTER TABLE controlling.payment_transfers
@@ -101,7 +101,7 @@ ALTER TABLE controlling.payment_transfers
   ADD CONSTRAINT payment_transfers_deferred_until_check
     CHECK (status = 'vertagt' OR deferred_until IS NULL);
 
-CREATE UNIQUE INDEX ux_payment_transfers_provider_reference
+CREATE UNIQUE INDEX IF NOT EXISTS ux_payment_transfers_provider_reference
   ON controlling.payment_transfers (provider, referenz)
   WHERE referenz IS NOT NULL;
 
@@ -129,7 +129,7 @@ ALTER TABLE controlling.payment_transfer_matches
   ADD CONSTRAINT payment_transfer_matches_deferred_until_check
     CHECK (status = 'vertagt' OR deferred_until IS NULL);
 
-CREATE UNIQUE INDEX ux_payment_transfer_matches_active
+CREATE UNIQUE INDEX IF NOT EXISTS ux_payment_transfer_matches_active
   ON controlling.payment_transfer_matches (transfer_id)
   WHERE status IN ('vorgeschlagen', 'bestaetigt', 'vertagt');
 
@@ -143,7 +143,7 @@ CREATE TABLE IF NOT EXISTS controlling.payment_review_events (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX idx_payment_review_events_day_time
+CREATE INDEX IF NOT EXISTS idx_payment_review_events_day_time
   ON controlling.payment_review_events (payment_day_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS controlling.payment_transfer_events (
@@ -157,7 +157,7 @@ CREATE TABLE IF NOT EXISTS controlling.payment_transfer_events (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
-CREATE INDEX idx_payment_transfer_events_transfer_time
+CREATE INDEX IF NOT EXISTS idx_payment_transfer_events_transfer_time
   ON controlling.payment_transfer_events (transfer_id, created_at DESC);
 
 CREATE OR REPLACE FUNCTION controlling.reject_module2_event_mutation()
