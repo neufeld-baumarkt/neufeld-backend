@@ -14,6 +14,7 @@ const { runCashOpeningMigration } = require('./lib/runCashOpeningMigration');
 const { runEmployeePinMigration } = require('./lib/runEmployeePinMigration');
 const { runCashClosingMigration } = require('./lib/runCashClosingMigration');
 const { runQlikImportMigration } = require('./lib/runQlikImportMigration');
+const { runQlikDerivedMigration } = require('./lib/runQlikDerivedMigration');
 const { ALLOWED_CORS_HEADERS } = require('./lib/corsPolicy');
 
 // ✅ FINAL: JWT_SECRET kommt ausschließlich aus ENV (Render)
@@ -209,6 +210,7 @@ async function startServer() {
   await runEmployeePinMigration(pool);
   await runCashClosingMigration(pool);
   await runQlikImportMigration(pool);
+  await runQlikDerivedMigration(pool);
   console.log('✅ Datenbankschema für Einzählung, Abrechnung und Tresorzählung ist bereit');
 
   app.listen(PORT, '0.0.0.0', () => {

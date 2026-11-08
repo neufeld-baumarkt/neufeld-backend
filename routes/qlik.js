@@ -1,6 +1,12 @@
 const express = require('express');
+const verifyToken = require('../middleware/verifyToken');
 const { importQlikCsv } = require('../lib/qlikImport');
 const { payloadSha256, verifyImportSignature } = require('../lib/qlikImportSignature');
+const {
+  CONTROLLING_ROLES,
+  loadDayCloseReconciliation,
+  loadDerivedValues,
+} = require('../lib/qlikDerivedValues');
 
 const IMPORT_PATH = '/api/qlik/internal/import';
 const csvParser = express.raw({
@@ -8,11 +14,49 @@ const csvParser = express.raw({
   limit: '1mb',
 });
 
-function createQlikImportRouter({ pool, secret, now = () => Date.now() }) {
-  if (typeof secret !== 'string' || secret.length < 32) {
-    throw new Error('QLIK_IMPORT_SECRET fehlt oder ist zu kurz.');
-  }
+function createQlikImportRouter({ pool, secret, now = () => Date.now(), authenticate = verifyToken() }) {
   const router = express.Router();
+
+  router.use((_req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store');
+    next();
+  });
+
+  function requireControlling(req, res, next) {
+    if (req.user && CONTROLLING_ROLES.has(req.user.role)) return next();
+    return res.status(403).json({ message: 'Zugriff verweigert.' });
+  }
+
+  function sendReadError(res, error, fallback) {
+    const status = Number(error?.statusCode) || 500;
+    if (status >= 500) console.error('[QLIK_VALUE_ERROR]', error?.code || error?.message);
+    return res.status(status).json({ message: status >= 500 ? fallback : error.message });
+  }
+
+  router.get('/values', authenticate, requireControlling, async (req, res) => {
+    try {
+      const result = await loadDerivedValues(pool, {
+        branch: req.query.branch,
+        businessDate: req.query.date,
+        consumerCode: req.query.consumer,
+      });
+      return res.json({ ok: true, ...result });
+    } catch (error) {
+      return sendReadError(res, error, 'Qlik-Fachwerte konnten nicht geladen werden.');
+    }
+  });
+
+  router.get('/reconciliation/day-close', authenticate, requireControlling, async (req, res) => {
+    try {
+      const result = await loadDayCloseReconciliation(pool, {
+        branch: req.query.branch,
+        businessDate: req.query.date,
+      });
+      return res.json({ ok: true, ...result });
+    } catch (error) {
+      return sendReadError(res, error, 'Qlik-Gegenprüfung konnte nicht geladen werden.');
+    }
+  });
 
   router.post('/internal/import', csvParser, async (req, res) => {
     const payload = req.body;
@@ -47,6 +91,8 @@ function createQlikImportRouter({ pool, secret, now = () => Date.now() }) {
           customerCount: result.report.customerNumbers.length,
           paymentTypeCount: new Set(result.report.rows.map((row) => row.paymentType)).size,
           sourceSha256: suppliedHash,
+          derivedValuesInserted: Number(result.materialized?.inserted_values || 0),
+          sourceLinksInserted: Number(result.materialized?.inserted_sources || 0),
         },
       });
     } catch (error) {
@@ -61,4 +107,4 @@ function createQlikImportRouter({ pool, secret, now = () => Date.now() }) {
   return router;
 }
 
-module.exports = { createQlikImportRouter };
+module.exports = { IMPORT_PATH, createQlikImportRouter };
