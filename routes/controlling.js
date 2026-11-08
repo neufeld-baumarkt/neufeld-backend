@@ -153,6 +153,7 @@ function buildEcCashMonthResponse({ jahr, monat, paymentDays, paymentTransfers }
 
     const transfer = {
       id: row.id,
+      provider: row.provider || 'UNBEKANNT',
       filiale: row.filiale,
       buchungsdatum,
       betrag: toNumberOrNull(row.betrag),
@@ -161,11 +162,18 @@ function buildEcCashMonthResponse({ jahr, monat, paymentDays, paymentTransfers }
       createdAt: row.created_at || null,
     };
 
+    if (transfer.provider === 'CLASSIC') {
+      day.gesamtUeberweisung.betrag = transfer.betrag;
+      day.gesamtUeberweisung.classicTransferId = transfer.id;
+      return;
+    }
+
     day.gesamtUeberweisung.transfers.push(transfer);
 
-    const currentTotal = toNumberOrNull(day.gesamtUeberweisung.betrag) || 0;
-    const transferAmount = toNumberOrNull(row.betrag) || 0;
-    day.gesamtUeberweisung.betrag = currentTotal + transferAmount;
+    if (!day.gesamtUeberweisung.classicTransferId) {
+      const currentTotal = toNumberOrNull(day.gesamtUeberweisung.betrag) || 0;
+      day.gesamtUeberweisung.betrag = currentTotal + (transfer.betrag || 0);
+    }
   });
 
   return {
@@ -268,6 +276,7 @@ router.get('/ec-cash/month', verifyToken(), async (req, res) => {
         ptf.betrag,
         ptf.referenz,
         ptf.status,
+        ptf.provider,
         ptf.created_at
       FROM controlling.payment_transfers ptf
       INNER JOIN controlling.payment_types pt
@@ -728,6 +737,57 @@ router.patch('/v2/reviews', verifyToken(), async (req, res) => {
   }
 });
 
+router.put('/transfers/classic', verifyToken(), async (req, res) => {
+  if (!hasAccess(req)) {
+    return res.status(403).json({ ok: false, message: 'Zugriff verweigert.' });
+  }
+
+  let client;
+
+  try {
+    const paymentType = normalizePaymentType(req.body?.paymentType);
+    const amountCents = moneyToCents(req.body?.amount);
+    const buchungsdatum = String(req.body?.datum || '');
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(buchungsdatum)) {
+      throw Object.assign(new Error('Buchungsdatum ist ungültig.'), { statusCode: 400 });
+    }
+
+    client = await pool.connect();
+    await client.query('BEGIN');
+    const result = await client.query(
+      `INSERT INTO controlling.payment_transfers
+        (payment_type_id,filiale,buchungsdatum,betrag,referenz,status,provider,created_by)
+       SELECT id,'Unternehmen',$2::date,$3::bigint/100.0,$4,'offen','CLASSIC',NULL
+       FROM controlling.payment_types WHERE code=$1
+       ON CONFLICT (payment_type_id,buchungsdatum) WHERE provider='CLASSIC'
+       DO UPDATE SET betrag=EXCLUDED.betrag,status='offen',updated_at=now()
+       RETURNING *, (xmax=0) AS inserted`,
+      [paymentType, buchungsdatum, amountCents, `CLASSIC:${paymentType}:${buchungsdatum}`]
+    );
+
+    if (!result.rowCount) {
+      throw Object.assign(new Error('Zahlungsart wurde nicht gefunden.'), { statusCode: 400 });
+    }
+
+    const transfer = result.rows[0];
+    await client.query(
+      `INSERT INTO controlling.payment_transfer_events
+        (transfer_id,event_type,actor_user_id,details)
+       VALUES ($1,$2,$3,jsonb_build_object('source','CLASSIC','amountCents',$4::bigint))`,
+      [transfer.id, transfer.inserted ? 'ERFASST' : 'ANGEPASST', req.user.id, amountCents]
+    );
+
+    await client.query('COMMIT');
+    return res.json({ ok: true, transfer: mapPaymentTransfer(transfer) });
+  } catch (error) {
+    if (client) await client.query('ROLLBACK').catch(() => {});
+    return routeError(res, error, 'Gesamtüberweisung konnte nicht gespeichert werden.');
+  } finally {
+    client?.release();
+  }
+});
+
 router.get('/v2/transfers', verifyToken(), async (req, res) => {
   if (!hasAccess(req)) return res.status(403).json({ ok: false, message: 'Zugriff verweigert.' });
   try {
@@ -749,7 +809,8 @@ router.get('/v2/transfers', verifyToken(), async (req, res) => {
          ON m.transfer_id=t.id AND m.status IN ('vorgeschlagen','bestaetigt','vertagt')
        LEFT JOIN controlling.payment_transfer_match_items mi ON mi.match_id=m.id
        LEFT JOIN controlling.payment_days pd ON pd.id=mi.payment_day_id
-       WHERE EXTRACT(YEAR FROM t.buchungsdatum)::integer=$1
+       WHERE t.provider <> 'CLASSIC'
+         AND EXTRACT(YEAR FROM t.buchungsdatum)::integer=$1
          AND EXTRACT(MONTH FROM t.buchungsdatum)::integer=$2
        GROUP BY t.id, pt.code, m.id
        ORDER BY t.provider, t.buchungsdatum DESC, t.created_at DESC`,
