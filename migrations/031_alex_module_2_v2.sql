@@ -90,7 +90,7 @@ ALTER TABLE controlling.payment_transfers
 
 ALTER TABLE controlling.payment_transfers
   ADD CONSTRAINT payment_transfers_provider_check
-    CHECK (provider IN ('FIRSTDATA', 'TELECASH', 'UNBEKANNT')),
+    CHECK (provider IN ('FIRSTDATA', 'TELECASH', 'UNBEKANNT', 'CLASSIC')),
   ADD CONSTRAINT payment_transfers_status_check
     CHECK (status IN ('offen', 'vorgeschlagen', 'bestaetigt', 'abgelehnt', 'vertagt')),
   ADD CONSTRAINT payment_transfers_decision_metadata_check
