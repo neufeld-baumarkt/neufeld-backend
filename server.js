@@ -15,6 +15,7 @@ const { runEmployeePinMigration } = require('./lib/runEmployeePinMigration');
 const { runCashClosingMigration } = require('./lib/runCashClosingMigration');
 const { runQlikImportMigration } = require('./lib/runQlikImportMigration');
 const { runQlikDerivedMigration } = require('./lib/runQlikDerivedMigration');
+const { startAlexModule1RetryWorker } = require('./lib/alexModule1RetryWorker');
 const { ALLOWED_CORS_HEADERS } = require('./lib/corsPolicy');
 
 // ✅ FINAL: JWT_SECRET kommt ausschließlich aus ENV (Render)
@@ -213,10 +214,12 @@ async function startServer() {
   await runQlikDerivedMigration(pool);
   console.log('✅ Datenbankschema für Einzählung, Abrechnung und Tresorzählung ist bereit');
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`✅ Backend läuft auf Port ${PORT} (0.0.0.0)`);
     console.log(`🧩 BUILD_TAG=${BUILD_TAG} START_TS=${START_TS}`);
   });
+  const alexModule1RetryWorker = startAlexModule1RetryWorker({ pool });
+  server.once('close', () => alexModule1RetryWorker.stop());
 }
 
 startServer().catch((error) => {
