@@ -5,6 +5,7 @@ const { payloadSha256, verifyImportSignature } = require('../lib/qlikImportSigna
 const {
   CONTROLLING_ROLES,
   loadDayCloseReconciliation,
+  loadDailyAggregateValues,
   loadDerivedValues,
 } = require('../lib/qlikDerivedValues');
 
@@ -58,6 +59,18 @@ function createQlikImportRouter({ pool, secret, now = () => Date.now(), authenti
     }
   });
 
+  router.get('/aggregate-values', authenticate, requireControlling, async (req, res) => {
+    try {
+      const result = await loadDailyAggregateValues(pool, {
+        businessDate: req.query.date,
+        consumerCode: req.query.consumer,
+      });
+      return res.json({ ok: true, ...result });
+    } catch (error) {
+      return sendReadError(res, error, 'Aggregierte Qlik-Fachwerte konnten nicht geladen werden.');
+    }
+  });
+
   router.post('/internal/import', csvParser, async (req, res) => {
     const payload = req.body;
     const fileName = String(req.get('x-qlik-file-name') || '').trim();
@@ -93,6 +106,10 @@ function createQlikImportRouter({ pool, secret, now = () => Date.now(), authenti
           sourceSha256: suppliedHash,
           derivedValuesInserted: Number(result.materialized?.inserted_values || 0),
           sourceLinksInserted: Number(result.materialized?.inserted_sources || 0),
+          aggregatesInserted: Number(result.aggregateMaterialized?.inserted_aggregates || 0),
+          aggregateSourceLinksInserted: Number(result.aggregateMaterialized?.inserted_sources || 0),
+          alexModule1RevenueSynchronized: Number(result.alexModule1?.synchronized || 0),
+          alexModule1RevenueStatus: result.alexModule1?.status || 'NOT_RUN',
         },
       });
     } catch (error) {
