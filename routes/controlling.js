@@ -876,6 +876,9 @@ router.post('/v2/transfers/:id/suggest', verifyToken(), async (req, res) => {
     const suggestion = findBestMatch(candidatesResult.rows.map((row) => ({
       id: row.id, datum: dateOnly(row.datum), amountCents: Number(row.qlik_amount_cents), filiale: row.filiale,
     })), Number(transfer.amount_cents));
+    if (!suggestion.complete) {
+      throw Object.assign(new Error('Der Suchraum ist für einen verlässlichen automatischen Vorschlag zu groß.'), { statusCode: 409 });
+    }
     if (!suggestion.itemIds.length) throw Object.assign(new Error('Keine geeigneten Tageswerte für einen Vorschlag gefunden.'), { statusCode: 409 });
     await client.query(
       `UPDATE controlling.payment_transfer_matches SET status='abgelehnt',updated_at=now(),review_note='Durch neuen Vorschlag ersetzt.'
@@ -884,7 +887,7 @@ router.post('/v2/transfers/:id/suggest', verifyToken(), async (req, res) => {
     );
     const matchResult = await client.query(
       `INSERT INTO controlling.payment_transfer_matches (transfer_id,status,differenz,automatisch,algorithm_version)
-       VALUES ($1,'vorgeschlagen',$2::bigint/100.0,true,'subset-cents-v1') RETURNING *`,
+       VALUES ($1,'vorgeschlagen',$2::bigint/100.0,true,'subset-cents-v2') RETURNING *`,
       [transfer.id, suggestion.differenceCents]
     );
     const match = matchResult.rows[0];
