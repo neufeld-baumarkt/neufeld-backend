@@ -673,6 +673,7 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
         b.buchungsgruppe_id,
         b.rechnungsbetrag_brutto,
         b.skonto_prozent,
+        b.qlik_aggregate_value_id,
         k.typ
       FROM cashflow.buchungen b
       JOIN cashflow.kategorien k
@@ -693,6 +694,13 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
 
     const current = currentResult.rows[0];
     const isEinnahme = current.typ === 'Einnahme';
+
+    if (current.qlik_aggregate_value_id) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        message: 'Qlik-verifizierte Einnahmen sind unveränderlich. Eine Korrektur benötigt einen eigenen nachvollziehbaren Prüfvorgang.',
+      });
+    }
 
     const hasInvoiceFieldUpdate =
       payload.updateRechnungsnummer ||
@@ -766,6 +774,7 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
         geaendert_am = NOW()
       FROM cashflow.kategorien k
       WHERE b.id = $1
+        AND b.qlik_aggregate_value_id IS NULL
         AND k.id = b.kategorie_id
         AND k.aktiv = true
       RETURNING
@@ -983,6 +992,7 @@ router.delete('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req
       DELETE FROM cashflow.buchungen b
       USING cashflow.kategorien k
       WHERE b.id = $1
+        AND b.qlik_aggregate_value_id IS NULL
         AND k.id = b.kategorie_id
         AND k.aktiv = true
       RETURNING

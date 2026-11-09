@@ -19,8 +19,8 @@ function poolFake() {
   const client = {
     async query(sql) {
       if (sql.includes('SELECT id,status,report_date')) return { rows: [] };
-      if (sql.includes('INSERT INTO controlling.qlik_import_runs')) return { rows: [{ id: 'run-http', status: 'VALIDATED' }] };
-      if (sql.includes('UPDATE controlling.qlik_import_runs')) return { rows: [{ id: 'run-http', status: 'IMPORTED' }] };
+      if (sql.includes('INSERT INTO controlling.qlik_import_runs')) return { rows: [{ id: 'run-http', status: 'VALIDATED', report_date: '2099-01-02' }] };
+      if (sql.includes('UPDATE controlling.qlik_import_runs')) return { rows: [{ id: 'run-http', status: 'IMPORTED', report_date: '2099-01-02' }] };
       if (sql.includes('materialize_qlik_derived_daily_values')) return { rows: [{ inserted_values: 32, inserted_sources: 8 }] };
       return { rows: [] };
     },
@@ -29,6 +29,13 @@ function poolFake() {
   return {
     connect: async () => client,
     async query(sql) {
+      if (sql.includes('qlik_derived_daily_aggregates')) return { rows: [{
+        id: 'aggregate-1', metric_code: 'GESAMTUMSATZ_ALLE_FILIALEN_QLIK',
+        display_name: 'Gesamtumsatz aller Filialen', value_kind: 'MONEY_CENTS',
+        numeric_value: '4006194', availability_status: 'VORHANDEN',
+        quality_status: 'NICHT_GEPRUEFT', expected_member_count: '4',
+        actual_member_count: '4', rule_version: '1', source_count: '4',
+      }] };
       if (sql.includes('WITH candidates')) return { rows: [{ id: 'v1', metric_code: 'GESAMTUMSATZ_QLIK', display_name: 'Gesamtumsatz', value_kind: 'MONEY_CENTS', numeric_value: '961610', availability_status: 'VORHANDEN', quality_status: 'NICHT_GEPRUEFT', rule_version: 1, source_count: 2 }] };
       return { rows: [{ daily_revenue_cents: 961610, eurocontrol_bank_cents: 279507, cash_difference_cents: 7, business_day_status: 'final' }] };
     },
@@ -73,7 +80,20 @@ test('nimmt nur hashgebundene Qlik-CSV-Dateien an und liefert keine Rohdaten zur
     assert.equal(result.import.customerCount, 4);
     assert.equal(result.import.paymentTypeCount, 2);
     assert.equal(result.import.derivedValuesInserted, 32);
+    assert.equal(result.import.alexModule1RevenueStatus, 'QLIK_NOT_AVAILABLE');
     assert.equal(JSON.stringify(result).includes('10,00'), false);
+  });
+});
+
+test('liefert das vollstaendige Alex-1-Tagesaggregat ohne Filial-Rohdaten', async () => {
+  await withServer(async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/api/qlik/aggregate-values?date=2026-11-07&consumer=ALEX_MODULE_1`);
+    const result = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(result.values[0].metricCode, 'GESAMTUMSATZ_ALLE_FILIALEN_QLIK');
+    assert.equal(result.values[0].bookable, true);
+    assert.equal(result.values[0].actualMemberCount, 4);
+    assert.equal(JSON.stringify(result).includes('raw_fields'), false);
   });
 });
 
