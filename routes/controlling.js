@@ -10,7 +10,6 @@ const {
   normalizeTransferDecision,
   moneyToCents,
   findBestMatch,
-  synchronizeQlikPaymentDays,
   berlinDateOnly,
 } = require('../lib/alexModule2');
 
@@ -234,8 +233,6 @@ router.get('/ec-cash/month', verifyToken(), async (req, res) => {
   let client;
   try {
     client = await pool.connect();
-    await client.query('BEGIN');
-    await synchronizeQlikPaymentDays(client, { jahr, monat });
     const paymentDaysResult = await client.query(
       `
       SELECT
@@ -289,7 +286,6 @@ router.get('/ec-cash/month', verifyToken(), async (req, res) => {
       [jahr, monat, EC_CASH_PAYMENT_TYPES]
     );
 
-    await client.query('COMMIT');
     return res.json(
       buildEcCashMonthResponse({
         jahr,
@@ -299,7 +295,6 @@ router.get('/ec-cash/month', verifyToken(), async (req, res) => {
       })
     );
   } catch (err) {
-    if (client) await client.query('ROLLBACK').catch(() => {});
     console.error('[CONTROLLING_EC_CASH_MONTH_ERROR]', err);
     return res.status(500).json({
       ok: false,
@@ -608,8 +603,6 @@ router.get('/v2/overview', verifyToken(), async (req, res) => {
     const jahr = parseYear(req.query.jahr);
     const monat = parseMonth(req.query.monat, 'monat');
     client = await pool.connect();
-    await client.query('BEGIN');
-    const sync = await synchronizeQlikPaymentDays(client, { jahr, monat });
     const [daysResult, unresolvedResult, importResult] = await Promise.all([
       client.query(
         `SELECT pd.id, pd.datum, pd.filiale, pt.code AS payment_type,
@@ -654,8 +647,6 @@ router.get('/v2/overview', verifyToken(), async (req, res) => {
         [jahr, monat]
       ),
     ]);
-    await client.query('COMMIT');
-
     const itemsByKey = new Map();
     for (const row of daysResult.rows) {
       const datum = dateOnly(row.datum);
@@ -689,11 +680,10 @@ router.get('/v2/overview', verifyToken(), async (req, res) => {
       confirmedCount: items.filter((item) => ['BESTAETIGT', 'EXTERN_BESTAETIGT'].includes(item.reviewStatus)).length,
       unresolvedPaymentTypeCount: unresolvedResult.rows.length,
     };
-    return res.json({ ok: true, jahr, monat, sync, summary, items,
+    return res.json({ ok: true, jahr, monat, sync: { mode: 'QLIK_IMPORT' }, summary, items,
       unresolvedPaymentTypes: unresolvedResult.rows,
       importState: importResult.rows[0] || { completed_at: null, imported_days: 0 } });
   } catch (error) {
-    if (client) await client.query('ROLLBACK').catch(() => {});
     return routeError(res, error, 'Modul-2-Daten konnten nicht geladen werden.');
   } finally {
     client?.release();
