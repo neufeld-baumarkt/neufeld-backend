@@ -110,6 +110,7 @@ function createQlikImportRouter({ pool, secret, now = () => Date.now(), authenti
           aggregateSourceLinksInserted: Number(result.aggregateMaterialized?.inserted_sources || 0),
           alexModule1RevenueSynchronized: Number(result.alexModule1?.synchronized || 0),
           alexModule1RevenueStatus: result.alexModule1?.status || 'NOT_RUN',
+          alexModule2ValuesSynchronized: Number(result.alexModule2?.synchronized || 0),
         },
       });
     } catch (error) {
