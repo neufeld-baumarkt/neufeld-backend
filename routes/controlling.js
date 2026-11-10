@@ -11,6 +11,8 @@ const {
   moneyToCents,
   findBestMatch,
   berlinDateOnly,
+  classicDayHasPositiveRevenue,
+  filterPositiveRevenueItems,
 } = require('../lib/alexModule2');
 
 const router = express.Router();
@@ -173,6 +175,10 @@ function buildEcCashMonthResponse({ jahr, monat, paymentDays, paymentTransfers }
       const currentTotal = toNumberOrNull(day.gesamtUeberweisung.betrag) || 0;
       day.gesamtUeberweisung.betrag = currentTotal + (transfer.betrag || 0);
     }
+  });
+
+  Object.values(blocks).forEach((block) => {
+    block.tage = block.tage.filter(classicDayHasPositiveRevenue);
   });
 
   return {
@@ -613,6 +619,13 @@ router.get('/v2/overview', verifyToken(), async (req, res) => {
          JOIN controlling.payment_types pt ON pt.id=pd.payment_type_id
          LEFT JOIN public.users u ON u.id=pd.reviewed_by
          WHERE pd.jahr=$1 AND pd.monat=$2 AND pt.code=ANY($3::text[])
+           AND EXISTS (
+             SELECT 1
+             FROM controlling.payment_days positive_day
+             WHERE positive_day.payment_type_id=pd.payment_type_id
+               AND positive_day.datum=pd.datum
+               AND positive_day.qlik_amount_cents>0
+           )
          ORDER BY pd.datum DESC, pt.sortierung, pd.filiale`,
         [jahr, monat, EC_CASH_PAYMENT_TYPES]
       ),
@@ -666,13 +679,13 @@ router.get('/v2/overview', verifyToken(), async (req, res) => {
         reviewedBy: row.reviewed_by,
       });
     }
-    const items = [...itemsByKey.values()].map((item) => ({
+    const items = filterPositiveRevenueItems([...itemsByKey.values()].map((item) => ({
       ...item,
       qlikTotalCents: item.branches.reduce((sum, branch) => sum + (branch.qlikAmountCents || 0), 0),
       availabilityStatus: item.branches.every((branch) => branch.availabilityStatus === 'VORHANDEN') ? 'VORHANDEN' : 'UNVOLLSTAENDIG',
       comparisonStatus: comparisonPrecedence(item.branches.map((branch) => branch.comparisonStatus)),
       reviewStatus: reviewPrecedence(item.branches.map((branch) => branch.reviewStatus)),
-    }));
+    })));
     const summary = {
       newCount: items.filter((item) => item.reviewStatus === 'OFFEN').length,
       deviationCount: items.filter((item) => item.comparisonStatus === 'ABWEICHEND').length,
