@@ -5,7 +5,7 @@ const {
   parseMonth,
   parseYear,
   normalizePaymentType,
-  normalizeProvider,
+  providerForPaymentType,
   normalizeReviewDecision,
   normalizeTransferDecision,
   moneyToCents,
@@ -287,6 +287,7 @@ router.get('/ec-cash/month', verifyToken(), async (req, res) => {
       WHERE EXTRACT(YEAR FROM ptf.buchungsdatum)::integer = $1
         AND EXTRACT(MONTH FROM ptf.buchungsdatum)::integer = $2
         AND pt.code = ANY($3::text[])
+        AND ptf.deleted_at IS NULL
       ORDER BY ptf.buchungsdatum ASC, pt.sortierung ASC, ptf.filiale ASC, ptf.created_at ASC
       `,
       [jahr, monat, EC_CASH_PAYMENT_TYPES]
@@ -763,7 +764,7 @@ router.put('/transfers/classic', verifyToken(), async (req, res) => {
         (payment_type_id,filiale,buchungsdatum,betrag,referenz,status,provider,created_by)
        SELECT id,'Unternehmen',$2::date,$3::bigint/100.0,$4,'offen','CLASSIC',NULL
        FROM controlling.payment_types WHERE code=$1
-       ON CONFLICT (payment_type_id,buchungsdatum) WHERE provider='CLASSIC'
+       ON CONFLICT (payment_type_id,buchungsdatum) WHERE provider='CLASSIC' AND deleted_at IS NULL
        DO UPDATE SET betrag=EXCLUDED.betrag,status='offen',updated_at=now()
        RETURNING *, (xmax=0) AS inserted`,
       [paymentType, buchungsdatum, amountCents, `CLASSIC:${paymentType}:${buchungsdatum}`]
@@ -815,6 +816,7 @@ router.get('/v2/transfers', verifyToken(), async (req, res) => {
        WHERE t.provider <> 'CLASSIC'
          AND EXTRACT(YEAR FROM t.buchungsdatum)::integer=$1
          AND EXTRACT(MONTH FROM t.buchungsdatum)::integer=$2
+         AND t.deleted_at IS NULL
        GROUP BY t.id, pt.code, m.id
        ORDER BY t.provider, t.buchungsdatum DESC, t.created_at DESC`,
       [jahr, monat]
@@ -834,8 +836,8 @@ router.get('/v2/transfers', verifyToken(), async (req, res) => {
 router.post('/v2/transfers', verifyToken(), async (req, res) => {
   if (!hasAccess(req)) return res.status(403).json({ ok: false, message: 'Zugriff verweigert.' });
   try {
-    const provider = normalizeProvider(req.body?.provider);
     const paymentType = normalizePaymentType(req.body?.paymentType);
+    const provider = providerForPaymentType(paymentType);
     const amountCents = moneyToCents(req.body?.amount);
     const buchungsdatum = String(req.body?.buchungsdatum || '');
     const referenz = String(req.body?.referenz || '').trim() || null;
@@ -868,7 +870,7 @@ router.post('/v2/transfers/:id/suggest', verifyToken(), async (req, res) => {
     const transferResult = await client.query(
       `SELECT t.*, pt.code AS payment_type, round(t.betrag*100)::bigint AS amount_cents
        FROM controlling.payment_transfers t JOIN controlling.payment_types pt ON pt.id=t.payment_type_id
-       WHERE t.id=$1 FOR UPDATE`,
+       WHERE t.id=$1 AND t.deleted_at IS NULL FOR UPDATE`,
       [req.params.id]
     );
     if (!transferResult.rowCount) throw Object.assign(new Error('Sammelüberweisung wurde nicht gefunden.'), { statusCode: 404 });
@@ -944,7 +946,7 @@ router.get('/v2/transfers/:id/candidates', verifyToken(), async (req, res) => {
        JOIN controlling.payment_days pd ON pd.payment_type_id=t.payment_type_id
          AND pd.datum BETWEEN t.buchungsdatum - INTERVAL '21 days' AND t.buchungsdatum
          AND pd.qlik_amount_cents>0
-       WHERE t.id=$1 AND NOT EXISTS (
+       WHERE t.id=$1 AND t.deleted_at IS NULL AND NOT EXISTS (
          SELECT 1 FROM controlling.payment_transfer_match_items used
          JOIN controlling.payment_transfer_matches confirmed ON confirmed.id=used.match_id
          WHERE used.payment_day_id=pd.id AND confirmed.status='bestaetigt' AND confirmed.transfer_id<>t.id
@@ -974,7 +976,7 @@ router.put('/v2/transfers/:id/match', verifyToken(), async (req, res) => {
     await client.query('BEGIN');
     const transferResult = await client.query(
       `SELECT t.*, round(t.betrag*100)::bigint AS amount_cents
-       FROM controlling.payment_transfers t WHERE id=$1 FOR UPDATE`,
+       FROM controlling.payment_transfers t WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`,
       [req.params.id]
     );
     if (!transferResult.rowCount) throw Object.assign(new Error('Sammelüberweisung wurde nicht gefunden.'), { statusCode: 404 });
@@ -1039,7 +1041,8 @@ router.post('/v2/transfers/:id/decision', verifyToken(), async (req, res) => {
       `SELECT t.id AS transfer_id, m.id AS match_id, m.differenz
        FROM controlling.payment_transfers t
        JOIN controlling.payment_transfer_matches m ON m.transfer_id=t.id
-       WHERE t.id=$1 AND m.status IN ('vorgeschlagen','vertagt') FOR UPDATE OF t,m`,
+       WHERE t.id=$1 AND t.deleted_at IS NULL
+         AND m.status IN ('vorgeschlagen','vertagt') FOR UPDATE OF t,m`,
       [req.params.id]
     );
     if (!result.rowCount) throw Object.assign(new Error('Offener Match-Vorschlag wurde nicht gefunden.'), { statusCode: 404 });
