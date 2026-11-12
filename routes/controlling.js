@@ -10,6 +10,7 @@ const {
   normalizeTransferDecision,
   moneyToCents,
   findBestMatch,
+  isExactDifferenceCarry,
   berlinDateOnly,
   classicDayHasPositiveRevenue,
   filterPositiveRevenueItems,
@@ -802,6 +803,19 @@ router.get('/v2/transfers', verifyToken(), async (req, res) => {
               t.decision_note, t.deferred_until, t.decided_at, pt.code AS payment_type,
               m.id AS match_id, m.status AS match_status, m.differenz,
               m.automatisch, m.algorithm_version, m.review_note,
+              source_carry.id AS source_carry_id, source_carry.status AS source_carry_status,
+              source_carry.amount_cents AS source_carry_amount_cents,
+              source_settlement_transfer.id AS source_settlement_transfer_id,
+              source_settlement_transfer.buchungsdatum AS source_settlement_date,
+              settlement_carry.id AS settlement_carry_id,
+              settlement_carry.status AS settlement_carry_status,
+              settlement_carry.amount_cents AS settlement_carry_amount_cents,
+              settlement_source_transfer.id AS settlement_source_transfer_id,
+              settlement_source_transfer.buchungsdatum AS settlement_source_date,
+              carry_candidate.id AS carry_suggestion_id,
+              carry_candidate.amount_cents AS carry_suggestion_amount_cents,
+              carry_candidate.source_transfer_id AS carry_suggestion_source_transfer_id,
+              carry_candidate.source_booking_date AS carry_suggestion_source_date,
               COALESCE(jsonb_agg(jsonb_build_object(
                 'id', mi.id, 'paymentDayId', pd.id, 'datum', pd.datum,
                 'filiale', pd.filiale, 'amountCents', round(mi.betrag*100)::bigint,
@@ -811,23 +825,82 @@ router.get('/v2/transfers', verifyToken(), async (req, res) => {
        JOIN controlling.payment_types pt ON pt.id=t.payment_type_id
        LEFT JOIN controlling.payment_transfer_matches m
          ON m.transfer_id=t.id AND m.status IN ('vorgeschlagen','bestaetigt','vertagt')
+       LEFT JOIN controlling.payment_transfer_difference_carries source_carry
+         ON source_carry.source_match_id=m.id
+       LEFT JOIN controlling.payment_transfer_matches source_settlement_match
+         ON source_settlement_match.id=source_carry.settlement_match_id
+       LEFT JOIN controlling.payment_transfers source_settlement_transfer
+         ON source_settlement_transfer.id=source_settlement_match.transfer_id
+       LEFT JOIN controlling.payment_transfer_difference_carries settlement_carry
+         ON settlement_carry.settlement_match_id=m.id
+       LEFT JOIN controlling.payment_transfer_matches settlement_source_match
+         ON settlement_source_match.id=settlement_carry.source_match_id
+       LEFT JOIN controlling.payment_transfers settlement_source_transfer
+         ON settlement_source_transfer.id=settlement_source_match.transfer_id
+       LEFT JOIN LATERAL (
+         SELECT carry.id, carry.amount_cents,
+                source_transfer.id AS source_transfer_id,
+                source_transfer.buchungsdatum AS source_booking_date
+         FROM controlling.payment_transfer_difference_carries carry
+         JOIN controlling.payment_transfer_matches source_match ON source_match.id=carry.source_match_id
+         JOIN controlling.payment_transfers source_transfer ON source_transfer.id=source_match.transfer_id
+         WHERE carry.status='OFFEN'
+           AND m.status IN ('vorgeschlagen','vertagt')
+           AND round(m.differenz*100)::bigint=carry.amount_cents
+           AND m.differenz>0
+           AND source_transfer.provider=t.provider
+           AND source_transfer.payment_type_id=t.payment_type_id
+           AND source_transfer.buchungsdatum<=t.buchungsdatum
+           AND source_transfer.deleted_at IS NULL
+         ORDER BY source_transfer.buchungsdatum DESC, carry.created_at DESC
+         LIMIT 1
+       ) carry_candidate ON true
        LEFT JOIN controlling.payment_transfer_match_items mi ON mi.match_id=m.id
        LEFT JOIN controlling.payment_days pd ON pd.id=mi.payment_day_id
        WHERE t.provider <> 'CLASSIC'
          AND EXTRACT(YEAR FROM t.buchungsdatum)::integer=$1
          AND EXTRACT(MONTH FROM t.buchungsdatum)::integer=$2
          AND t.deleted_at IS NULL
-       GROUP BY t.id, pt.code, m.id
+       GROUP BY t.id, pt.code, m.id, source_carry.id, source_settlement_transfer.id,
+                settlement_carry.id, settlement_source_transfer.id,
+                carry_candidate.id, carry_candidate.amount_cents,
+                carry_candidate.source_transfer_id, carry_candidate.source_booking_date
        ORDER BY t.provider, t.buchungsdatum DESC, t.created_at DESC`,
       [jahr, monat]
     );
-    return res.json({ ok: true, transfers: result.rows.map((row) => ({
-      ...row,
-      buchungsdatum: dateOnly(row.buchungsdatum),
-      betragCents: Math.round(Number(row.betrag) * 100),
-      differenzCents: row.differenz === null ? null : Math.round(Number(row.differenz) * 100),
-      deferred_until: dateOnly(row.deferred_until),
-    })) });
+    return res.json({ ok: true, transfers: result.rows.map((row) => {
+      const rawDifferenceCents = row.differenz === null ? null : Math.round(Number(row.differenz) * 100);
+      const carrySettled = row.source_carry_status === 'AUSGEGLICHEN' || row.settlement_carry_status === 'AUSGEGLICHEN';
+      return {
+        ...row,
+        buchungsdatum: dateOnly(row.buchungsdatum),
+        betragCents: Math.round(Number(row.betrag) * 100),
+        rawDifferenzCents: rawDifferenceCents,
+        differenzCents: carrySettled ? 0 : rawDifferenceCents,
+        deferred_until: dateOnly(row.deferred_until),
+        differenceCarry: row.source_carry_id ? {
+          id: row.source_carry_id,
+          role: 'SOURCE',
+          status: row.source_carry_status,
+          amountCents: Number(row.source_carry_amount_cents),
+          counterpartTransferId: row.source_settlement_transfer_id || null,
+          counterpartDate: dateOnly(row.source_settlement_date),
+        } : row.settlement_carry_id ? {
+          id: row.settlement_carry_id,
+          role: 'SETTLEMENT',
+          status: row.settlement_carry_status,
+          amountCents: Number(row.settlement_carry_amount_cents),
+          counterpartTransferId: row.settlement_source_transfer_id,
+          counterpartDate: dateOnly(row.settlement_source_date),
+        } : null,
+        carrySuggestion: row.carry_suggestion_id ? {
+          id: row.carry_suggestion_id,
+          amountCents: Number(row.carry_suggestion_amount_cents),
+          sourceTransferId: row.carry_suggestion_source_transfer_id,
+          sourceDate: dateOnly(row.carry_suggestion_source_date),
+        } : null,
+      };
+    }) });
   } catch (error) {
     return routeError(res, error, 'Sammelüberweisungen konnten nicht geladen werden.');
   }
@@ -1038,16 +1111,54 @@ router.post('/v2/transfers/:id/decision', verifyToken(), async (req, res) => {
     client = await pool.connect();
     await client.query('BEGIN');
     const result = await client.query(
-      `SELECT t.id AS transfer_id, m.id AS match_id, m.differenz
+      `SELECT t.id AS transfer_id, t.provider, t.payment_type_id,
+              t.buchungsdatum, pt.code AS payment_type,
+              m.id AS match_id, m.differenz,
+              round(m.differenz*100)::bigint AS difference_cents
        FROM controlling.payment_transfers t
        JOIN controlling.payment_transfer_matches m ON m.transfer_id=t.id
+       JOIN controlling.payment_types pt ON pt.id=t.payment_type_id
        WHERE t.id=$1 AND t.deleted_at IS NULL
          AND m.status IN ('vorgeschlagen','vertagt') FOR UPDATE OF t,m`,
       [req.params.id]
     );
     if (!result.rowCount) throw Object.assign(new Error('Offener Match-Vorschlag wurde nicht gefunden.'), { statusCode: 404 });
     const current = result.rows[0];
-    if (decision.action === 'confirm' && Number(current.differenz) !== 0 && !String(req.body?.note || '').trim()) {
+    const settleCarryId = String(req.body?.settleCarryId || '').trim() || null;
+    let carryToSettle = null;
+    if (decision.action === 'confirm' && settleCarryId) {
+      const carryResult = await client.query(
+        `SELECT carry.id, carry.amount_cents, carry.source_match_id,
+                source_transfer.id AS source_transfer_id,
+                source_transfer.provider AS source_provider,
+                source_transfer.payment_type_id AS source_payment_type_id,
+                source_transfer.buchungsdatum AS source_date,
+                round(source_match.differenz*100)::bigint AS source_difference_cents
+         FROM controlling.payment_transfer_difference_carries carry
+         JOIN controlling.payment_transfer_matches source_match ON source_match.id=carry.source_match_id
+         JOIN controlling.payment_transfers source_transfer ON source_transfer.id=source_match.transfer_id
+         WHERE carry.id=$1 AND carry.status='OFFEN'
+         FOR UPDATE OF carry`,
+        [settleCarryId]
+      );
+      if (!carryResult.rowCount) throw Object.assign(new Error('Der vorgeschlagene Fehlbetrag ist nicht mehr offen.'), { statusCode: 409 });
+      carryToSettle = carryResult.rows[0];
+      const exact = isExactDifferenceCarry({
+        sourceDifferenceCents: Number(carryToSettle.source_difference_cents),
+        settlementDifferenceCents: Number(current.difference_cents),
+        sourceProvider: carryToSettle.source_provider,
+        settlementProvider: current.provider,
+        sourcePaymentType: String(carryToSettle.source_payment_type_id),
+        settlementPaymentType: String(current.payment_type_id),
+        sourceDate: dateOnly(carryToSettle.source_date),
+        settlementDate: dateOnly(current.buchungsdatum),
+      });
+      if (!exact || Number(carryToSettle.amount_cents) !== Number(current.difference_cents)) {
+        throw Object.assign(new Error('Der Fehlbetrag passt nicht exakt zu dieser positiven Differenz.'), { statusCode: 409 });
+      }
+    }
+    if (decision.action === 'confirm' && Number(current.differenz) !== 0
+      && !String(req.body?.note || '').trim() && !carryToSettle) {
       throw Object.assign(new Error('Eine bestätigte Differenz benötigt eine Begründung.'), { statusCode: 400 });
     }
     const matchStatus = decision.action === 'confirm' ? 'bestaetigt' : decision.action === 'reject' ? 'abgelehnt' : 'vertagt';
@@ -1065,17 +1176,75 @@ router.post('/v2/transfers/:id/decision', verifyToken(), async (req, res) => {
       [current.transfer_id, matchStatus, req.user.id, decision.note || String(req.body?.note || '').trim() || null, decision.deferredUntil]
     );
     if (decision.action === 'confirm') {
+      const dayStatus = Number(current.difference_cents) < 0 ? 'AUSGLEICH_AUSSTEHEND' : 'EXTERN_BESTAETIGT';
       const days = await client.query(
-        `UPDATE controlling.payment_days pd SET review_status='EXTERN_BESTAETIGT',reviewed_by=$2,reviewed_at=now(),updated_at=now()
+        `UPDATE controlling.payment_days pd SET review_status=$2,reviewed_by=$3,reviewed_at=now(),updated_at=now()
          FROM controlling.payment_transfer_match_items mi
          WHERE mi.match_id=$1 AND mi.payment_day_id=pd.id RETURNING pd.id`,
-        [current.match_id, req.user.id]
+        [current.match_id, dayStatus, req.user.id]
       );
       for (const day of days.rows) {
         await client.query(
           `INSERT INTO controlling.payment_review_events (payment_day_id,event_type,actor_user_id,details)
-           VALUES ($1,'EXTERN_BESTAETIGT',$2,jsonb_build_object('matchId',$3::uuid))`,
-          [day.id, req.user.id, current.match_id]
+           VALUES ($1,$2,$3,jsonb_build_object('matchId',$4::uuid))`,
+          [day.id, dayStatus, req.user.id, current.match_id]
+        );
+      }
+      if (Number(current.difference_cents) < 0) {
+        const carry = await client.query(
+          `INSERT INTO controlling.payment_transfer_difference_carries
+             (source_match_id,amount_cents,created_by)
+           VALUES ($1,$2,$3)
+           RETURNING id`,
+          [current.match_id, Math.abs(Number(current.difference_cents)), req.user.id]
+        );
+        await client.query(
+          `INSERT INTO controlling.payment_transfer_events
+             (transfer_id,match_id,event_type,actor_user_id,details)
+           VALUES ($1,$2,'FEHLBETRAG_GEMERKT',$3,jsonb_build_object(
+             'carryId',$4::uuid,'amountCents',$5::bigint
+           ))`,
+          [current.transfer_id, current.match_id, req.user.id, carry.rows[0].id,
+            Math.abs(Number(current.difference_cents))]
+        );
+      }
+      if (carryToSettle) {
+        await client.query(
+          `UPDATE controlling.payment_transfer_difference_carries
+           SET status='AUSGEGLICHEN',settlement_match_id=$2,settled_by=$3,settled_at=now()
+           WHERE id=$1`,
+          [carryToSettle.id, current.match_id, req.user.id]
+        );
+        const sourceDays = await client.query(
+          `UPDATE controlling.payment_days pd
+           SET review_status='EXTERN_BESTAETIGT',reviewed_by=$2,reviewed_at=now(),updated_at=now()
+           FROM controlling.payment_transfer_match_items item
+           WHERE item.match_id=$1 AND item.payment_day_id=pd.id
+           RETURNING pd.id`,
+          [carryToSettle.source_match_id, req.user.id]
+        );
+        for (const day of sourceDays.rows) {
+          await client.query(
+            `INSERT INTO controlling.payment_review_events (payment_day_id,event_type,actor_user_id,details)
+             VALUES ($1,'EXTERN_BESTAETIGT',$2,jsonb_build_object(
+               'sourceMatchId',$3::uuid,'settlementMatchId',$4::uuid,'carryId',$5::uuid
+             ))`,
+            [day.id, req.user.id, carryToSettle.source_match_id, current.match_id, carryToSettle.id]
+          );
+        }
+        await client.query(
+          `INSERT INTO controlling.payment_transfer_events
+             (transfer_id,match_id,event_type,actor_user_id,details)
+           VALUES
+             ($1,$2,'FEHLBETRAG_AUSGEGLICHEN',$5,jsonb_build_object(
+               'carryId',$4::uuid,'settlementTransferId',$3::uuid,'amountCents',$6::bigint
+             )),
+             ($3,$7,'AUSGLEICH_BESTAETIGT',$5,jsonb_build_object(
+               'carryId',$4::uuid,'sourceTransferId',$1::uuid,'amountCents',$6::bigint
+             ))`,
+          [carryToSettle.source_transfer_id, carryToSettle.source_match_id,
+            current.transfer_id, carryToSettle.id, req.user.id,
+            Number(carryToSettle.amount_cents), current.match_id]
         );
       }
     }
@@ -1085,7 +1254,7 @@ router.post('/v2/transfers/:id/decision', verifyToken(), async (req, res) => {
       [current.transfer_id, current.match_id, eventType, req.user.id, decision.note, decision.deferredUntil]
     );
     await client.query('COMMIT');
-    return res.json({ ok: true, status: matchStatus });
+    return res.json({ ok: true, status: matchStatus, carrySettled: Boolean(carryToSettle) });
   } catch (error) {
     if (client) await client.query('ROLLBACK').catch(() => {});
     return routeError(res, error, 'Match-Entscheidung konnte nicht gespeichert werden.');
