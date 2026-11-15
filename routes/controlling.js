@@ -9,6 +9,7 @@ const {
   normalizeReviewDecision,
   normalizeTransferDecision,
   moneyToCents,
+  MAX_AUTOMATIC_MATCH_AMOUNT_CENTS,
   findBestMatch,
   isExactDifferenceCarry,
   berlinDateOnly,
@@ -799,6 +800,104 @@ router.patch('/v2/reviews', verifyToken(), async (req, res) => {
   }
 });
 
+async function createAutomaticMatchSuggestion(transferId, actorUserId = null) {
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query('BEGIN');
+    const transferResult = await client.query(
+      `SELECT t.*, pt.code AS payment_type, round(t.betrag*100)::bigint AS amount_cents
+       FROM controlling.payment_transfers t JOIN controlling.payment_types pt ON pt.id=t.payment_type_id
+       WHERE t.id=$1 AND t.deleted_at IS NULL FOR UPDATE`,
+      [transferId]
+    );
+    if (!transferResult.rowCount) throw Object.assign(new Error('Sammelüberweisung wurde nicht gefunden.'), { statusCode: 404 });
+    const transfer = transferResult.rows[0];
+    if (Number(transfer.amount_cents) > MAX_AUTOMATIC_MATCH_AMOUNT_CENTS) {
+      throw Object.assign(new Error('Der Betrag überschreitet den automatischen Suchbereich von 100.000 €.'), {
+        statusCode: 409,
+        code: 'MATCH_LIMIT_EXCEEDED',
+      });
+    }
+    const confirmed = await client.query(
+      `SELECT 1 FROM controlling.payment_transfer_matches
+       WHERE transfer_id=$1 AND status='bestaetigt'`,
+      [transfer.id]
+    );
+    if (confirmed.rowCount) {
+      throw Object.assign(new Error('Eine bereits bestätigte Zuordnung wird nicht neu berechnet.'), { statusCode: 409 });
+    }
+    const candidatesResult = await client.query(
+      `SELECT pd.id, pd.datum, pd.filiale, pd.qlik_amount_cents
+       FROM controlling.payment_days pd
+       WHERE pd.payment_type_id=$1 AND pd.qlik_amount_cents>0
+         AND pd.datum BETWEEN $2::date - INTERVAL '21 days' AND $2::date
+         AND NOT EXISTS (
+           SELECT 1 FROM controlling.payment_transfer_match_items used
+           JOIN controlling.payment_transfer_matches confirmed ON confirmed.id=used.match_id
+           WHERE used.payment_day_id=pd.id AND confirmed.status='bestaetigt'
+         )
+       ORDER BY pd.datum, pd.filiale`,
+      [transfer.payment_type_id, dateOnly(transfer.buchungsdatum)]
+    );
+    const suggestion = findBestMatch(candidatesResult.rows.map((row) => ({
+      id: row.id,
+      datum: dateOnly(row.datum),
+      amountCents: Number(row.qlik_amount_cents),
+      filiale: row.filiale,
+    })), Number(transfer.amount_cents));
+    if (!suggestion.complete) {
+      throw Object.assign(new Error('Der Suchraum ist für einen verlässlichen automatischen Vorschlag zu groß.'), { statusCode: 409 });
+    }
+    if (!suggestion.itemIds.length) {
+      throw Object.assign(new Error('Keine geeigneten Tageswerte für einen Vorschlag gefunden.'), { statusCode: 409 });
+    }
+    await client.query(
+      `UPDATE controlling.payment_transfer_matches
+       SET status='abgelehnt',updated_at=now(),review_note='Durch neuen Vorschlag ersetzt.'
+       WHERE transfer_id=$1 AND status IN ('vorgeschlagen','vertagt')`,
+      [transfer.id]
+    );
+    const matchResult = await client.query(
+      `INSERT INTO controlling.payment_transfer_matches (transfer_id,status,differenz,automatisch,algorithm_version)
+       VALUES ($1,'vorgeschlagen',$2::bigint/100.0,true,'subset-cents-v2') RETURNING *`,
+      [transfer.id, suggestion.differenceCents]
+    );
+    const match = matchResult.rows[0];
+    let order = 0;
+    for (const itemId of suggestion.itemIds) {
+      const candidate = candidatesResult.rows.find((row) => row.id === itemId);
+      await client.query(
+        `INSERT INTO controlling.payment_transfer_match_items (match_id,payment_day_id,betrag,teilbetrag,reihenfolge)
+         VALUES ($1,$2,$3::bigint/100.0,false,$4)`,
+        [match.id, itemId, Number(candidate.qlik_amount_cents), order]
+      );
+      order += 1;
+    }
+    await client.query("UPDATE controlling.payment_transfers SET status='vorgeschlagen',updated_at=now() WHERE id=$1", [transfer.id]);
+    await client.query(
+      `INSERT INTO controlling.payment_transfer_events (transfer_id,match_id,event_type,actor_user_id,details)
+       VALUES ($1,$2,'VORGESCHLAGEN',$3,jsonb_build_object('exact',$4::boolean,'differenceCents',$5::bigint,'automaticTrigger',true))`,
+      [transfer.id, match.id, actorUserId, suggestion.exact, suggestion.differenceCents]
+    );
+    await client.query('COMMIT');
+    return { ...match, suggestion };
+  } catch (error) {
+    if (client) await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client?.release();
+  }
+}
+
+async function tryAutomaticMatchSuggestion(transferId, actorUserId) {
+  try {
+    return { match: await createAutomaticMatchSuggestion(transferId, actorUserId), suggestionError: null };
+  } catch (error) {
+    return { match: null, suggestionError: error.message || 'Match-Vorschlag konnte nicht erzeugt werden.' };
+  }
+}
+
 router.put('/transfers/classic', verifyToken(), async (req, res) => {
   if (!hasAccess(req)) {
     return res.status(403).json({ ok: false, message: 'Zugriff verweigert.' });
@@ -836,6 +935,7 @@ router.put('/transfers/classic', verifyToken(), async (req, res) => {
       throw Object.assign(new Error('Für diesen Tag bestehen mehrere Sammelüberweisungen. Bitte in V2 bearbeiten.'), { statusCode: 409 });
     }
     let transfer;
+    let shouldSuggest = true;
     let eventType;
     if (existing.rowCount === 1) {
       const current = existing.rows[0];
@@ -851,6 +951,7 @@ router.put('/transfers/classic', verifyToken(), async (req, res) => {
       );
       transfer = updated.rows[0];
       eventType = currentAmountCents === amountCents ? null : 'ANGEPASST';
+      shouldSuggest = !current.match_status;
     } else {
       const inserted = await client.query(
         `INSERT INTO controlling.payment_transfers
@@ -872,7 +973,12 @@ router.put('/transfers/classic', verifyToken(), async (req, res) => {
     );
 
     await client.query('COMMIT');
-    return res.json({ ok: true, transfer: mapPaymentTransfer(transfer) });
+    client.release();
+    client = null;
+    const automatic = shouldSuggest
+      ? await tryAutomaticMatchSuggestion(transfer.id, req.user.id)
+      : { match: null, suggestionError: null };
+    return res.json({ ok: true, transfer: mapPaymentTransfer(transfer), ...automatic });
   } catch (error) {
     if (client) await client.query('ROLLBACK').catch(() => {});
     return routeError(res, error, 'Gesamtüberweisung konnte nicht gespeichert werden.');
@@ -1015,7 +1121,8 @@ router.post('/v2/transfers', verifyToken(), async (req, res) => {
        VALUES ($1,'ERFASST',$2,'{}'::jsonb)`,
       [result.rows[0].id, req.user.id]
     );
-    return res.status(201).json({ ok: true, transfer: result.rows[0] });
+    const automatic = await tryAutomaticMatchSuggestion(result.rows[0].id, req.user.id);
+    return res.status(201).json({ ok: true, transfer: result.rows[0], ...automatic });
   } catch (error) {
     return routeError(res, error, 'Sammelüberweisung konnte nicht gespeichert werden.');
   }
@@ -1023,72 +1130,12 @@ router.post('/v2/transfers', verifyToken(), async (req, res) => {
 
 router.post('/v2/transfers/:id/suggest', verifyToken(), async (req, res) => {
   if (!hasAccess(req)) return res.status(403).json({ ok: false, message: 'Zugriff verweigert.' });
-  let client;
   try {
-    client = await pool.connect();
-    await client.query('BEGIN');
-    const transferResult = await client.query(
-      `SELECT t.*, pt.code AS payment_type, round(t.betrag*100)::bigint AS amount_cents
-       FROM controlling.payment_transfers t JOIN controlling.payment_types pt ON pt.id=t.payment_type_id
-       WHERE t.id=$1 AND t.deleted_at IS NULL FOR UPDATE`,
-      [req.params.id]
-    );
-    if (!transferResult.rowCount) throw Object.assign(new Error('Sammelüberweisung wurde nicht gefunden.'), { statusCode: 404 });
-    const transfer = transferResult.rows[0];
-    const candidatesResult = await client.query(
-      `SELECT pd.id, pd.datum, pd.filiale, pd.qlik_amount_cents
-       FROM controlling.payment_days pd
-       WHERE pd.payment_type_id=$1 AND pd.qlik_amount_cents>0
-         AND pd.datum BETWEEN $2::date - INTERVAL '21 days' AND $2::date
-         AND NOT EXISTS (
-           SELECT 1 FROM controlling.payment_transfer_match_items used
-           JOIN controlling.payment_transfer_matches confirmed ON confirmed.id=used.match_id
-           WHERE used.payment_day_id=pd.id AND confirmed.status='bestaetigt'
-         )
-       ORDER BY pd.datum, pd.filiale`,
-      [transfer.payment_type_id, dateOnly(transfer.buchungsdatum)]
-    );
-    const suggestion = findBestMatch(candidatesResult.rows.map((row) => ({
-      id: row.id, datum: dateOnly(row.datum), amountCents: Number(row.qlik_amount_cents), filiale: row.filiale,
-    })), Number(transfer.amount_cents));
-    if (!suggestion.complete) {
-      throw Object.assign(new Error('Der Suchraum ist für einen verlässlichen automatischen Vorschlag zu groß.'), { statusCode: 409 });
-    }
-    if (!suggestion.itemIds.length) throw Object.assign(new Error('Keine geeigneten Tageswerte für einen Vorschlag gefunden.'), { statusCode: 409 });
-    await client.query(
-      `UPDATE controlling.payment_transfer_matches SET status='abgelehnt',updated_at=now(),review_note='Durch neuen Vorschlag ersetzt.'
-       WHERE transfer_id=$1 AND status IN ('vorgeschlagen','vertagt')`,
-      [transfer.id]
-    );
-    const matchResult = await client.query(
-      `INSERT INTO controlling.payment_transfer_matches (transfer_id,status,differenz,automatisch,algorithm_version)
-       VALUES ($1,'vorgeschlagen',$2::bigint/100.0,true,'subset-cents-v2') RETURNING *`,
-      [transfer.id, suggestion.differenceCents]
-    );
-    const match = matchResult.rows[0];
-    let order = 0;
-    for (const itemId of suggestion.itemIds) {
-      const candidate = candidatesResult.rows.find((row) => row.id === itemId);
-      await client.query(
-        `INSERT INTO controlling.payment_transfer_match_items (match_id,payment_day_id,betrag,teilbetrag,reihenfolge)
-         VALUES ($1,$2,$3::bigint/100.0,false,$4)`,
-        [match.id, itemId, Number(candidate.qlik_amount_cents), order]
-      );
-      order += 1;
-    }
-    await client.query("UPDATE controlling.payment_transfers SET status='vorgeschlagen',updated_at=now() WHERE id=$1", [transfer.id]);
-    await client.query(
-      `INSERT INTO controlling.payment_transfer_events (transfer_id,match_id,event_type,details)
-       VALUES ($1,$2,'VORGESCHLAGEN',jsonb_build_object('exact',$3::boolean,'differenceCents',$4::bigint))`,
-      [transfer.id, match.id, suggestion.exact, suggestion.differenceCents]
-    );
-    await client.query('COMMIT');
+    const match = await createAutomaticMatchSuggestion(req.params.id, req.user.id);
+    const suggestion = match.suggestion;
     return res.status(201).json({ ok: true, match: { ...match, suggestion } });
   } catch (error) {
-    if (client) await client.query('ROLLBACK').catch(() => {});
     return routeError(res, error, 'Match-Vorschlag konnte nicht erzeugt werden.');
-  } finally {
-    client?.release();
   }
 });
 
