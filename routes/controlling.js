@@ -674,7 +674,23 @@ router.get('/v2/overview', verifyToken(), async (req, res) => {
         `SELECT pd.id, pd.datum, pd.filiale, pt.code AS payment_type,
                 pd.qlik_amount_cents, pd.ist_betrag, pd.availability_status,
                 pd.comparison_status, pd.review_status, pd.review_note,
-                pd.deferred_until, pd.reviewed_at, u.name AS reviewed_by
+                pd.deferred_until, pd.reviewed_at, u.name AS reviewed_by,
+                (
+                  pd.review_status='BESTAETIGT'
+                  OR EXISTS (
+                    SELECT 1 FROM controlling.payment_review_events review_event
+                    WHERE review_event.payment_day_id=pd.id
+                      AND review_event.event_type='BESTAETIGT'
+                  )
+                ) AS manually_confirmed,
+                (
+                  pd.review_status='EXTERN_BESTAETIGT'
+                  OR EXISTS (
+                    SELECT 1 FROM controlling.payment_review_events transfer_event
+                    WHERE transfer_event.payment_day_id=pd.id
+                      AND transfer_event.event_type='EXTERN_BESTAETIGT'
+                  )
+                ) AS transfer_confirmed
          FROM controlling.payment_days pd
          JOIN controlling.payment_types pt ON pt.id=pd.payment_type_id
          LEFT JOIN public.users u ON u.id=pd.reviewed_by
@@ -765,6 +781,10 @@ router.get('/v2/overview', verifyToken(), async (req, res) => {
         deferredUntil: dateOnly(row.deferred_until),
         reviewedAt: row.reviewed_at,
         reviewedBy: row.reviewed_by,
+        confirmationStatuses: [
+          ...(row.manually_confirmed ? ['BESTAETIGT'] : []),
+          ...(row.transfer_confirmed ? ['EXTERN_BESTAETIGT'] : []),
+        ],
         components,
         componentProgress: {
           confirmed: confirmedComponents.length,
@@ -773,13 +793,26 @@ router.get('/v2/overview', verifyToken(), async (req, res) => {
         },
       });
     }
-    const items = filterPositiveRevenueItems([...itemsByKey.values()].map((item) => ({
-      ...item,
-      qlikTotalCents: item.branches.reduce((sum, branch) => sum + (branch.qlikAmountCents || 0), 0),
-      availabilityStatus: item.branches.every((branch) => branch.availabilityStatus === 'VORHANDEN') ? 'VORHANDEN' : 'UNVOLLSTAENDIG',
-      comparisonStatus: comparisonPrecedence(item.branches.map((branch) => branch.comparisonStatus)),
-      reviewStatus: reviewPrecedence(item.branches.map((branch) => branch.reviewStatus)),
-    })));
+    const items = filterPositiveRevenueItems([...itemsByKey.values()].map((item) => {
+      const relevantBranches = item.branches.filter((branch) => Number(branch.qlikAmountCents) > 0);
+      const confirmationStatuses = [];
+      if (relevantBranches.length > 0
+        && relevantBranches.every((branch) => branch.confirmationStatuses.includes('BESTAETIGT'))) {
+        confirmationStatuses.push('BESTAETIGT');
+      }
+      if (relevantBranches.length > 0
+        && relevantBranches.every((branch) => branch.confirmationStatuses.includes('EXTERN_BESTAETIGT'))) {
+        confirmationStatuses.push('EXTERN_BESTAETIGT');
+      }
+      return {
+        ...item,
+        qlikTotalCents: item.branches.reduce((sum, branch) => sum + (branch.qlikAmountCents || 0), 0),
+        availabilityStatus: item.branches.every((branch) => branch.availabilityStatus === 'VORHANDEN') ? 'VORHANDEN' : 'UNVOLLSTAENDIG',
+        comparisonStatus: comparisonPrecedence(item.branches.map((branch) => branch.comparisonStatus)),
+        reviewStatus: reviewPrecedence(item.branches.map((branch) => branch.reviewStatus)),
+        confirmationStatuses,
+      };
+    }));
     const summary = {
       newCount: items.filter((item) => item.reviewStatus === 'OFFEN').length,
       deviationCount: items.filter((item) => item.comparisonStatus === 'ABWEICHEND').length,
