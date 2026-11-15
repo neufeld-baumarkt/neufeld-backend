@@ -30,7 +30,7 @@ ALTER TABLE controlling.payment_review_events
     CHECK (event_type IN (
       'QLIK_SYNCHRONISIERT', 'IN_PRUEFUNG', 'BESTAETIGT', 'KORRIGIERT',
       'VERTAGT', 'AUSGLEICH_AUSSTEHEND', 'EXTERN_BESTAETIGT', 'RUECKGESETZT'
-    ));
+    )) NOT VALID;
 
 ALTER TABLE controlling.payment_transfer_events
   DROP CONSTRAINT IF EXISTS payment_transfer_events_event_type_check;
@@ -42,6 +42,6 @@ ALTER TABLE controlling.payment_transfer_events
       'ABGELEHNT', 'VERTAGT', 'FEHLBETRAG_GEMERKT',
       'FEHLBETRAG_AUSGEGLICHEN', 'AUSGLEICH_BESTAETIGT', 'RUECKGESETZT',
       'ANBIETER_NORMALISIERT', 'DUBLETTE_BEREINIGT'
-    ));
+    )) NOT VALID;
 
 COMMIT;
