@@ -10,7 +10,7 @@ ALTER TABLE controlling.payment_transfer_events
       'ABGELEHNT', 'VERTAGT', 'FEHLBETRAG_GEMERKT',
       'FEHLBETRAG_AUSGEGLICHEN', 'AUSGLEICH_BESTAETIGT', 'RUECKGESETZT',
       'ANBIETER_NORMALISIERT', 'DUBLETTE_BEREINIGT'
-    ));
+    )) NOT VALID;
 
 WITH exact_duplicates AS (
   SELECT classic.id AS classic_id, duplicate.id AS duplicate_id
