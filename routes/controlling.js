@@ -136,6 +136,9 @@ function buildEcCashMonthResponse({ jahr, monat, paymentDays, paymentTransfers }
       id: row.id,
       sollBetrag: toNumberOrNull(row.soll_betrag),
       istBetrag: toNumberOrNull(row.ist_betrag),
+      reviewStatus: row.review_status || 'OFFEN',
+      reviewedBy: row.reviewed_by || null,
+      reviewedAt: row.reviewed_at || null,
       status: row.status || 'offen',
       bemerkung: row.bemerkung || null,
       updatedAt: row.updated_at || null,
@@ -253,12 +256,17 @@ router.get('/ec-cash/month', verifyToken(), async (req, res) => {
         pt.bezeichnung,
         pd.soll_betrag,
         pd.ist_betrag,
+        pd.review_status,
+        pd.reviewed_at,
+        reviewer.name AS reviewed_by,
         pd.status,
         pd.bemerkung,
         pd.updated_at
       FROM controlling.payment_days pd
       INNER JOIN controlling.payment_types pt
         ON pt.id = pd.payment_type_id
+      LEFT JOIN public.users reviewer
+        ON reviewer.id = pd.reviewed_by
       WHERE pd.jahr = $1
         AND pd.monat = $2
         AND pt.code = ANY($3::text[])
@@ -543,6 +551,55 @@ router.put('/payment-days/:id', verifyToken(), async (req, res) => {
   }
 });
 
+router.patch('/payment-days/:id/review', verifyToken(), async (req, res) => {
+  if (!hasAccess(req)) {
+    return res.status(403).json({ ok: false, message: 'Zugriff verweigert.' });
+  }
+
+  const { id } = req.params;
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {
+    return res.status(400).json({ ok: false, message: 'Tageswert-ID ist ungültig.' });
+  }
+
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query('BEGIN');
+    const result = await client.query(
+      `UPDATE controlling.payment_days
+       SET review_status='BESTAETIGT', review_note=NULL, deferred_until=NULL,
+           reviewed_by=$2, reviewed_at=now(), updated_at=now()
+       WHERE id=$1 AND qlik_amount_cents IS NOT NULL
+       RETURNING id, review_status, reviewed_at`,
+      [id, req.user.id]
+    );
+
+    if (!result.rowCount) {
+      throw Object.assign(new Error('Qlik-Tageswert wurde nicht gefunden.'), { statusCode: 404 });
+    }
+
+    await client.query(
+      `INSERT INTO controlling.payment_review_events
+         (payment_day_id,event_type,actor_user_id,details)
+       VALUES ($1,'BESTAETIGT',$2,jsonb_build_object('source','CLASSIC_ONE_CLICK'))`,
+      [id, req.user.id]
+    );
+    await client.query('COMMIT');
+
+    return res.json({
+      ok: true,
+      paymentDayId: result.rows[0].id,
+      reviewStatus: result.rows[0].review_status,
+      reviewedAt: result.rows[0].reviewed_at,
+    });
+  } catch (error) {
+    if (client) await client.query('ROLLBACK').catch(() => {});
+    return routeError(res, error, 'Qlik-Tageswert konnte nicht bestätigt werden.');
+  } finally {
+    client?.release();
+  }
+});
+
 router.delete('/payment-days/:id', verifyToken(), async (req, res) => {
   if (!hasAccess(req)) {
     return res.status(403).json({ ok: false, message: 'Zugriff verweigert.' });
@@ -751,6 +808,7 @@ router.put('/transfers/classic', verifyToken(), async (req, res) => {
 
   try {
     const paymentType = normalizePaymentType(req.body?.paymentType);
+    const provider = providerForPaymentType(paymentType);
     const amountCents = moneyToCents(req.body?.amount);
     const buchungsdatum = String(req.body?.datum || '');
 
@@ -760,27 +818,57 @@ router.put('/transfers/classic', verifyToken(), async (req, res) => {
 
     client = await pool.connect();
     await client.query('BEGIN');
-    const result = await client.query(
-      `INSERT INTO controlling.payment_transfers
-        (payment_type_id,filiale,buchungsdatum,betrag,referenz,status,provider,created_by)
-       SELECT id,'Unternehmen',$2::date,$3::bigint/100.0,$4,'offen','CLASSIC',NULL
-       FROM controlling.payment_types WHERE code=$1
-       ON CONFLICT (payment_type_id,buchungsdatum) WHERE provider='CLASSIC' AND deleted_at IS NULL
-       DO UPDATE SET betrag=EXCLUDED.betrag,status='offen',updated_at=now()
-       RETURNING *, (xmax=0) AS inserted`,
-      [paymentType, buchungsdatum, amountCents, `CLASSIC:${paymentType}:${buchungsdatum}`]
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`ALEX2:${paymentType}:${buchungsdatum}`]);
+    const existing = await client.query(
+      `SELECT transfer.*, match.status AS match_status
+       FROM controlling.payment_transfers transfer
+       JOIN controlling.payment_types payment_type ON payment_type.id=transfer.payment_type_id
+       LEFT JOIN controlling.payment_transfer_matches match
+         ON match.transfer_id=transfer.id
+        AND match.status IN ('vorgeschlagen','vertagt','bestaetigt')
+       WHERE payment_type.code=$1 AND transfer.provider=$2
+         AND transfer.buchungsdatum=$3::date AND transfer.deleted_at IS NULL
+       ORDER BY transfer.created_at, transfer.id
+       FOR UPDATE OF transfer`,
+      [paymentType, provider, buchungsdatum]
     );
-
-    if (!result.rowCount) {
-      throw Object.assign(new Error('Zahlungsart wurde nicht gefunden.'), { statusCode: 400 });
+    if (existing.rowCount > 1) {
+      throw Object.assign(new Error('Für diesen Tag bestehen mehrere Sammelüberweisungen. Bitte in V2 bearbeiten.'), { statusCode: 409 });
     }
-
-    const transfer = result.rows[0];
-    await client.query(
+    let transfer;
+    let eventType;
+    if (existing.rowCount === 1) {
+      const current = existing.rows[0];
+      const currentAmountCents = Math.round(Number(current.betrag) * 100);
+      if (current.match_status && currentAmountCents !== amountCents) {
+        throw Object.assign(new Error('Eine bereits zugeordnete Sammelüberweisung kann nicht in Klassik geändert werden.'), { statusCode: 409 });
+      }
+      const updated = await client.query(
+        `UPDATE controlling.payment_transfers
+         SET betrag=$2::bigint/100.0,status=CASE WHEN $3 THEN status ELSE 'offen' END,updated_at=now()
+         WHERE id=$1 RETURNING *`,
+        [current.id, amountCents, Boolean(current.match_status)]
+      );
+      transfer = updated.rows[0];
+      eventType = currentAmountCents === amountCents ? null : 'ANGEPASST';
+    } else {
+      const inserted = await client.query(
+        `INSERT INTO controlling.payment_transfers
+          (payment_type_id,filiale,buchungsdatum,betrag,referenz,status,provider,created_by)
+         SELECT id,'Unternehmen',$2::date,$3::bigint/100.0,$4,'offen',$5,$6
+         FROM controlling.payment_types WHERE code=$1
+         RETURNING *`,
+        [paymentType, buchungsdatum, amountCents, `CLASSIC:${paymentType}:${buchungsdatum}`, provider, req.user.id]
+      );
+      if (!inserted.rowCount) throw Object.assign(new Error('Zahlungsart wurde nicht gefunden.'), { statusCode: 400 });
+      transfer = inserted.rows[0];
+      eventType = 'ERFASST';
+    }
+    if (eventType) await client.query(
       `INSERT INTO controlling.payment_transfer_events
         (transfer_id,event_type,actor_user_id,details)
-       VALUES ($1,$2,$3,jsonb_build_object('source','CLASSIC','amountCents',$4::bigint))`,
-      [transfer.id, transfer.inserted ? 'ERFASST' : 'ANGEPASST', req.user.id, amountCents]
+       VALUES ($1,$2,$3,jsonb_build_object('source','CLASSIC_VIEW','provider',$4::text,'amountCents',$5::bigint))`,
+      [transfer.id, eventType, req.user.id, provider, amountCents]
     );
 
     await client.query('COMMIT');
@@ -857,8 +945,7 @@ router.get('/v2/transfers', verifyToken(), async (req, res) => {
        ) carry_candidate ON true
        LEFT JOIN controlling.payment_transfer_match_items mi ON mi.match_id=m.id
        LEFT JOIN controlling.payment_days pd ON pd.id=mi.payment_day_id
-       WHERE t.provider <> 'CLASSIC'
-         AND EXTRACT(YEAR FROM t.buchungsdatum)::integer=$1
+       WHERE EXTRACT(YEAR FROM t.buchungsdatum)::integer=$1
          AND EXTRACT(MONTH FROM t.buchungsdatum)::integer=$2
          AND t.deleted_at IS NULL
        GROUP BY t.id, pt.code, m.id, source_carry.id, source_settlement_transfer.id,
@@ -1178,7 +1265,10 @@ router.post('/v2/transfers/:id/decision', verifyToken(), async (req, res) => {
     if (decision.action === 'confirm') {
       const dayStatus = Number(current.difference_cents) < 0 ? 'AUSGLEICH_AUSSTEHEND' : 'EXTERN_BESTAETIGT';
       const days = await client.query(
-        `UPDATE controlling.payment_days pd SET review_status=$2,reviewed_by=$3,reviewed_at=now(),updated_at=now()
+        `UPDATE controlling.payment_days pd
+         SET review_status=$2,
+             ist_betrag=CASE WHEN $2='EXTERN_BESTAETIGT' THEN mi.betrag ELSE NULL END,
+             reviewed_by=$3,reviewed_at=now(),updated_at=now()
          FROM controlling.payment_transfer_match_items mi
          WHERE mi.match_id=$1 AND mi.payment_day_id=pd.id RETURNING pd.id`,
         [current.match_id, dayStatus, req.user.id]
@@ -1217,7 +1307,8 @@ router.post('/v2/transfers/:id/decision', verifyToken(), async (req, res) => {
         );
         const sourceDays = await client.query(
           `UPDATE controlling.payment_days pd
-           SET review_status='EXTERN_BESTAETIGT',reviewed_by=$2,reviewed_at=now(),updated_at=now()
+           SET review_status='EXTERN_BESTAETIGT',ist_betrag=item.betrag,
+               reviewed_by=$2,reviewed_at=now(),updated_at=now()
            FROM controlling.payment_transfer_match_items item
            WHERE item.match_id=$1 AND item.payment_day_id=pd.id
            RETURNING pd.id`,
