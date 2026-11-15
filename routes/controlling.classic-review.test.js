@@ -38,3 +38,17 @@ test('IST wird ausschließlich aus menschlich bestätigten Match-Positionen bef�
   assert.match(route, /SET review_status='EXTERN_BESTAETIGT',ist_betrag=item\.betrag/);
   assert.match(route, /if \(decision\.action === 'confirm'\)/);
 });
+
+test('Klassik und V2 starten nach dem Speichern denselben automatischen Match-Vorschlag', async () => {
+  const source = await readFile(sourcePath, 'utf8');
+  const classicStart = source.indexOf("router.put('/transfers/classic'");
+  const v2Start = source.indexOf("router.post('/v2/transfers'");
+  const suggestStart = source.indexOf("router.post('/v2/transfers/:id/suggest'");
+
+  assert.ok(classicStart >= 0 && v2Start > classicStart && suggestStart > v2Start);
+  assert.match(source.slice(classicStart, v2Start), /tryAutomaticMatchSuggestion\(transfer\.id, req\.user\.id\)/);
+  assert.match(source.slice(v2Start, suggestStart), /tryAutomaticMatchSuggestion\(result\.rows\[0\]\.id, req\.user\.id\)/);
+  assert.match(source, /async function createAutomaticMatchSuggestion/);
+  assert.match(source, /automaticTrigger',true/);
+  assert.match(source, /suggestionError/);
+});
