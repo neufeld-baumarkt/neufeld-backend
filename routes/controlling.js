@@ -669,7 +669,7 @@ router.get('/v2/overview', verifyToken(), async (req, res) => {
     const jahr = parseYear(req.query.jahr);
     const monat = parseMonth(req.query.monat, 'monat');
     client = await pool.connect();
-    const [daysResult, unresolvedResult, importResult] = await Promise.all([
+    const [daysResult, componentResult, unresolvedResult, importResult] = await Promise.all([
       client.query(
         `SELECT pd.id, pd.datum, pd.filiale, pt.code AS payment_type,
                 pd.qlik_amount_cents, pd.ist_betrag, pd.availability_status,
@@ -688,6 +688,17 @@ router.get('/v2/overview', verifyToken(), async (req, res) => {
            )
          ORDER BY pd.datum DESC, pt.sortierung, pd.filiale`,
         [jahr, monat, EC_CASH_PAYMENT_TYPES]
+      ),
+      client.query(
+        `SELECT component.id, component.payment_day_id, component.component_code,
+                component.component_label, component.amount_cents, component.review_status,
+                component.reviewed_at, reviewer.name AS reviewed_by
+         FROM controlling.payment_day_component_reviews component
+         JOIN controlling.payment_days pd ON pd.id=component.payment_day_id
+         LEFT JOIN public.users reviewer ON reviewer.id=component.reviewed_by
+         WHERE pd.jahr=$1 AND pd.monat=$2
+         ORDER BY component.payment_day_id, component.component_code`,
+        [jahr, monat]
       ),
       client.query(
         `WITH ranked AS (
@@ -720,11 +731,28 @@ router.get('/v2/overview', verifyToken(), async (req, res) => {
         [jahr, monat]
       ),
     ]);
+    const componentsByDay = new Map();
+    for (const row of componentResult.rows) {
+      if (!componentsByDay.has(row.payment_day_id)) componentsByDay.set(row.payment_day_id, []);
+      componentsByDay.get(row.payment_day_id).push({
+        id: row.id,
+        code: row.component_code,
+        label: row.component_label,
+        amountCents: Number(row.amount_cents),
+        reviewStatus: row.review_status,
+        reviewedAt: row.reviewed_at,
+        reviewedBy: row.reviewed_by,
+        requiresReview: Number(row.amount_cents) > 0,
+      });
+    }
     const itemsByKey = new Map();
     for (const row of daysResult.rows) {
       const datum = dateOnly(row.datum);
       const key = `${datum}|${row.payment_type}`;
       if (!itemsByKey.has(key)) itemsByKey.set(key, { datum, paymentType: row.payment_type, branches: [] });
+      const components = componentsByDay.get(row.id) || [];
+      const requiredComponents = components.filter((component) => component.requiresReview);
+      const confirmedComponents = requiredComponents.filter((component) => component.reviewStatus === 'BESTAETIGT');
       itemsByKey.get(key).branches.push({
         id: row.id,
         filiale: row.filiale,
@@ -737,6 +765,12 @@ router.get('/v2/overview', verifyToken(), async (req, res) => {
         deferredUntil: dateOnly(row.deferred_until),
         reviewedAt: row.reviewed_at,
         reviewedBy: row.reviewed_by,
+        components,
+        componentProgress: {
+          confirmed: confirmedComponents.length,
+          required: requiredComponents.length,
+          complete: requiredComponents.length > 0 && confirmedComponents.length === requiredComponents.length,
+        },
       });
     }
     const items = filterPositiveRevenueItems([...itemsByKey.values()].map((item) => ({
@@ -758,6 +792,91 @@ router.get('/v2/overview', verifyToken(), async (req, res) => {
       importState: importResult.rows[0] || { completed_at: null, imported_days: 0 } });
   } catch (error) {
     return routeError(res, error, 'Modul-2-Daten konnten nicht geladen werden.');
+  } finally {
+    client?.release();
+  }
+});
+
+router.patch('/v2/component-reviews/:id', verifyToken(), async (req, res) => {
+  if (!hasAccess(req)) return res.status(403).json({ ok: false, message: 'Zugriff verweigert.' });
+  const componentId = String(req.params.id || '');
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(componentId)) {
+    return res.status(400).json({ ok: false, message: 'Einzelwert ist ungültig.' });
+  }
+
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query('BEGIN');
+    const selected = await client.query(
+      `SELECT component.id, component.payment_day_id, component.amount_cents,
+              component.component_code, component.component_label
+       FROM controlling.payment_day_component_reviews component
+       WHERE component.id=$1
+       FOR UPDATE`,
+      [componentId]
+    );
+    if (!selected.rowCount) throw Object.assign(new Error('Einzelwert wurde nicht gefunden.'), { statusCode: 404 });
+    const component = selected.rows[0];
+    if (Number(component.amount_cents) <= 0) {
+      throw Object.assign(new Error('Nullwerte gelten als „kein Umsatz“ und benötigen keine Bestätigung.'), { statusCode: 409 });
+    }
+
+    await client.query(
+      `UPDATE controlling.payment_day_component_reviews
+       SET review_status='BESTAETIGT', reviewed_by=$2, reviewed_at=now(), updated_at=now()
+       WHERE id=$1`,
+      [componentId, req.user.id]
+    );
+    await client.query(
+      `INSERT INTO controlling.payment_day_component_review_events (
+         component_review_id, event_type, actor_user_id, details
+       ) VALUES ($1,'BESTAETIGT',$2,jsonb_build_object(
+         'componentCode',$3::text,'componentLabel',$4::text,'amountCents',$5::bigint
+       ))`,
+      [componentId, req.user.id, component.component_code, component.component_label, component.amount_cents]
+    );
+
+    const progressResult = await client.query(
+      `SELECT count(*) FILTER (WHERE amount_cents>0)::integer AS required,
+              count(*) FILTER (WHERE amount_cents>0 AND review_status='BESTAETIGT')::integer AS confirmed
+       FROM controlling.payment_day_component_reviews
+       WHERE payment_day_id=$1`,
+      [component.payment_day_id]
+    );
+    const progress = progressResult.rows[0];
+    const complete = Number(progress.required) > 0 && Number(progress.required) === Number(progress.confirmed);
+    const nextStatus = complete ? 'BESTAETIGT' : 'IN_PRUEFUNG';
+    const parentUpdate = await client.query(
+      `UPDATE controlling.payment_days
+       SET review_status=CASE WHEN review_status='EXTERN_BESTAETIGT' THEN review_status ELSE $2 END,
+           reviewed_by=CASE WHEN review_status='EXTERN_BESTAETIGT' THEN reviewed_by ELSE $3 END,
+           reviewed_at=CASE WHEN review_status='EXTERN_BESTAETIGT' THEN reviewed_at ELSE now() END,
+           updated_at=now()
+       WHERE id=$1
+       RETURNING review_status`,
+      [component.payment_day_id, nextStatus, req.user.id]
+    );
+    await client.query(
+      `INSERT INTO controlling.payment_review_events (payment_day_id,event_type,actor_user_id,details)
+       VALUES ($1,$2,$3,jsonb_build_object(
+         'source','COMPONENT_REVIEW','componentReviewId',$4::text,
+         'confirmed',$5::integer,'required',$6::integer
+       ))`,
+      [component.payment_day_id, nextStatus, req.user.id, componentId,
+        progress.confirmed, progress.required]
+    );
+    await client.query('COMMIT');
+    return res.json({
+      ok: true,
+      componentId,
+      reviewStatus: 'BESTAETIGT',
+      branchReviewStatus: parentUpdate.rows[0]?.review_status || nextStatus,
+      progress: { confirmed: Number(progress.confirmed), required: Number(progress.required), complete },
+    });
+  } catch (error) {
+    if (client) await client.query('ROLLBACK').catch(() => {});
+    return routeError(res, error, 'Einzelwert konnte nicht bestätigt werden.');
   } finally {
     client?.release();
   }
