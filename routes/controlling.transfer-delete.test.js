@@ -22,6 +22,8 @@ test('Einmalige Bereinigung ist centgenau, eindeutig und blockiert bestaetigte M
   assert.match(migration, /buchungsdatum = DATE '2026-11-05'/);
   assert.match(migration, /1714786/);
   assert.match(migration, /target_count <> 1/);
+  assert.match(migration, /target_count = 0 AND EXISTS/);
+  assert.match(migration, /details ->> 'source' = 'MIGRATION_048'/);
   assert.match(migration, /match\.status = 'bestaetigt'/);
   assert.match(migration, /deleted_at = now\(\)/);
   assert.match(migration, /'GELOESCHT'/);

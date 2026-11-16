@@ -25,6 +25,17 @@ BEGIN
     AND round(transfer.betrag * 100)::bigint = 1714786
     AND transfer.deleted_at IS NULL;
 
+  IF target_count = 0 AND EXISTS (
+    SELECT 1
+    FROM controlling.payment_transfer_events event
+    WHERE event.event_type = 'GELOESCHT'
+      AND event.details ->> 'source' = 'MIGRATION_048'
+      AND event.details ->> 'bookingDate' = '2026-11-05'
+      AND (event.details ->> 'amountCents')::bigint = 1714786
+  ) THEN
+    RETURN;
+  END IF;
+
   IF target_count <> 1 THEN
     RAISE EXCEPTION
       'Verwaiste Sammelueberweisung nicht eindeutig: erwartet 1, gefunden %.', target_count;
