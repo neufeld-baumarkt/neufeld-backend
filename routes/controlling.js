@@ -265,7 +265,15 @@ router.get('/ec-cash/month', verifyToken(), async (req, res) => {
         pt.code,
         pt.bezeichnung,
         pd.soll_betrag,
-        pd.ist_betrag,
+        CASE WHEN EXISTS (
+          SELECT 1
+          FROM controlling.payment_transfer_match_items match_item
+          JOIN controlling.payment_transfer_matches transfer_match
+            ON transfer_match.id = match_item.match_id
+          WHERE match_item.payment_day_id = pd.id
+            AND transfer_match.status = 'bestaetigt'
+            AND match_item.betrag = pd.ist_betrag
+        ) THEN pd.ist_betrag ELSE NULL END AS ist_betrag,
         pd.review_status,
         pd.reviewed_at,
         reviewer.name AS reviewed_by,
@@ -360,7 +368,15 @@ router.get('/payment-days', verifyToken(), async (req, res) => {
         pt.code,
         pt.bezeichnung,
         pd.soll_betrag,
-        pd.ist_betrag,
+        CASE WHEN EXISTS (
+          SELECT 1
+          FROM controlling.payment_transfer_match_items match_item
+          JOIN controlling.payment_transfer_matches transfer_match
+            ON transfer_match.id = match_item.match_id
+          WHERE match_item.payment_day_id = pd.id
+            AND transfer_match.status = 'bestaetigt'
+            AND match_item.betrag = pd.ist_betrag
+        ) THEN pd.ist_betrag ELSE NULL END AS ist_betrag,
         pd.status,
         pd.bemerkung,
         pd.updated_at
@@ -416,6 +432,13 @@ router.post('/payment-days', verifyToken(), async (req, res) => {
     });
   }
 
+  if (istBetrag !== undefined && istBetrag !== null && istBetrag !== '') {
+    return res.status(400).json({
+      ok: false,
+      message: 'IST Match-Engine kann nicht manuell erfasst werden.',
+    });
+  }
+
   const parsedDate = new Date(`${datum}T00:00:00`);
   if (Number.isNaN(parsedDate.getTime())) {
     return res.status(400).json({
@@ -429,8 +452,6 @@ router.post('/payment-days', verifyToken(), async (req, res) => {
   const tag = parsedDate.getDate();
 
   const soll = toNumberOrNull(sollBetrag);
-  const ist = toNumberOrNull(istBetrag);
-
   try {
     const result = await pool.query(
       `
@@ -456,17 +477,16 @@ router.post('/payment-days', verifyToken(), async (req, res) => {
         $5,
         $6,
         $7,
-        $8,
-        COALESCE($9, 'offen'),
+        NULL,
+        COALESCE($8, 'offen'),
+        $9,
         $10,
-        $11,
         now()
       FROM controlling.payment_types pt
       WHERE pt.code = $1
       ON CONFLICT (payment_type_id, filiale, datum)
       DO UPDATE SET
         soll_betrag = EXCLUDED.soll_betrag,
-        ist_betrag = EXCLUDED.ist_betrag,
         status = EXCLUDED.status,
         bemerkung = EXCLUDED.bemerkung,
         updated_at = now()
@@ -480,7 +500,6 @@ router.post('/payment-days', verifyToken(), async (req, res) => {
         monat,
         tag,
         soll,
-        ist,
         status || 'offen',
         bemerkung || null,
         null,
@@ -517,15 +536,21 @@ router.put('/payment-days/:id', verifyToken(), async (req, res) => {
   const { id } = req.params;
   const { sollBetrag, istBetrag, status, bemerkung } = req.body || {};
 
+  if (istBetrag !== undefined && istBetrag !== null && istBetrag !== '') {
+    return res.status(400).json({
+      ok: false,
+      message: 'IST Match-Engine kann nicht manuell geändert werden.',
+    });
+  }
+
   try {
     const result = await pool.query(
       `
       UPDATE controlling.payment_days
       SET
         soll_betrag = $2,
-        ist_betrag = $3,
-        status = COALESCE($4, status),
-        bemerkung = $5,
+        status = COALESCE($3, status),
+        bemerkung = $4,
         updated_at = now()
       WHERE id = $1
       RETURNING *
@@ -533,7 +558,6 @@ router.put('/payment-days/:id', verifyToken(), async (req, res) => {
       [
         id,
         toNumberOrNull(sollBetrag),
-        toNumberOrNull(istBetrag),
         status || null,
         bemerkung || null,
       ]
