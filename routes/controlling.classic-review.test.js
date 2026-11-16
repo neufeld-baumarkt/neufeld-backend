@@ -34,7 +34,8 @@ test('IST wird ausschließlich aus menschlich bestätigten Match-Positionen bef�
   const route = source.slice(start);
 
   assert.ok(start >= 0);
-  assert.match(route, /ist_betrag=CASE WHEN \$2='EXTERN_BESTAETIGT' THEN mi\.betrag ELSE NULL END/);
+  assert.match(route, /SET review_status=\$2::varchar\(30\)/);
+  assert.match(route, /ist_betrag=CASE WHEN \$2::varchar\(30\)='EXTERN_BESTAETIGT' THEN mi\.betrag ELSE NULL END/);
   assert.match(route, /SET review_status='EXTERN_BESTAETIGT',ist_betrag=item\.betrag/);
   assert.match(route, /if \(decision\.action === 'confirm'\)/);
 });

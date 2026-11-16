@@ -1465,8 +1465,8 @@ router.post('/v2/transfers/:id/decision', verifyToken(), async (req, res) => {
       const dayStatus = Number(current.difference_cents) < 0 ? 'AUSGLEICH_AUSSTEHEND' : 'EXTERN_BESTAETIGT';
       const days = await client.query(
         `UPDATE controlling.payment_days pd
-         SET review_status=$2,
-             ist_betrag=CASE WHEN $2='EXTERN_BESTAETIGT' THEN mi.betrag ELSE NULL END,
+         SET review_status=$2::varchar(30),
+             ist_betrag=CASE WHEN $2::varchar(30)='EXTERN_BESTAETIGT' THEN mi.betrag ELSE NULL END,
              reviewed_by=$3,reviewed_at=now(),updated_at=now()
          FROM controlling.payment_transfer_match_items mi
          WHERE mi.match_id=$1 AND mi.payment_day_id=pd.id RETURNING pd.id`,
