@@ -1,6 +1,7 @@
 const express = require('express');
 const pool = require('../db');
 const verifyToken = require('../middleware/verifyToken');
+const { streamAlexModule2Changes } = require('../lib/alexModule2LiveSync');
 const {
   parseMonth,
   parseYear,
@@ -22,6 +23,16 @@ const router = express.Router();
 const ALLOWED_ROLES = new Set(['Admin', 'Supervisor', 'Geschäftsführer']);
 const EC_CASH_PAYMENT_TYPES = ['EC_CASH', 'KREDITKARTE'];
 const FILIALEN = ['Telgte', 'Ahaus', 'Vreden', 'Münster'];
+
+router.get('/sync/events', verifyToken(), async (req, res) => {
+  if (!hasAccess(req)) return res.status(403).json({ ok: false, message: 'Zugriff verweigert.' });
+  try {
+    await streamAlexModule2Changes({ pool, req, res });
+  } catch (error) {
+    console.error('[ALEX_MODULE2_SYNC_ERROR]', error);
+    if (!res.headersSent) return res.status(503).json({ ok: false, message: 'Live-Synchronisierung ist vorübergehend nicht verfügbar.' });
+  }
+});
 
 function hasAccess(req) {
   return req.user && ALLOWED_ROLES.has(req.user.role);
