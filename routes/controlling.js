@@ -1206,6 +1206,64 @@ async function correctTransferAmount(client, { transferId, amountCents, reason, 
   return { transfer: updated.rows[0], changed: true, supersededMatchIds: matchIds };
 }
 
+async function deleteUnconfirmedTransfer(client, { transferId, reason, actorUserId, source }) {
+  const deletionReason = String(reason || '').trim();
+  if (!deletionReason) {
+    throw Object.assign(new Error('Das Löschen benötigt eine Begründung.'), { statusCode: 400 });
+  }
+
+  const selected = await client.query(
+    `SELECT transfer.*
+     FROM controlling.payment_transfers transfer
+     WHERE transfer.id=$1 AND transfer.deleted_at IS NULL
+     FOR UPDATE`,
+    [transferId]
+  );
+  if (!selected.rowCount) {
+    throw Object.assign(new Error('Sammelüberweisung wurde nicht gefunden.'), { statusCode: 404 });
+  }
+
+  const confirmed = await client.query(
+    `SELECT id FROM controlling.payment_transfer_matches
+     WHERE transfer_id=$1 AND status='bestaetigt'
+     LIMIT 1`,
+    [transferId]
+  );
+  if (confirmed.rowCount) {
+    throw Object.assign(new Error('Eine bestätigte Zuordnung kann nicht gelöscht werden. Bitte zuerst den Match nachvollziehbar zurücksetzen.'), { statusCode: 409 });
+  }
+
+  const rejected = await client.query(
+    `UPDATE controlling.payment_transfer_matches
+     SET status='abgelehnt',reviewed_by=$2,reviewed_at=now(),
+         review_note=$3,updated_at=now()
+     WHERE transfer_id=$1 AND status IN ('vorgeschlagen','vertagt')
+     RETURNING id`,
+    [transferId, actorUserId, `Sammelüberweisung gelöscht: ${deletionReason}`]
+  );
+
+  const deleted = await client.query(
+    `UPDATE controlling.payment_transfers
+     SET deleted_at=now(),deleted_by=$2,deletion_reason=$3,
+         status='abgelehnt',decided_by=$2,decided_at=now(),
+         decision_note=$3,updated_at=now()
+     WHERE id=$1 AND deleted_at IS NULL
+     RETURNING *`,
+    [transferId, actorUserId, deletionReason]
+  );
+  await client.query(
+    `INSERT INTO controlling.payment_transfer_events
+       (transfer_id,event_type,actor_user_id,details)
+     VALUES ($1,'GELOESCHT',$2,jsonb_build_object(
+       'source',$3::text,'reason',$4::text,'rejectedMatchIds',$5::jsonb
+     ))`,
+    [transferId, actorUserId, source, deletionReason,
+      JSON.stringify(rejected.rows.map((row) => row.id))]
+  );
+
+  return deleted.rows[0];
+}
+
 router.put('/transfers/classic', verifyToken(), async (req, res) => {
   if (!hasAccess(req)) {
     return res.status(403).json({ ok: false, message: 'Zugriff verweigert.' });
@@ -1464,6 +1522,28 @@ router.patch('/v2/transfers/:id', verifyToken(), async (req, res) => {
   } catch (error) {
     if (client) await client.query('ROLLBACK').catch(() => {});
     return routeError(res, error, 'Betrag der Sammelüberweisung konnte nicht korrigiert werden.');
+  } finally {
+    client?.release();
+  }
+});
+
+router.delete('/v2/transfers/:id', verifyToken(), async (req, res) => {
+  if (!hasAccess(req)) return res.status(403).json({ ok: false, message: 'Zugriff verweigert.' });
+  let client;
+  try {
+    client = await pool.connect();
+    await client.query('BEGIN');
+    const transfer = await deleteUnconfirmedTransfer(client, {
+      transferId: req.params.id,
+      reason: req.body?.reason,
+      actorUserId: req.user.id,
+      source: String(req.body?.source || 'V2_VIEW'),
+    });
+    await client.query('COMMIT');
+    return res.json({ ok: true, transfer: mapPaymentTransfer(transfer) });
+  } catch (error) {
+    if (client) await client.query('ROLLBACK').catch(() => {});
+    return routeError(res, error, 'Sammelüberweisung konnte nicht gelöscht werden.');
   } finally {
     client?.release();
   }
