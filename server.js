@@ -15,6 +15,7 @@ const { runEmployeePinMigration } = require('./lib/runEmployeePinMigration');
 const { runCashClosingMigration } = require('./lib/runCashClosingMigration');
 const { runQlikImportMigration } = require('./lib/runQlikImportMigration');
 const { runQlikDerivedMigration } = require('./lib/runQlikDerivedMigration');
+const { runAlexModule2LiveSyncMigration } = require('./lib/runAlexModule2LiveSyncMigration');
 const { startAlexModule1RetryWorker } = require('./lib/alexModule1RetryWorker');
 const { runAlexModule2StartupMaintenance } = require('./lib/alexModule2StartupMaintenance');
 const { ALLOWED_CORS_HEADERS } = require('./lib/corsPolicy');
@@ -213,6 +214,8 @@ async function startServer() {
   await runCashClosingMigration(pool);
   await runQlikImportMigration(pool);
   await runQlikDerivedMigration(pool);
+  await runAlexModule2LiveSyncMigration(pool);
+  console.log('✅ Alex-2-Live-Sync-Datenbanktrigger sind bereit');
   const alex2Maintenance = await runAlexModule2StartupMaintenance(pool);
   console.log(`ALEX2_TABULA_RASA=${JSON.stringify(alex2Maintenance)}`);
   console.log('✅ Datenbankschema für Einzählung, Abrechnung und Tresorzählung ist bereit');
