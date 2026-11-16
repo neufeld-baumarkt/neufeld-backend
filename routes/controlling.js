@@ -95,6 +95,7 @@ function createEmptyDay(jahr, monat, tag) {
     filialen,
     gesamtUeberweisung: {
       betrag: null,
+      originalBetrag: null,
       transfers: [],
     },
   };
@@ -170,6 +171,7 @@ function buildEcCashMonthResponse({ jahr, monat, paymentDays, paymentTransfers }
 
     if (transfer.provider === 'CLASSIC') {
       day.gesamtUeberweisung.betrag = transfer.betrag;
+      day.gesamtUeberweisung.originalBetrag = transfer.betrag;
       day.gesamtUeberweisung.classicTransferId = transfer.id;
       return;
     }
@@ -179,6 +181,13 @@ function buildEcCashMonthResponse({ jahr, monat, paymentDays, paymentTransfers }
     if (!day.gesamtUeberweisung.classicTransferId) {
       const currentTotal = toNumberOrNull(day.gesamtUeberweisung.betrag) || 0;
       day.gesamtUeberweisung.betrag = currentTotal + (transfer.betrag || 0);
+      if (day.gesamtUeberweisung.transfers.length === 1) {
+        day.gesamtUeberweisung.classicTransferId = transfer.id;
+        day.gesamtUeberweisung.originalBetrag = transfer.betrag;
+      } else {
+        day.gesamtUeberweisung.classicTransferId = null;
+        day.gesamtUeberweisung.originalBetrag = null;
+      }
     }
   });
 
@@ -1050,6 +1059,129 @@ async function tryAutomaticMatchSuggestion(transferId, actorUserId) {
   }
 }
 
+function transferCorrectionReason(value) {
+  const reason = String(value || '').trim();
+  if (!reason) throw Object.assign(new Error('Die Betragskorrektur benötigt eine Begründung.'), { statusCode: 400 });
+  if (reason.length > 500) throw Object.assign(new Error('Die Begründung darf höchstens 500 Zeichen lang sein.'), { statusCode: 400 });
+  return reason;
+}
+
+async function correctTransferAmount(client, { transferId, amountCents, reason, actorUserId, source }) {
+  const transferResult = await client.query(
+    `SELECT transfer.*, round(transfer.betrag*100)::bigint AS old_amount_cents
+     FROM controlling.payment_transfers transfer
+     WHERE transfer.id=$1 AND transfer.deleted_at IS NULL
+     FOR UPDATE`,
+    [transferId]
+  );
+  if (!transferResult.rowCount) throw Object.assign(new Error('Sammelüberweisung wurde nicht gefunden.'), { statusCode: 404 });
+  const transfer = transferResult.rows[0];
+  const oldAmountCents = Number(transfer.old_amount_cents);
+  if (oldAmountCents === amountCents) return { transfer, changed: false, supersededMatchIds: [] };
+
+  const correctionReason = transferCorrectionReason(reason);
+  const matches = await client.query(
+    `SELECT id,status FROM controlling.payment_transfer_matches
+     WHERE transfer_id=$1 AND status IN ('vorgeschlagen','vertagt','bestaetigt')
+     ORDER BY created_at,id FOR UPDATE`,
+    [transferId]
+  );
+  const matchIds = matches.rows.map((row) => row.id);
+
+  if (matchIds.length) {
+    const settledCarries = await client.query(
+      `UPDATE controlling.payment_transfer_difference_carries carry
+       SET status='OFFEN',settlement_match_id=NULL,settled_by=NULL,settled_at=NULL
+       WHERE carry.settlement_match_id=ANY($1::uuid[]) AND carry.status='AUSGEGLICHEN'
+       RETURNING carry.id,carry.source_match_id`,
+      [matchIds]
+    );
+    for (const carry of settledCarries.rows) {
+      const sourceDays = await client.query(
+        `UPDATE controlling.payment_days day
+         SET review_status='AUSGLEICH_AUSSTEHEND',ist_betrag=NULL,
+             reviewed_by=$2,reviewed_at=now(),updated_at=now()
+         FROM controlling.payment_transfer_match_items item
+         WHERE item.match_id=$1 AND item.payment_day_id=day.id
+         RETURNING day.id`,
+        [carry.source_match_id, actorUserId]
+      );
+      for (const day of sourceDays.rows) {
+        await client.query(
+          `INSERT INTO controlling.payment_review_events
+             (payment_day_id,event_type,actor_user_id,details)
+           VALUES ($1,'TRANSFER_KORRIGIERT',$2,jsonb_build_object(
+             'source',$3::text,'reason',$4::text,'carryId',$5::uuid,
+             'effect','DIFFERENCE_CARRY_REOPENED'
+           ))`,
+          [day.id, actorUserId, source, correctionReason, carry.id]
+        );
+      }
+    }
+
+    await client.query(
+      `UPDATE controlling.payment_transfer_difference_carries
+       SET status='STORNIERT'
+       WHERE source_match_id=ANY($1::uuid[]) AND status IN ('OFFEN','AUSGEGLICHEN')`,
+      [matchIds]
+    );
+
+    const restoredDays = await client.query(
+      `UPDATE controlling.payment_days day
+       SET review_status=COALESCE(human.event_type,'OFFEN'),ist_betrag=NULL,
+           reviewed_by=human.actor_user_id,reviewed_at=human.created_at,updated_at=now()
+       FROM controlling.payment_transfer_match_items item
+       LEFT JOIN LATERAL (
+         SELECT event.event_type,event.actor_user_id,event.created_at
+         FROM controlling.payment_review_events event
+         WHERE event.payment_day_id=item.payment_day_id
+           AND event.event_type IN ('IN_PRUEFUNG','BESTAETIGT','KORRIGIERT','VERTAGT')
+         ORDER BY event.created_at DESC,event.id DESC LIMIT 1
+       ) human ON true
+       WHERE item.match_id=ANY($1::uuid[]) AND item.payment_day_id=day.id
+       RETURNING day.id,item.match_id`,
+      [matchIds]
+    );
+    for (const day of restoredDays.rows) {
+      await client.query(
+        `INSERT INTO controlling.payment_review_events
+           (payment_day_id,event_type,actor_user_id,details)
+         VALUES ($1,'TRANSFER_KORRIGIERT',$2,jsonb_build_object(
+           'source',$3::text,'reason',$4::text,'supersededMatchId',$5::uuid,
+           'oldAmountCents',$6::bigint,'newAmountCents',$7::bigint
+         ))`,
+        [day.id, actorUserId, source, correctionReason, day.match_id, oldAmountCents, amountCents]
+      );
+    }
+
+    await client.query(
+      `UPDATE controlling.payment_transfer_matches
+       SET status='abgelehnt',reviewed_by=$2,reviewed_at=now(),
+           review_note=$3,updated_at=now()
+       WHERE id=ANY($1::uuid[])`,
+      [matchIds, actorUserId, `Durch Betragskorrektur ersetzt: ${correctionReason}`]
+    );
+  }
+
+  const updated = await client.query(
+    `UPDATE controlling.payment_transfers
+     SET betrag=$2::bigint/100.0,status='offen',decided_by=NULL,decided_at=NULL,
+         decision_note=NULL,deferred_until=NULL,updated_at=now()
+     WHERE id=$1 RETURNING *`,
+    [transferId, amountCents]
+  );
+  await client.query(
+    `INSERT INTO controlling.payment_transfer_events
+       (transfer_id,event_type,actor_user_id,details)
+     VALUES ($1,'BETRAG_KORRIGIERT',$2,jsonb_build_object(
+       'source',$3::text,'reason',$4::text,'oldAmountCents',$5::bigint,
+       'newAmountCents',$6::bigint,'supersededMatchIds',$7::jsonb
+     ))`,
+    [transferId, actorUserId, source, correctionReason, oldAmountCents, amountCents, JSON.stringify(matchIds)]
+  );
+  return { transfer: updated.rows[0], changed: true, supersededMatchIds: matchIds };
+}
+
 router.put('/transfers/classic', verifyToken(), async (req, res) => {
   if (!hasAccess(req)) {
     return res.status(403).json({ ok: false, message: 'Zugriff verweigert.' });
@@ -1092,18 +1224,22 @@ router.put('/transfers/classic', verifyToken(), async (req, res) => {
     if (existing.rowCount === 1) {
       const current = existing.rows[0];
       const currentAmountCents = Math.round(Number(current.betrag) * 100);
-      if (current.match_status && currentAmountCents !== amountCents) {
-        throw Object.assign(new Error('Eine bereits zugeordnete Sammelüberweisung kann nicht in Klassik geändert werden.'), { statusCode: 409 });
+      if (currentAmountCents !== amountCents) {
+        const correction = await correctTransferAmount(client, {
+          transferId: current.id,
+          amountCents,
+          reason: req.body?.reason,
+          actorUserId: req.user.id,
+          source: 'CLASSIC_VIEW',
+        });
+        transfer = correction.transfer;
+        eventType = null;
+        shouldSuggest = true;
+      } else {
+        transfer = current;
+        eventType = null;
+        shouldSuggest = !current.match_status;
       }
-      const updated = await client.query(
-        `UPDATE controlling.payment_transfers
-         SET betrag=$2::bigint/100.0,status=CASE WHEN $3 THEN status ELSE 'offen' END,updated_at=now()
-         WHERE id=$1 RETURNING *`,
-        [current.id, amountCents, Boolean(current.match_status)]
-      );
-      transfer = updated.rows[0];
-      eventType = currentAmountCents === amountCents ? null : 'ANGEPASST';
-      shouldSuggest = !current.match_status;
     } else {
       const inserted = await client.query(
         `INSERT INTO controlling.payment_transfers
@@ -1277,6 +1413,35 @@ router.post('/v2/transfers', verifyToken(), async (req, res) => {
     return res.status(201).json({ ok: true, transfer: result.rows[0], ...automatic });
   } catch (error) {
     return routeError(res, error, 'Sammelüberweisung konnte nicht gespeichert werden.');
+  }
+});
+
+router.patch('/v2/transfers/:id', verifyToken(), async (req, res) => {
+  if (!hasAccess(req)) return res.status(403).json({ ok: false, message: 'Zugriff verweigert.' });
+  let client;
+  try {
+    const amountCents = moneyToCents(req.body?.amount);
+    client = await pool.connect();
+    await client.query('BEGIN');
+    const correction = await correctTransferAmount(client, {
+      transferId: req.params.id,
+      amountCents,
+      reason: req.body?.reason,
+      actorUserId: req.user.id,
+      source: 'V2_VIEW',
+    });
+    await client.query('COMMIT');
+    client.release();
+    client = null;
+    const automatic = correction.changed
+      ? await tryAutomaticMatchSuggestion(req.params.id, req.user.id)
+      : { match: null, suggestionError: null };
+    return res.json({ ok: true, transfer: mapPaymentTransfer(correction.transfer), ...automatic });
+  } catch (error) {
+    if (client) await client.query('ROLLBACK').catch(() => {});
+    return routeError(res, error, 'Betrag der Sammelüberweisung konnte nicht korrigiert werden.');
+  } finally {
+    client?.release();
   }
 });
 
