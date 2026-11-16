@@ -16,6 +16,7 @@ const { runCashClosingMigration } = require('./lib/runCashClosingMigration');
 const { runQlikImportMigration } = require('./lib/runQlikImportMigration');
 const { runQlikDerivedMigration } = require('./lib/runQlikDerivedMigration');
 const { startAlexModule1RetryWorker } = require('./lib/alexModule1RetryWorker');
+const { runAlexModule2StartupMaintenance } = require('./lib/alexModule2StartupMaintenance');
 const { ALLOWED_CORS_HEADERS } = require('./lib/corsPolicy');
 
 // ✅ FINAL: JWT_SECRET kommt ausschließlich aus ENV (Render)
@@ -212,6 +213,8 @@ async function startServer() {
   await runCashClosingMigration(pool);
   await runQlikImportMigration(pool);
   await runQlikDerivedMigration(pool);
+  const alex2Maintenance = await runAlexModule2StartupMaintenance(pool);
+  console.log(`ALEX2_TABULA_RASA=${JSON.stringify(alex2Maintenance)}`);
   console.log('✅ Datenbankschema für Einzählung, Abrechnung und Tresorzählung ist bereit');
 
   const server = app.listen(PORT, '0.0.0.0', () => {

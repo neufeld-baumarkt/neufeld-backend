@@ -415,6 +415,8 @@ router.post('/payment-days', verifyToken(), async (req, res) => {
     return res.status(403).json({ ok: false, message: 'Zugriff verweigert.' });
   }
 
+  return res.status(405).json({ ok: false, message: 'Tageswerte werden ausschließlich aus Qlik synchronisiert.' });
+
   const {
     paymentType,
     filiale,
@@ -533,6 +535,8 @@ router.put('/payment-days/:id', verifyToken(), async (req, res) => {
     return res.status(403).json({ ok: false, message: 'Zugriff verweigert.' });
   }
 
+  return res.status(405).json({ ok: false, message: 'SOLL Qlik kann nicht manuell verändert werden.' });
+
   const { id } = req.params;
   const { sollBetrag, istBetrag, status, bemerkung } = req.body || {};
 
@@ -638,6 +642,8 @@ router.delete('/payment-days/:id', verifyToken(), async (req, res) => {
   if (!hasAccess(req)) {
     return res.status(403).json({ ok: false, message: 'Zugriff verweigert.' });
   }
+
+  return res.status(405).json({ ok: false, message: 'Qlik-Tageswerte können nicht manuell gelöscht werden.' });
 
   const { id } = req.params;
 
