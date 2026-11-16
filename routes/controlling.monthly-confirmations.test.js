@@ -5,13 +5,14 @@ const path = require('node:path');
 
 const source = fs.readFileSync(path.join(__dirname, 'controlling.js'), 'utf8');
 
-test('Monatsübersicht liest menschliche und Transferbestätigung getrennt aus dem Auditprotokoll', () => {
+test('Monatsübersicht trennt menschliche Bestätigung vom kanonischen Transferbeleg', () => {
   const start = source.indexOf("router.get('/v2/overview'");
   const end = source.indexOf("router.patch('/v2/component-reviews/:id'", start);
   const route = source.slice(start, end);
   assert.ok(start >= 0 && end > start);
   assert.match(route, /review_event\.event_type='BESTAETIGT'/);
-  assert.match(route, /transfer_event\.event_type='EXTERN_BESTAETIGT'/);
+  assert.match(route, /canonical_ist\.ist_betrag IS NOT NULL/);
+  assert.match(route, /canonicalIstMatchJoin\('pd'\)/);
   assert.match(route, /confirmationStatuses/);
 });
 

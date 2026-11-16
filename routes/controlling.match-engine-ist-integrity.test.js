@@ -8,9 +8,17 @@ const bundledMigration = join(__dirname, '..', 'migrations', '047_alex2_match_en
 const saveroomMigration = join(__dirname, '..', '..', 'database', 'migrations', '047_alex2_match_engine_ist_integrity.sql');
 const migration = readFileSync(existsSync(bundledMigration) ? bundledMigration : saveroomMigration, 'utf8');
 
-test('klassische Lesepfade zeigen IST nur aus einem bestaetigten exakten Match', () => {
-  const matchGuard = /CASE WHEN EXISTS \([\s\S]*?transfer_match\.status = 'bestaetigt'[\s\S]*?match_item\.betrag = pd\.ist_betrag[\s\S]*?THEN pd\.ist_betrag ELSE NULL END AS ist_betrag/g;
-  assert.equal((route.match(matchGuard) || []).length, 2);
+test('alle Lesepfade zeigen IST nur aus dem kanonischen bestaetigten Match-Beleg', () => {
+  const helperStart = route.indexOf('function canonicalIstMatchJoin');
+  const helperEnd = route.indexOf('function getDaysInMonth', helperStart);
+  const helper = route.slice(helperStart, helperEnd);
+
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+  assert.match(helper, /transfer_match\.status='bestaetigt'/);
+  assert.match(helper, /transfer_match\.differenz=0/);
+  assert.match(helper, /event_type='EXTERN_BESTAETIGT'/);
+  assert.equal((route.match(/canonicalIstMatchJoin\('pd'\)/g) || []).length, 3);
+  assert.doesNotMatch(route, /match_item\.betrag\s*=\s*pd\.ist_betrag/);
 });
 
 test('alte manuelle Schreibpfade koennen IST nicht mehr setzen', () => {

@@ -73,6 +73,34 @@ function parsePositiveInteger(value) {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
+function canonicalIstMatchJoin(paymentDayAlias = 'pd', resultAlias = 'canonical_ist') {
+  if (!/^[a-z_][a-z0-9_]*$/i.test(paymentDayAlias) || !/^[a-z_][a-z0-9_]*$/i.test(resultAlias)) {
+    throw new Error('Ungültiger SQL-Alias für den kanonischen Modul-2-Lesepfad.');
+  }
+
+  return `LEFT JOIN LATERAL (
+    SELECT match_item.betrag AS ist_betrag, transfer_match.id AS match_id
+    FROM controlling.payment_transfer_match_items match_item
+    JOIN controlling.payment_transfer_matches transfer_match
+      ON transfer_match.id=match_item.match_id
+    WHERE match_item.payment_day_id=${paymentDayAlias}.id
+      AND transfer_match.status='bestaetigt'
+      AND (
+        transfer_match.differenz=0
+        OR EXISTS (
+          SELECT 1
+          FROM controlling.payment_review_events transfer_confirmation
+          WHERE transfer_confirmation.payment_day_id=${paymentDayAlias}.id
+            AND transfer_confirmation.event_type='EXTERN_BESTAETIGT'
+        )
+      )
+    ORDER BY transfer_match.reviewed_at DESC NULLS LAST,
+             transfer_match.updated_at DESC,
+             transfer_match.id DESC
+    LIMIT 1
+  ) ${resultAlias} ON TRUE`;
+}
+
 function getDaysInMonth(jahr, monat) {
   return new Date(jahr, monat, 0).getDate();
 }
@@ -275,16 +303,8 @@ router.get('/ec-cash/month', verifyToken(), async (req, res) => {
         pd.filiale,
         pt.code,
         pt.bezeichnung,
-        pd.soll_betrag,
-        CASE WHEN EXISTS (
-          SELECT 1
-          FROM controlling.payment_transfer_match_items match_item
-          JOIN controlling.payment_transfer_matches transfer_match
-            ON transfer_match.id = match_item.match_id
-          WHERE match_item.payment_day_id = pd.id
-            AND transfer_match.status = 'bestaetigt'
-            AND match_item.betrag = pd.ist_betrag
-        ) THEN pd.ist_betrag ELSE NULL END AS ist_betrag,
+        (pd.qlik_amount_cents::numeric / 100.0) AS soll_betrag,
+        canonical_ist.ist_betrag,
         pd.review_status,
         pd.reviewed_at,
         reviewer.name AS reviewed_by,
@@ -294,6 +314,7 @@ router.get('/ec-cash/month', verifyToken(), async (req, res) => {
       FROM controlling.payment_days pd
       INNER JOIN controlling.payment_types pt
         ON pt.id = pd.payment_type_id
+      ${canonicalIstMatchJoin('pd')}
       LEFT JOIN public.users reviewer
         ON reviewer.id = pd.reviewed_by
       WHERE pd.jahr = $1
@@ -378,22 +399,15 @@ router.get('/payment-days', verifyToken(), async (req, res) => {
         pd.filiale,
         pt.code,
         pt.bezeichnung,
-        pd.soll_betrag,
-        CASE WHEN EXISTS (
-          SELECT 1
-          FROM controlling.payment_transfer_match_items match_item
-          JOIN controlling.payment_transfer_matches transfer_match
-            ON transfer_match.id = match_item.match_id
-          WHERE match_item.payment_day_id = pd.id
-            AND transfer_match.status = 'bestaetigt'
-            AND match_item.betrag = pd.ist_betrag
-        ) THEN pd.ist_betrag ELSE NULL END AS ist_betrag,
+        (pd.qlik_amount_cents::numeric / 100.0) AS soll_betrag,
+        canonical_ist.ist_betrag,
         pd.status,
         pd.bemerkung,
         pd.updated_at
       FROM controlling.payment_days pd
       INNER JOIN controlling.payment_types pt
         ON pt.id = pd.payment_type_id
+      ${canonicalIstMatchJoin('pd')}
       WHERE pd.jahr = $1
         AND pd.monat = $2
         AND pt.code = $3
@@ -426,7 +440,10 @@ router.post('/payment-days', verifyToken(), async (req, res) => {
     return res.status(403).json({ ok: false, message: 'Zugriff verweigert.' });
   }
 
-  return res.status(405).json({ ok: false, message: 'Tageswerte werden ausschließlich aus Qlik synchronisiert.' });
+  return res.status(405).json({
+    ok: false,
+    message: 'Tageswerte werden ausschließlich aus Qlik synchronisiert.',
+  });
 
   const {
     paymentType,
@@ -546,7 +563,10 @@ router.put('/payment-days/:id', verifyToken(), async (req, res) => {
     return res.status(403).json({ ok: false, message: 'Zugriff verweigert.' });
   }
 
-  return res.status(405).json({ ok: false, message: 'SOLL Qlik kann nicht manuell verändert werden.' });
+  return res.status(405).json({
+    ok: false,
+    message: 'SOLL Qlik kann nicht manuell verändert werden.',
+  });
 
   const { id } = req.params;
   const { sollBetrag, istBetrag, status, bemerkung } = req.body || {};
@@ -654,7 +674,10 @@ router.delete('/payment-days/:id', verifyToken(), async (req, res) => {
     return res.status(403).json({ ok: false, message: 'Zugriff verweigert.' });
   }
 
-  return res.status(405).json({ ok: false, message: 'Qlik-Tageswerte können nicht manuell gelöscht werden.' });
+  return res.status(405).json({
+    ok: false,
+    message: 'Qlik-Tageswerte können nicht manuell gelöscht werden.',
+  });
 
   const { id } = req.params;
 
@@ -722,7 +745,7 @@ router.get('/v2/overview', verifyToken(), async (req, res) => {
     const [daysResult, componentResult, unresolvedResult, importResult] = await Promise.all([
       client.query(
         `SELECT pd.id, pd.datum, pd.filiale, pt.code AS payment_type,
-                pd.qlik_amount_cents, pd.ist_betrag, pd.availability_status,
+                pd.qlik_amount_cents, canonical_ist.ist_betrag, pd.availability_status,
                 pd.comparison_status, pd.review_status, pd.review_note,
                 pd.deferred_until, pd.reviewed_at, u.name AS reviewed_by,
                 (
@@ -733,16 +756,10 @@ router.get('/v2/overview', verifyToken(), async (req, res) => {
                       AND review_event.event_type='BESTAETIGT'
                   )
                 ) AS manually_confirmed,
-                (
-                  pd.review_status='EXTERN_BESTAETIGT'
-                  OR EXISTS (
-                    SELECT 1 FROM controlling.payment_review_events transfer_event
-                    WHERE transfer_event.payment_day_id=pd.id
-                      AND transfer_event.event_type='EXTERN_BESTAETIGT'
-                  )
-                ) AS transfer_confirmed
+                (canonical_ist.ist_betrag IS NOT NULL) AS transfer_confirmed
          FROM controlling.payment_days pd
          JOIN controlling.payment_types pt ON pt.id=pd.payment_type_id
+         ${canonicalIstMatchJoin('pd')}
          LEFT JOIN public.users u ON u.id=pd.reviewed_by
          WHERE pd.jahr=$1 AND pd.monat=$2 AND pt.code=ANY($3::text[])
            AND EXISTS (
@@ -819,14 +836,25 @@ router.get('/v2/overview', verifyToken(), async (req, res) => {
       const components = componentsByDay.get(row.id) || [];
       const requiredComponents = components.filter((component) => component.requiresReview);
       const confirmedComponents = requiredComponents.filter((component) => component.reviewStatus === 'BESTAETIGT');
+      const comparisonAmountCents = row.ist_betrag === null ? null : Math.round(Number(row.ist_betrag) * 100);
+      const effectiveReviewStatus = row.transfer_confirmed
+        ? 'EXTERN_BESTAETIGT'
+        : row.review_status === 'EXTERN_BESTAETIGT'
+          ? (row.manually_confirmed ? 'BESTAETIGT' : 'OFFEN')
+          : row.review_status;
+      const effectiveComparisonStatus = comparisonAmountCents === null
+        ? 'NICHT_VERGLICHEN'
+        : comparisonAmountCents === Number(row.qlik_amount_cents)
+          ? 'UEBEREINSTIMMEND'
+          : 'ABWEICHEND';
       itemsByKey.get(key).branches.push({
         id: row.id,
         filiale: row.filiale,
         qlikAmountCents: row.qlik_amount_cents === null ? null : Number(row.qlik_amount_cents),
-        comparisonAmountCents: row.ist_betrag === null ? null : Math.round(Number(row.ist_betrag) * 100),
+        comparisonAmountCents,
         availabilityStatus: row.availability_status,
-        comparisonStatus: row.comparison_status,
-        reviewStatus: row.review_status,
+        comparisonStatus: effectiveComparisonStatus,
+        reviewStatus: effectiveReviewStatus,
         reviewNote: row.review_note,
         deferredUntil: dateOnly(row.deferred_until),
         reviewedAt: row.reviewed_at,
