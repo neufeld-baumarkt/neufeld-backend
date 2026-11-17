@@ -16,7 +16,8 @@ test('klassische Monatsansicht liefert den menschlichen Qlik-Prüfstatus', async
   assert.match(source.slice(start, end), /reviewer\.name AS reviewed_by/);
   assert.match(responseBuilder, /reviewStatus: row\.review_status \|\| 'OFFEN'/);
 });
-test('Ein-Klick-Bestätigung ändert genau einen Qlik-Tageswert und schreibt ein Audit-Ereignis', async () => {
+
+test('Ein-Klick-Bestätigung bestätigt Tageswert und Einzelwerte atomar und schreibt Audit-Ereignisse', async () => {
   const source = await readFile(sourcePath, 'utf8');
   const start = source.indexOf("router.patch('/payment-days/:id/review'");
   const route = source.slice(start, source.indexOf("router.get('/v2/overview'", start));
@@ -25,7 +26,20 @@ test('Ein-Klick-Bestätigung ändert genau einen Qlik-Tageswert und schreibt ein
   assert.match(route, /review_status='BESTAETIGT'/);
   assert.match(route, /WHERE id=\$1 AND qlik_amount_cents IS NOT NULL/);
   assert.match(route, /payment_review_events/);
+  assert.match(route, /confirmPaymentDayComponents/);
+  assert.match(source, /payment_day_component_review_events/);
   assert.match(route, /'CLASSIC_ONE_CLICK'/);
+});
+
+test('Sammelüberweisungen speichern die ganzzahlige Benutzer-ID in der korrekt typisierten Spalte', async () => {
+  const source = await readFile(sourcePath, 'utf8');
+  const classicStart = source.indexOf("router.put('/transfers/classic'");
+  const v2Start = source.indexOf("router.post('/v2/transfers'");
+  const v2End = source.indexOf("router.patch('/v2/transfers/:id'", v2Start);
+
+  assert.match(source.slice(classicStart, v2Start), /created_by_user_id/);
+  assert.match(source.slice(v2Start, v2End), /created_by_user_id/);
+  assert.doesNotMatch(source.slice(classicStart, v2End), /provider,created_by\)/);
 });
 
 test('IST wird ausschließlich aus menschlich bestätigten Match-Positionen befüllt', async () => {

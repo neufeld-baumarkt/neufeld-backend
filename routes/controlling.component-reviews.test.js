@@ -22,3 +22,17 @@ test('Einzelbestätigung wird auditiert und der Filialstatus serverseitig berech
   assert.match(route, /Nullwerte gelten als „kein Umsatz“/);
   assert.doesNotMatch(route, /req\.body.*amount/i);
 });
+
+test('Tages-Sammelbestätigung bestätigt alle Einzelwerte serverseitig in einer Transaktion', () => {
+  const start = source.indexOf("router.patch('/v2/component-reviews'");
+  const end = source.indexOf("router.patch('/v2/component-reviews/:id'", start);
+  const route = source.slice(start, end);
+
+  assert.ok(start >= 0 && end > start);
+  assert.match(route, /normalizePaymentType/);
+  assert.match(route, /confirmPaymentDayComponents/);
+  assert.match(route, /V2_DAY_BULK_CONFIRM/);
+  assert.match(route, /await client\.query\('BEGIN'\)/);
+  assert.match(route, /await client\.query\('COMMIT'\)/);
+  assert.doesNotMatch(route, /req\.body.*amount/i);
+});

@@ -620,6 +620,33 @@ router.put('/payment-days/:id', verifyToken(), async (req, res) => {
   }
 });
 
+async function confirmPaymentDayComponents(client, paymentDayIds, actorUserId, source) {
+  const pending = await client.query(
+    `UPDATE controlling.payment_day_component_reviews
+     SET review_status='BESTAETIGT', reviewed_by=$2, reviewed_at=now(), updated_at=now()
+     WHERE payment_day_id=ANY($1::uuid[])
+       AND amount_cents>0
+       AND review_status<>'BESTAETIGT'
+     RETURNING id, payment_day_id, component_code, component_label, amount_cents`,
+    [paymentDayIds, actorUserId]
+  );
+
+  for (const component of pending.rows) {
+    await client.query(
+      `INSERT INTO controlling.payment_day_component_review_events (
+         component_review_id, event_type, actor_user_id, details
+       ) VALUES ($1,'BESTAETIGT',$2,jsonb_build_object(
+         'source',$3::text,'componentCode',$4::text,
+         'componentLabel',$5::text,'amountCents',$6::bigint
+       ))`,
+      [component.id, actorUserId, source, component.component_code,
+        component.component_label, component.amount_cents]
+    );
+  }
+
+  return pending.rows;
+}
+
 router.patch('/payment-days/:id/review', verifyToken(), async (req, res) => {
   if (!hasAccess(req)) {
     return res.status(403).json({ ok: false, message: 'Zugriff verweigert.' });
@@ -647,11 +674,20 @@ router.patch('/payment-days/:id/review', verifyToken(), async (req, res) => {
       throw Object.assign(new Error('Qlik-Tageswert wurde nicht gefunden.'), { statusCode: 404 });
     }
 
+    const confirmedComponents = await confirmPaymentDayComponents(
+      client,
+      [id],
+      req.user.id,
+      'CLASSIC_ONE_CLICK'
+    );
+
     await client.query(
       `INSERT INTO controlling.payment_review_events
          (payment_day_id,event_type,actor_user_id,details)
-       VALUES ($1,'BESTAETIGT',$2,jsonb_build_object('source','CLASSIC_ONE_CLICK'))`,
-      [id, req.user.id]
+       VALUES ($1,'BESTAETIGT',$2,jsonb_build_object(
+         'source','CLASSIC_ONE_CLICK','confirmedComponents',$3::integer
+       ))`,
+      [id, req.user.id, confirmedComponents.length]
     );
     await client.query('COMMIT');
 
@@ -903,6 +939,73 @@ router.get('/v2/overview', verifyToken(), async (req, res) => {
       importState: importResult.rows[0] || { completed_at: null, imported_days: 0 } });
   } catch (error) {
     return routeError(res, error, 'Modul-2-Daten konnten nicht geladen werden.');
+  } finally {
+    client?.release();
+  }
+});
+
+router.patch('/v2/component-reviews', verifyToken(), async (req, res) => {
+  if (!hasAccess(req)) return res.status(403).json({ ok: false, message: 'Zugriff verweigert.' });
+
+  let client;
+  try {
+    const paymentType = normalizePaymentType(req.body?.paymentType);
+    const datum = String(req.body?.datum || '');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(datum)) {
+      throw Object.assign(new Error('Geschäftstag ist ungültig.'), { statusCode: 400 });
+    }
+
+    client = await pool.connect();
+    await client.query('BEGIN');
+    const selectedDays = await client.query(
+      `SELECT pd.id
+       FROM controlling.payment_days pd
+       JOIN controlling.payment_types pt ON pt.id=pd.payment_type_id
+       WHERE pt.code=$1 AND pd.datum=$2::date AND pd.qlik_amount_cents IS NOT NULL
+       ORDER BY pd.id
+       FOR UPDATE OF pd`,
+      [paymentType, datum]
+    );
+    if (!selectedDays.rowCount) {
+      throw Object.assign(new Error('Für diesen Tag wurden keine Qlik-Werte gefunden.'), { statusCode: 404 });
+    }
+
+    const paymentDayIds = selectedDays.rows.map((row) => row.id);
+    const confirmedComponents = await confirmPaymentDayComponents(
+      client,
+      paymentDayIds,
+      req.user.id,
+      'V2_DAY_BULK_CONFIRM'
+    );
+    await client.query(
+      `UPDATE controlling.payment_days
+       SET review_status=CASE WHEN review_status='EXTERN_BESTAETIGT' THEN review_status ELSE 'BESTAETIGT' END,
+           reviewed_by=CASE WHEN review_status='EXTERN_BESTAETIGT' THEN reviewed_by ELSE $2 END,
+           reviewed_at=CASE WHEN review_status='EXTERN_BESTAETIGT' THEN reviewed_at ELSE now() END,
+           review_note=NULL, deferred_until=NULL, updated_at=now()
+       WHERE id=ANY($1::uuid[])`,
+      [paymentDayIds, req.user.id]
+    );
+    for (const paymentDayId of paymentDayIds) {
+      await client.query(
+        `INSERT INTO controlling.payment_review_events (payment_day_id,event_type,actor_user_id,details)
+         VALUES ($1,'BESTAETIGT',$2,jsonb_build_object(
+           'source','V2_DAY_BULK_CONFIRM','paymentType',$3::text,'datum',$4::text
+         ))`,
+        [paymentDayId, req.user.id, paymentType, datum]
+      );
+    }
+    await client.query('COMMIT');
+    return res.json({
+      ok: true,
+      paymentType,
+      datum,
+      confirmedPaymentDays: paymentDayIds.length,
+      confirmedComponents: confirmedComponents.length,
+    });
+  } catch (error) {
+    if (client) await client.query('ROLLBACK').catch(() => {});
+    return routeError(res, error, 'Einzelwerte konnten nicht gemeinsam bestätigt werden.');
   } finally {
     client?.release();
   }
@@ -1370,7 +1473,7 @@ router.put('/transfers/classic', verifyToken(), async (req, res) => {
     } else {
       const inserted = await client.query(
         `INSERT INTO controlling.payment_transfers
-          (payment_type_id,filiale,buchungsdatum,betrag,referenz,status,provider,created_by)
+          (payment_type_id,filiale,buchungsdatum,betrag,referenz,status,provider,created_by_user_id)
          SELECT id,'Unternehmen',$2::date,$3::bigint/100.0,$4,'offen',$5,$6
          FROM controlling.payment_types WHERE code=$1
          RETURNING *`,
@@ -1525,10 +1628,10 @@ router.post('/v2/transfers', verifyToken(), async (req, res) => {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(buchungsdatum)) throw Object.assign(new Error('Buchungsdatum ist ungültig.'), { statusCode: 400 });
     const result = await pool.query(
       `INSERT INTO controlling.payment_transfers
-        (payment_type_id,filiale,buchungsdatum,betrag,referenz,status,provider,created_by)
-       SELECT id,'Unternehmen',$3::date,$4::bigint/100.0,$5,'offen',$1,NULL
+        (payment_type_id,filiale,buchungsdatum,betrag,referenz,status,provider,created_by_user_id)
+       SELECT id,'Unternehmen',$3::date,$4::bigint/100.0,$5,'offen',$1,$6
        FROM controlling.payment_types WHERE code=$2 RETURNING *`,
-      [provider, paymentType, buchungsdatum, amountCents, referenz]
+      [provider, paymentType, buchungsdatum, amountCents, referenz, req.user.id]
     );
     if (!result.rowCount) throw Object.assign(new Error('Zahlungsart wurde nicht gefunden.'), { statusCode: 400 });
     await pool.query(
