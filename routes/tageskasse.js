@@ -734,13 +734,16 @@ router.post('/deposit-receipts/confirm', async (req, res) => {
 router.get('/business-days', async (req, res) => {
   try {
     const branch = await resolveBranch(pool, req);
-    const result = await pool.query(`SELECT business_date,status,finalized_at,final_report
-      FROM core.cash_business_days WHERE branch_id=$1 AND status='finalized'
-      ORDER BY business_date DESC LIMIT 120`, [branch.id]);
+    const result = await pool.query(`SELECT day.business_date,day.status,day.finalized_at,day.final_report,
+        EXISTS (SELECT 1 FROM core.cash_deposit_receipt_business_days link
+          WHERE link.business_day_id=day.id) AS receipt_verified
+      FROM core.cash_business_days day WHERE day.branch_id=$1 AND day.status='finalized'
+      ORDER BY day.business_date DESC LIMIT 120`, [branch.id]);
     return res.json({ days:result.rows.map((row)=>({
       businessDate:row.business_date,status:row.status,finalizedAt:row.finalized_at,
       totals:row.final_report?.totals || {}, babReport:row.final_report?.babReport || null,
       closingCount:Array.isArray(row.final_report?.closings) ? row.final_report.closings.length : 0,
+      receiptVerified:row.receipt_verified === true,
     })) });
   } catch (error) {
     console.error('GET /api/tageskasse/business-days Fehler:', error);
@@ -753,10 +756,32 @@ router.get('/business-days/:date', async (req, res) => {
     const businessDate = String(req.params.date || '');
     if (!/^\d{4}-\d{2}-\d{2}$/.test(businessDate)) return res.status(400).json({ message:'Das Datum ist ungültig.' });
     const branch = await resolveBranch(pool, req);
-    const result = await pool.query(`SELECT final_report FROM core.cash_business_days
-      WHERE branch_id=$1 AND business_date=$2 AND status='finalized'`, [branch.id,businessDate]);
+    const result = await pool.query(`SELECT day.final_report,receipt.id AS receipt_id,
+        TO_CHAR(receipt.deposit_date,'YYYY-MM-DD') AS receipt_deposit_date,
+        TO_CHAR(receipt.deposit_time,'HH24:MI') AS receipt_deposit_time,
+        receipt.transaction_number AS receipt_transaction_number,
+        receipt.terminal_number AS receipt_terminal_number,
+        receipt.receipt_total_cents,receipt.confirmed_by_pin_id,
+        receipt.confirmed_by_name,receipt.confirmed_at
+      FROM core.cash_business_days day
+      LEFT JOIN core.cash_deposit_receipt_business_days link ON link.business_day_id=day.id
+      LEFT JOIN core.cash_deposit_receipts receipt ON receipt.id=link.receipt_id
+      WHERE day.branch_id=$1 AND day.business_date=$2 AND day.status='finalized'`, [branch.id,businessDate]);
     if (!result.rows[0]) return res.status(404).json({ message:'Für dieses Datum wurde kein abgeschlossener Tagesbericht gefunden.' });
-    return res.json({ report:enrichFinalReport(result.rows[0].final_report) });
+    const row = result.rows[0];
+    const report = enrichFinalReport(row.final_report);
+    report.receiptVerified = row.receipt_id != null;
+    report.depositReceipt = row.receipt_id == null ? null : {
+      id:Number(row.receipt_id),
+      depositDate:row.receipt_deposit_date,
+      depositTime:row.receipt_deposit_time,
+      transactionNumber:row.receipt_transaction_number,
+      terminalNumber:row.receipt_terminal_number,
+      receiptTotalCents:Number(row.receipt_total_cents),
+      verifiedAt:row.confirmed_at,
+      verifiedBy:{ id:Number(row.confirmed_by_pin_id), name:row.confirmed_by_name },
+    };
+    return res.json({ report });
   } catch (error) {
     console.error('GET /api/tageskasse/business-days/:date Fehler:', error);
     return res.status(error.statusCode || 500).json({ message:error.statusCode ? error.message : 'Der Tagesbericht konnte nicht geladen werden.' });
