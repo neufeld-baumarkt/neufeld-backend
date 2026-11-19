@@ -28,6 +28,12 @@ test('Alex 3 confirms only the latest concrete Qlik value and keeps EZ read-only
   assert.match(route, /metric\.metric_code='BAR_AN_BANK_QLIK'/);
   assert.match(route, /newer\.calculated_at,newer\.id/);
   assert.match(route, /ON CONFLICT \(qlik_derived_value_id\) DO NOTHING/);
+  assert.match(route, /RETURNING qlik_derived_value_id,confirmed_at,confirmed_by_user_id/);
+  assert.match(route, /FROM inserted\s+JOIN public\.users reviewer/);
+  assert.match(route, /UNION ALL\s+SELECT confirmation\.qlik_derived_value_id/);
+  assert.match(route, /WHERE NOT EXISTS \(SELECT 1 FROM inserted\)/);
+  assert.match(route, /confirmed:\s*true/);
+  assert.match(route, /sollState:\s*'BESTAETIGT'/);
   assert.match(route, /router\.put\('\/alex3\/manual-values'/);
   assert.match(route, /if \(movementType === 'EZ'\)/);
   assert.match(route, /Number\.isSafeInteger/);

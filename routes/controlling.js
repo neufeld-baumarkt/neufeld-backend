@@ -489,20 +489,27 @@ router.post('/alex3/qlik-values/:id/confirm', verifyToken(), async (req, res) =>
           (qlik_derived_value_id,confirmed_by_user_id)
         SELECT id,$2 FROM current_value
         ON CONFLICT (qlik_derived_value_id) DO NOTHING
-        RETURNING qlik_derived_value_id
+        RETURNING qlik_derived_value_id,confirmed_at,confirmed_by_user_id
       )
+      SELECT inserted.qlik_derived_value_id,inserted.confirmed_at,reviewer.name AS confirmed_by
+      FROM inserted
+      JOIN public.users reviewer ON reviewer.id=inserted.confirmed_by_user_id
+      UNION ALL
       SELECT confirmation.qlik_derived_value_id,confirmation.confirmed_at,reviewer.name AS confirmed_by
       FROM current_value
       JOIN controlling.alex3_qlik_value_confirmations confirmation
         ON confirmation.qlik_derived_value_id=current_value.id
-      JOIN public.users reviewer ON reviewer.id=confirmation.confirmed_by_user_id`, [qlikValueId, req.user.id]);
+      JOIN public.users reviewer ON reviewer.id=confirmation.confirmed_by_user_id
+      WHERE NOT EXISTS (SELECT 1 FROM inserted)`, [qlikValueId, req.user.id]);
     if (!result.rows[0]) {
       return res.status(409).json({ ok: false, message: 'Dieser Qlik-Wert ist nicht mehr aktuell. Bitte Monat neu laden.' });
     }
     return res.json({ ok: true, confirmation: {
       qlikValueId: result.rows[0].qlik_derived_value_id,
+      confirmed: true,
       confirmedAt: result.rows[0].confirmed_at,
       confirmedBy: result.rows[0].confirmed_by,
+      sollState: 'BESTAETIGT',
     } });
   } catch (error) {
     console.error('[ALEX_MODULE3_QLIK_CONFIRM_ERROR]', error);
