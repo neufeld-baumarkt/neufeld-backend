@@ -2,6 +2,7 @@ const express = require('express');
 const pool = require('../db');
 const verifyToken = require('../middleware/verifyToken');
 const { streamAlexModule2Changes } = require('../lib/alexModule2LiveSync');
+const { ALEX3_QLIK_METRICS, buildAlex3Month } = require('../lib/alexModule3');
 const {
   parseMonth,
   parseYear,
@@ -370,6 +371,109 @@ router.get('/ec-cash/month', verifyToken(), async (req, res) => {
     });
   } finally {
     if (client) client.release();
+  }
+});
+
+router.get('/alex3/month', verifyToken(), async (req, res) => {
+  if (!hasAccess(req)) return res.status(403).json({ ok: false, message: 'Zugriff verweigert.' });
+  const year = parsePositiveInteger(req.query.year);
+  const month = parsePositiveInteger(req.query.month);
+  if (!year || !month || month > 12) {
+    return res.status(400).json({ ok: false, message: 'year und month sind erforderlich.' });
+  }
+
+  const startDate = buildDateString(year, month, 1);
+  const nextDate = month === 12
+    ? buildDateString(year + 1, 1, 1)
+    : buildDateString(year, month + 1, 1);
+  try {
+    const [manual, businessDays, receipts, qlikValues] = await Promise.all([
+      pool.query(`SELECT id,business_date,filiale,movement_type,soll_cents,ist_cents,note
+        FROM controlling.alex3_manual_daily_values
+        WHERE business_date >= $1::date AND business_date < $2::date
+        ORDER BY business_date,filiale,movement_type`, [startDate, nextDate]),
+      pool.query(`SELECT day.business_date,branch.name AS filiale,day.status AS business_day_status,
+          day.bab_rounded_cents,day.bab_safe_skim_cents,day.bab_booked_cents
+        FROM controlling.cash_business_days day
+        JOIN public.filialen branch ON branch.id=day.filiale_id
+        WHERE day.business_date >= $1::date AND day.business_date < $2::date
+        ORDER BY day.business_date,branch.name`, [startDate, nextDate]),
+      pool.query(`SELECT day.business_date,branch.name AS filiale,
+          COALESCE(SUM(closing.bank_amount_cents),0)::integer AS receipt_total_cents,
+          COUNT(DISTINCT receipt.id)::integer AS receipt_count
+        FROM controlling.cash_deposit_receipt_closings link
+        JOIN controlling.cash_deposit_receipts receipt ON receipt.id=link.receipt_id
+        JOIN controlling.cash_drawer_closings closing ON closing.id=link.closing_id
+        JOIN controlling.cash_business_days day ON day.id=closing.business_day_id
+        JOIN public.filialen branch ON branch.id=day.filiale_id
+        WHERE day.business_date >= $1::date AND day.business_date < $2::date
+        GROUP BY day.business_date,branch.name
+        ORDER BY day.business_date,branch.name`, [startDate, nextDate]),
+      pool.query(`WITH ranked AS (
+          SELECT value.business_date,branch.name AS filiale,metric.metric_code,
+            value.numeric_value,value.availability_status,value.quality_status,
+            row_number() OVER (
+              PARTITION BY value.business_date,value.branch_id,value.metric_definition_id
+              ORDER BY value.calculated_at DESC,value.id DESC
+            ) AS rank
+          FROM controlling.qlik_derived_daily_values value
+          JOIN controlling.qlik_metric_definitions metric
+            ON metric.id=value.metric_definition_id AND metric.active=true
+          JOIN public.filialen branch ON branch.id=value.branch_id
+          WHERE value.business_date >= $1::date AND value.business_date < $2::date
+            AND metric.metric_code=ANY($3::text[])
+        ) SELECT * FROM ranked WHERE rank=1
+        ORDER BY business_date,filiale,metric_code`, [startDate, nextDate, ALEX3_QLIK_METRICS]),
+    ]);
+
+    return res.json(buildAlex3Month({
+      year,
+      month,
+      branches: FILIALEN,
+      manualRows: manual.rows,
+      businessDays: businessDays.rows,
+      receipts: receipts.rows,
+      qlikValues: qlikValues.rows,
+    }));
+  } catch (error) {
+    console.error('[ALEX_MODULE3_MONTH_ERROR]', error);
+    return res.status(500).json({ ok: false, message: 'Alex-3-Monatsdaten konnten nicht geladen werden.' });
+  }
+});
+
+router.put('/alex3/manual-values', verifyToken(), async (req, res) => {
+  if (!hasAccess(req)) return res.status(403).json({ ok: false, message: 'Zugriff verweigert.' });
+  const businessDate = String(req.body?.businessDate || '');
+  const branch = String(req.body?.branch || '').trim();
+  const movementType = String(req.body?.movementType || '').toUpperCase();
+  const parseCents = (value) => value === null || value === undefined || value === '' ? null : Number(value);
+  const sollCents = parseCents(req.body?.sollCents);
+  const istCents = parseCents(req.body?.istCents);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(businessDate) || !FILIALEN.includes(branch) || !['EZ', 'AZ'].includes(movementType)) {
+    return res.status(400).json({ ok: false, message: 'Datum, Filiale oder Bewegungsart ist ungültig.' });
+  }
+  if ([sollCents, istCents].some((value) => value !== null && (!Number.isSafeInteger(value) || value < 0))) {
+    return res.status(400).json({ ok: false, message: 'Beträge müssen als nichtnegative Centwerte gespeichert werden.' });
+  }
+  if (branch === 'Vreden' && movementType === 'EZ') {
+    return res.status(409).json({ ok: false, message: 'Vreden-EZ wird automatisch ermittelt und kann nicht manuell überschrieben werden.' });
+  }
+
+  try {
+    const result = await pool.query(`INSERT INTO controlling.alex3_manual_daily_values
+        (business_date,filiale,movement_type,soll_cents,ist_cents,note,updated_by_user_id)
+      VALUES ($1::date,$2,$3,$4,$5,$6,$7)
+      ON CONFLICT (business_date,filiale,movement_type) DO UPDATE SET
+        soll_cents=EXCLUDED.soll_cents,ist_cents=EXCLUDED.ist_cents,note=EXCLUDED.note,
+        updated_by_user_id=EXCLUDED.updated_by_user_id,updated_at=now()
+      RETURNING id,business_date,filiale,movement_type,soll_cents,ist_cents,note,updated_at`, [
+        businessDate, branch, movementType, sollCents, istCents,
+        String(req.body?.note || '').trim() || null, req.user.id,
+      ]);
+    return res.json({ ok: true, value: { ...result.rows[0], business_date: formatDateOnly(result.rows[0].business_date) } });
+  } catch (error) {
+    console.error('[ALEX_MODULE3_MANUAL_VALUE_ERROR]', error);
+    return res.status(500).json({ ok: false, message: 'Der Alex-3-Tageswert konnte nicht gespeichert werden.' });
   }
 });
 
