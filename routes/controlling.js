@@ -387,31 +387,30 @@ router.get('/alex3/month', verifyToken(), async (req, res) => {
     ? buildDateString(year + 1, 1, 1)
     : buildDateString(year, month + 1, 1);
   try {
-    const [manual, businessDays, receipts, qlikValues] = await Promise.all([
+    const [manual, businessDays, qlikValues] = await Promise.all([
       pool.query(`SELECT id,business_date,filiale,movement_type,soll_cents,ist_cents,note
         FROM controlling.alex3_manual_daily_values
         WHERE business_date >= $1::date AND business_date < $2::date
         ORDER BY business_date,filiale,movement_type`, [startDate, nextDate]),
       pool.query(`SELECT day.business_date,branch.name AS filiale,day.status AS business_day_status,
-          day.bab_rounded_cents,day.bab_safe_skim_cents,day.bab_booked_cents
+          day.bab_safe_skim_cents,day.bab_booked_cents,
+          (SELECT COUNT(*) FROM controlling.cash_drawer_closings closing
+            WHERE closing.business_day_id=day.id AND closing.status='confirmed')::integer
+            AS confirmed_closing_count,
+          (SELECT COUNT(*) FROM controlling.cash_drawer_closings closing
+            JOIN controlling.cash_deposit_receipt_closings link ON link.closing_id=closing.id
+            WHERE closing.business_day_id=day.id AND closing.status='confirmed')::integer
+            AS linked_closing_count
         FROM controlling.cash_business_days day
         JOIN public.filialen branch ON branch.id=day.filiale_id
         WHERE day.business_date >= $1::date AND day.business_date < $2::date
         ORDER BY day.business_date,branch.name`, [startDate, nextDate]),
-      pool.query(`SELECT day.business_date,branch.name AS filiale,
-          COALESCE(SUM(closing.bank_amount_cents),0)::integer AS receipt_total_cents,
-          COUNT(DISTINCT receipt.id)::integer AS receipt_count
-        FROM controlling.cash_deposit_receipt_closings link
-        JOIN controlling.cash_deposit_receipts receipt ON receipt.id=link.receipt_id
-        JOIN controlling.cash_drawer_closings closing ON closing.id=link.closing_id
-        JOIN controlling.cash_business_days day ON day.id=closing.business_day_id
-        JOIN public.filialen branch ON branch.id=day.filiale_id
-        WHERE day.business_date >= $1::date AND day.business_date < $2::date
-        GROUP BY day.business_date,branch.name
-        ORDER BY day.business_date,branch.name`, [startDate, nextDate]),
       pool.query(`WITH ranked AS (
-          SELECT value.business_date,branch.name AS filiale,metric.metric_code,
+          SELECT value.id AS qlik_derived_value_id,value.business_date,
+            branch.name AS filiale,metric.metric_code,
             value.numeric_value,value.availability_status,value.quality_status,
+            confirmation.confirmed_at AS qlik_confirmed_at,
+            reviewer.name AS qlik_confirmed_by,
             row_number() OVER (
               PARTITION BY value.business_date,value.branch_id,value.metric_definition_id
               ORDER BY value.calculated_at DESC,value.id DESC
@@ -420,6 +419,9 @@ router.get('/alex3/month', verifyToken(), async (req, res) => {
           JOIN controlling.qlik_metric_definitions metric
             ON metric.id=value.metric_definition_id AND metric.active=true
           JOIN public.filialen branch ON branch.id=value.branch_id
+          LEFT JOIN controlling.alex3_qlik_value_confirmations confirmation
+            ON confirmation.qlik_derived_value_id=value.id
+          LEFT JOIN public.users reviewer ON reviewer.id=confirmation.confirmed_by_user_id
           WHERE value.business_date >= $1::date AND value.business_date < $2::date
             AND metric.metric_code=ANY($3::text[])
         ) SELECT * FROM ranked WHERE rank=1
@@ -432,12 +434,57 @@ router.get('/alex3/month', verifyToken(), async (req, res) => {
       branches: FILIALEN,
       manualRows: manual.rows,
       businessDays: businessDays.rows,
-      receipts: receipts.rows,
       qlikValues: qlikValues.rows,
     }));
   } catch (error) {
     console.error('[ALEX_MODULE3_MONTH_ERROR]', error);
     return res.status(500).json({ ok: false, message: 'Alex-3-Monatsdaten konnten nicht geladen werden.' });
+  }
+});
+
+router.post('/alex3/qlik-values/:id/confirm', verifyToken(), async (req, res) => {
+  if (!hasAccess(req)) return res.status(403).json({ ok: false, message: 'Zugriff verweigert.' });
+  const qlikValueId = String(req.params.id || '').toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(qlikValueId)) {
+    return res.status(400).json({ ok: false, message: 'Der Qlik-Wert ist ungültig.' });
+  }
+  try {
+    const result = await pool.query(`WITH current_value AS (
+        SELECT value.id
+        FROM controlling.qlik_derived_daily_values value
+        JOIN controlling.qlik_metric_definitions metric ON metric.id=value.metric_definition_id
+        WHERE value.id=$1::uuid AND metric.metric_code='BAR_AN_BANK_QLIK'
+          AND metric.active=true AND value.numeric_value IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM controlling.qlik_derived_daily_values newer
+            WHERE newer.business_date=value.business_date
+              AND newer.branch_id=value.branch_id
+              AND newer.metric_definition_id=value.metric_definition_id
+              AND (newer.calculated_at,newer.id) > (value.calculated_at,value.id)
+          )
+      ), inserted AS (
+        INSERT INTO controlling.alex3_qlik_value_confirmations
+          (qlik_derived_value_id,confirmed_by_user_id)
+        SELECT id,$2 FROM current_value
+        ON CONFLICT (qlik_derived_value_id) DO NOTHING
+        RETURNING qlik_derived_value_id
+      )
+      SELECT confirmation.qlik_derived_value_id,confirmation.confirmed_at,reviewer.name AS confirmed_by
+      FROM current_value
+      JOIN controlling.alex3_qlik_value_confirmations confirmation
+        ON confirmation.qlik_derived_value_id=current_value.id
+      JOIN public.users reviewer ON reviewer.id=confirmation.confirmed_by_user_id`, [qlikValueId, req.user.id]);
+    if (!result.rows[0]) {
+      return res.status(409).json({ ok: false, message: 'Dieser Qlik-Wert ist nicht mehr aktuell. Bitte Monat neu laden.' });
+    }
+    return res.json({ ok: true, confirmation: {
+      qlikValueId: result.rows[0].qlik_derived_value_id,
+      confirmedAt: result.rows[0].confirmed_at,
+      confirmedBy: result.rows[0].confirmed_by,
+    } });
+  } catch (error) {
+    console.error('[ALEX_MODULE3_QLIK_CONFIRM_ERROR]', error);
+    return res.status(500).json({ ok: false, message: 'Der Qlik-Wert konnte nicht bestätigt werden.' });
   }
 });
 
@@ -455,8 +502,8 @@ router.put('/alex3/manual-values', verifyToken(), async (req, res) => {
   if ([sollCents, istCents].some((value) => value !== null && (!Number.isSafeInteger(value) || value < 0))) {
     return res.status(400).json({ ok: false, message: 'Beträge müssen als nichtnegative Centwerte gespeichert werden.' });
   }
-  if (branch === 'Vreden' && movementType === 'EZ') {
-    return res.status(409).json({ ok: false, message: 'Vreden-EZ wird automatisch ermittelt und kann nicht manuell überschrieben werden.' });
+  if (movementType === 'EZ') {
+    return res.status(409).json({ ok: false, message: 'EZ wird aus Qlik und Tagesabrechnung ermittelt und kann nicht manuell überschrieben werden.' });
   }
 
   try {
