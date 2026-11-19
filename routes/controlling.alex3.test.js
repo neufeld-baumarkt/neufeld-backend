@@ -10,6 +10,12 @@ test('Alex 3 reads Qlik, day-close and complete receipt coverage separately', ()
   assert.match(route, /controlling\.alex3_manual_daily_values/);
   assert.match(route, /controlling\.cash_business_days/);
   assert.match(route, /controlling\.cash_deposit_receipt_closings/);
+  assert.match(route, /SUM\(closing\.bank_amount_cents\)::integer/);
+  assert.match(route, /confirmed_closing_bank_cents/);
+  assert.match(route, /core\.cash_business_days/);
+  assert.match(route, /core\.cash_deposit_receipt_business_days/);
+  assert.match(route, /final_report->'babReport'->>'bookedCents'/);
+  assert.match(route, /businessDays:\s*\[\.\.\.coreBusinessDays\.rows,\s*\.\.\.businessDays\.rows\]/);
   assert.match(route, /controlling\.qlik_derived_daily_values/);
   assert.match(route, /confirmed_closing_count/);
   assert.match(route, /linked_closing_count/);

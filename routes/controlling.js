@@ -387,13 +387,17 @@ router.get('/alex3/month', verifyToken(), async (req, res) => {
     ? buildDateString(year + 1, 1, 1)
     : buildDateString(year, month + 1, 1);
   try {
-    const [manual, businessDays, qlikValues] = await Promise.all([
+    const [manual, businessDays, coreBusinessDays, qlikValues] = await Promise.all([
       pool.query(`SELECT id,business_date,filiale,movement_type,soll_cents,ist_cents,note
         FROM controlling.alex3_manual_daily_values
         WHERE business_date >= $1::date AND business_date < $2::date
         ORDER BY business_date,filiale,movement_type`, [startDate, nextDate]),
       pool.query(`SELECT day.business_date,branch.name AS filiale,day.status AS business_day_status,
           day.bab_safe_skim_cents,day.bab_booked_cents,
+          (SELECT SUM(closing.bank_amount_cents)::integer
+            FROM controlling.cash_drawer_closings closing
+            WHERE closing.business_day_id=day.id AND closing.status='confirmed')
+            AS confirmed_closing_bank_cents,
           (SELECT COUNT(*) FROM controlling.cash_drawer_closings closing
             WHERE closing.business_day_id=day.id AND closing.status='confirmed')::integer
             AS confirmed_closing_count,
@@ -404,6 +408,24 @@ router.get('/alex3/month', verifyToken(), async (req, res) => {
         FROM controlling.cash_business_days day
         JOIN public.filialen branch ON branch.id=day.filiale_id
         WHERE day.business_date >= $1::date AND day.business_date < $2::date
+        ORDER BY day.business_date,branch.name`, [startDate, nextDate]),
+      pool.query(`SELECT day.business_date,branch.name AS filiale,
+          day.status AS business_day_status,
+          NULLIF(day.final_report->'babReport'->>'safeSkimCents','')::bigint
+            AS bab_safe_skim_cents,
+          NULLIF(day.final_report->'babReport'->>'bookedCents','')::bigint
+            AS bab_booked_cents,
+          NULLIF(day.final_report->'totals'->>'bankPayoutCents','')::bigint
+            AS confirmed_closing_bank_cents,
+          1::integer AS confirmed_closing_count,
+          CASE WHEN receipt_link.business_day_id IS NULL THEN 0 ELSE 1 END::integer
+            AS linked_closing_count
+        FROM core.cash_business_days day
+        JOIN public.filialen branch ON branch.id=day.branch_id
+        LEFT JOIN core.cash_deposit_receipt_business_days receipt_link
+          ON receipt_link.business_day_id=day.id
+        WHERE day.business_date >= $1::date AND day.business_date < $2::date
+          AND day.status='finalized'
         ORDER BY day.business_date,branch.name`, [startDate, nextDate]),
       pool.query(`WITH ranked AS (
           SELECT value.id AS qlik_derived_value_id,value.business_date,
@@ -433,7 +455,7 @@ router.get('/alex3/month', verifyToken(), async (req, res) => {
       month,
       branches: FILIALEN,
       manualRows: manual.rows,
-      businessDays: businessDays.rows,
+      businessDays: [...coreBusinessDays.rows, ...businessDays.rows],
       qlikValues: qlikValues.rows,
     }));
   } catch (error) {
