@@ -27,6 +27,10 @@ const {
   calculatePlannedAmount,
   normalizeSkontoRate,
 } = require('../lib/cashflowInvoicePayments');
+const {
+  buildAmountSuggestions,
+  parseAmountToCents,
+} = require('../lib/cashflowAmountSearch');
 
 const ALLOWED_ROLES = new Set(['Admin', 'Supervisor', 'Geschäftsführer']);
 const ALLOWED_TAGS = new Set(['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So']);
@@ -1053,8 +1057,17 @@ router.get('/buchungen/suche', verifyToken(), requireCashflowAccess, async (req,
       message: 'suchwert fehlt.',
     });
   }
-  if (!['rechnung', 'avis'].includes(suchtyp)) {
+  if (!['rechnung', 'avis', 'betrag'].includes(suchtyp)) {
     return res.status(400).json({ message: 'Ungültiger Suchtyp.' });
+  }
+
+  let targetCents = null;
+  if (suchtyp === 'betrag') {
+    try {
+      targetCents = parseAmountToCents(suchwert);
+    } catch (error) {
+      return res.status(400).json({ message: error.message });
+    }
   }
 
   try {
@@ -1092,8 +1105,10 @@ router.get('/buchungen/suche', verifyToken(), requireCashflowAccess, async (req,
         ON k.id = b.kategorie_id
       WHERE k.aktiv = true
         AND k.typ = 'Ausgabe'
+        AND COALESCE(b.eintrag_typ, 'betrag') = 'betrag'
         AND (($2 = 'avis' AND b.avis_nummer = $1)
-          OR ($2 = 'rechnung' AND b.rechnungsnummer = $1))
+          OR ($2 = 'rechnung' AND b.rechnungsnummer = $1)
+          OR ($2 = 'betrag' AND COALESCE(b.zahlbetrag, b.betrag) > 0))
       ORDER BY
         b.avis_nummer NULLS LAST,
         b.rechnungsdatum NULLS LAST,
@@ -1102,6 +1117,17 @@ router.get('/buchungen/suche', verifyToken(), requireCashflowAccess, async (req,
       `,
       [suchwert, suchtyp]
     );
+
+    if (suchtyp === 'betrag') {
+      const suggestions = buildAmountSuggestions(result.rows, targetCents);
+      return res.json({
+        suchwert,
+        suchtyp,
+        suchbetrag: (targetCents / 100).toFixed(2),
+        anzahl_treffer: suggestions.avis.length + suggestions.rechnungen.length,
+        ...suggestions,
+      });
+    }
 
     const avisMap = new Map();
 
@@ -1141,7 +1167,7 @@ router.get('/buchungen/suche', verifyToken(), requireCashflowAccess, async (req,
     console.error('Fehler GET /api/cashflow/buchungen/suche:', err);
 
     return res.status(500).json({
-      message: 'Serverfehler bei der Suche nach Avis oder Rechnungsnummer.',
+      message: 'Serverfehler bei der Suche nach Betrag, Avis oder Rechnungsnummer.',
     });
   }
 });
