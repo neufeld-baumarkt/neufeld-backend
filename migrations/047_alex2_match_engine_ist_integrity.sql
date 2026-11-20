@@ -14,6 +14,13 @@ BEGIN
     WHERE payment_type.code = 'KREDITKARTE'
       AND day.datum BETWEEN DATE '2026-11-09' AND DATE '2026-11-14'
       AND match.status = 'bestaetigt'
+      AND NOT EXISTS (
+        SELECT 1
+        FROM pg_trigger
+        WHERE tgrelid = 'controlling.payment_days'::regclass
+          AND tgname = 'payment_days_match_engine_ist_guard'
+          AND NOT tgisinternal
+      )
   ) THEN
     RAISE EXCEPTION
       'IST-Bereinigung abgebrochen: Im Zielzeitraum existiert bereits ein bestaetigter Kreditkarten-Match.';
@@ -41,7 +48,14 @@ JOIN controlling.payment_types payment_type
   ON payment_type.id = day.payment_type_id
 WHERE payment_type.code = 'KREDITKARTE'
   AND day.datum BETWEEN DATE '2026-11-09' AND DATE '2026-11-14'
-  AND day.ist_betrag IS NOT NULL;
+  AND day.ist_betrag IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1
+    FROM pg_trigger
+    WHERE tgrelid = 'controlling.payment_days'::regclass
+      AND tgname = 'payment_days_match_engine_ist_guard'
+      AND NOT tgisinternal
+  );
 
 UPDATE controlling.payment_days day
 SET ist_betrag = NULL,
@@ -50,7 +64,14 @@ FROM controlling.payment_types payment_type
 WHERE payment_type.id = day.payment_type_id
   AND payment_type.code = 'KREDITKARTE'
   AND day.datum BETWEEN DATE '2026-11-09' AND DATE '2026-11-14'
-  AND day.ist_betrag IS NOT NULL;
+  AND day.ist_betrag IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1
+    FROM pg_trigger
+    WHERE tgrelid = 'controlling.payment_days'::regclass
+      AND tgname = 'payment_days_match_engine_ist_guard'
+      AND NOT tgisinternal
+  );
 
 CREATE OR REPLACE FUNCTION controlling.enforce_match_engine_ist_value()
 RETURNS trigger
