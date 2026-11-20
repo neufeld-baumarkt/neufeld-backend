@@ -10,5 +10,8 @@
     "pdf-lib": "^1.17.1",
     "pg": "^8.16.0",
     "puppeteer": "^24.42.0"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.17"
   }
 }

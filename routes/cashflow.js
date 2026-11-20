@@ -28,9 +28,10 @@ const {
   normalizeSkontoRate,
 } = require('../lib/cashflowInvoicePayments');
 const {
-  buildAmountSuggestions,
   parseAmountToCents,
 } = require('../lib/cashflowAmountSearch');
+
+const { amountSearchQuery, buildSqlAmountSuggestions } = require('../lib/cashflowAmountSearchSql');
 
 const ALLOWED_ROLES = new Set(['Admin', 'Supervisor', 'Geschäftsführer']);
 const ALLOWED_TAGS = new Set(['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So']);
@@ -1071,7 +1072,9 @@ router.get('/buchungen/suche', verifyToken(), requireCashflowAccess, async (req,
   }
 
   try {
-    const result = await pool.query(
+    const result = suchtyp === 'betrag'
+      ? await pool.query(amountSearchQuery, [targetCents])
+      : await pool.query(
       `
       SELECT
         b.id,
@@ -1107,8 +1110,7 @@ router.get('/buchungen/suche', verifyToken(), requireCashflowAccess, async (req,
         AND k.typ = 'Ausgabe'
         AND COALESCE(b.eintrag_typ, 'betrag') = 'betrag'
         AND (($2 = 'avis' AND b.avis_nummer = $1)
-          OR ($2 = 'rechnung' AND b.rechnungsnummer = $1)
-          OR ($2 = 'betrag' AND COALESCE(b.zahlbetrag, b.betrag) > 0))
+          OR ($2 = 'rechnung' AND b.rechnungsnummer = $1))
       ORDER BY
         b.avis_nummer NULLS LAST,
         b.rechnungsdatum NULLS LAST,
@@ -1119,7 +1121,7 @@ router.get('/buchungen/suche', verifyToken(), requireCashflowAccess, async (req,
     );
 
     if (suchtyp === 'betrag') {
-      const suggestions = buildAmountSuggestions(result.rows, targetCents);
+      const suggestions = buildSqlAmountSuggestions(result.rows, targetCents);
       return res.json({
         suchwert,
         suchtyp,
