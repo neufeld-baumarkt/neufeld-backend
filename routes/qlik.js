@@ -2,6 +2,8 @@ const express = require('express');
 const verifyToken = require('../middleware/verifyToken');
 const { importQlikCsv } = require('../lib/qlikImport');
 const { payloadSha256, verifyImportSignature } = require('../lib/qlikImportSignature');
+const { verifyWorkerSignature } = require('../lib/qlikWorkerSignature');
+const { loadStatus, requestJob, claimJob, updateJob } = require('../lib/qlikExportJobs');
 const {
   CONTROLLING_ROLES,
   loadDayCloseReconciliation,
@@ -33,6 +35,61 @@ function createQlikImportRouter({ pool, secret, now = () => Date.now(), authenti
     if (status >= 500) console.error('[QLIK_VALUE_ERROR]', error?.code || error?.message);
     return res.status(status).json({ message: status >= 500 ? fallback : error.message });
   }
+
+  function requireWorker(req, res, next) {
+    const valid = verifyWorkerSignature({
+      secret,
+      timestamp: req.get('x-qlik-timestamp'),
+      signature: req.get('x-qlik-signature'),
+      method: req.method,
+      path: req.path,
+      payload: req.body,
+      now: now(),
+    });
+    if (!valid) return res.status(401).json({ message: 'Ungültige Qlik-Worker-Signatur.' });
+    return next();
+  }
+
+  router.get('/export-status', authenticate, requireControlling, async (_req, res) => {
+    try {
+      return res.json({ ok: true, ...(await loadStatus(pool)) });
+    } catch (error) {
+      return sendReadError(res, error, 'Qlik-Status konnte nicht geladen werden.');
+    }
+  });
+
+  router.post('/export-jobs', authenticate, requireControlling, async (req, res) => {
+    try {
+      const result = await requestJob(pool, {
+        reportDate: req.body?.reportDate,
+        userId: req.user.id,
+        userName: req.user.name,
+      });
+      return res.status(result.created ? 201 : 200).json({ ok: true, ...result });
+    } catch (error) {
+      return sendReadError(res, error, 'Qlik-Lauf konnte nicht angefordert werden.');
+    }
+  });
+
+  router.post('/internal/export-jobs/claim', requireWorker, async (req, res) => {
+    const workerId = String(req.body?.workerId || '').trim().slice(0, 120);
+    if (!workerId) return res.status(400).json({ message: 'workerId fehlt.' });
+    try {
+      return res.json({ ok: true, job: await claimJob(pool, workerId) });
+    } catch (error) {
+      return sendReadError(res, error, 'Qlik-Auftrag konnte nicht übernommen werden.');
+    }
+  });
+
+  router.patch('/internal/export-jobs/:id', requireWorker, async (req, res) => {
+    try {
+      const job = await updateJob(pool, req.params.id, req.body || {});
+      if (!job) return res.status(409).json({ message: 'Qlik-Auftrag ist nicht mehr aktiv.' });
+      return res.json({ ok: true, job });
+    } catch (error) {
+      return sendReadError(res, error, 'Qlik-Auftragsstatus konnte nicht aktualisiert werden.');
+    }
+  });
 
   router.get('/values', authenticate, requireControlling, async (req, res) => {
     try {
@@ -108,9 +165,9 @@ function createQlikImportRouter({ pool, secret, now = () => Date.now(), authenti
           sourceLinksInserted: Number(result.materialized?.inserted_sources || 0),
           aggregatesInserted: Number(result.aggregateMaterialized?.inserted_aggregates || 0),
           aggregateSourceLinksInserted: Number(result.aggregateMaterialized?.inserted_sources || 0),
+          alexModule2ValuesSynchronized: Number(result.alexModule2?.synchronized || 0),
           alexModule1RevenueSynchronized: Number(result.alexModule1?.synchronized || 0),
           alexModule1RevenueStatus: result.alexModule1?.status || 'NOT_RUN',
-          alexModule2ValuesSynchronized: Number(result.alexModule2?.synchronized || 0),
         },
       });
     } catch (error) {
