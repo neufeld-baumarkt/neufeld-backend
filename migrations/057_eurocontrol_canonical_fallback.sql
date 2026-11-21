@@ -1,4 +1,3 @@
-Attempting to perform the InitializeDefaultDrives operation on the 'FileSystem' provider failed.
 -- Vollstaendiger EuroControl-Fallback fuer die app-relevanten Qlik-Fachwerte.
 -- Das PDF wird vor dem Import kryptografisch und technisch geprueft, aber nicht
 -- dauerhaft als Blob gespeichert. Strukturierte Rohfelder und Ableitungen sind
