@@ -20,11 +20,22 @@ async function makePayload() {
     report: {
       reportType: 'FILIALBERICHT', branchIdentifier: '041129', branchLabel: 'Synthetic A',
       reportDate: '2099-01-02', pageCount: 1, reportVersion: null, reportCreatedAt: null,
+      parserVersion: '2.0.0',
       paymentRows: [
-        { rowNumber: 1, label: 'Kartenzahlung', sollCents: 2200, istCents: 2200, differenceCents: 0, withdrawalCents: 0 },
-        { rowNumber: 2, label: 'Visa', sollCents: 400, istCents: 400, differenceCents: 0, withdrawalCents: 0 },
+        { rowNumber: 1, label: 'BAR', sollCents: 1000, istCents: 1000, differenceCents: 0, withdrawalCents: 0 },
+        { rowNumber: 2, label: 'Kartenzahlung', sollCents: 2200, istCents: 2200, differenceCents: 0, withdrawalCents: 0 },
+        { rowNumber: 3, label: 'Visa', sollCents: 400, istCents: 400, differenceCents: 0, withdrawalCents: 0 },
       ],
-      totals: { sollCents: 2600, istCents: 2600, differenceCents: 0, withdrawalCents: 0 },
+      totals: { sollCents: 3600, istCents: 3600, differenceCents: 0, withdrawalCents: 0 },
+      reportFields: [
+        { fieldCode: 'REPORT_REVENUE_CENTS', valueKind: 'MONEY_CENTS', amountCents: 10000, pageNumber: 1, explicit: true },
+        { fieldCode: 'PAYOUTS_CENTS', valueKind: 'MONEY_CENTS', amountCents: 0, pageNumber: 1, explicit: true },
+        { fieldCode: 'CUSTOMER_COUNT', valueKind: 'COUNT', countValue: 4, pageNumber: 1, explicit: true },
+        { fieldCode: 'AVERAGE_RECEIPT_CENTS', valueKind: 'MONEY_CENTS', amountCents: 2500, pageNumber: 1, explicit: true },
+        { fieldCode: 'BANK_DEPOSIT_CENTS', valueKind: 'MONEY_CENTS', amountCents: 1000, pageNumber: 1, explicit: true },
+        { fieldCode: 'VAT_7_GROSS_CENTS', valueKind: 'MONEY_CENTS', amountCents: 3000, pageNumber: 1, explicit: true },
+        { fieldCode: 'VAT_19_GROSS_CENTS', valueKind: 'MONEY_CENTS', amountCents: 7000, pageNumber: 1, explicit: true },
+      ],
     },
   };
 }
@@ -35,10 +46,11 @@ function poolFake() {
       if (sql.includes('WHERE imported.source_sha256')) return { rows: [] };
       if (sql.includes('branch_source_identifiers')) return { rowCount: 1, rows: [{ branch_id: 2, branch_name: 'Synthetic A' }] };
       if (sql.includes('eurocontrol_payment_mappings')) return { rows: [
+        { external_label: 'BAR', mapping_role: 'IGNORE', provider_code: null },
         { external_label: 'Kartenzahlung', mapping_role: 'EC_CASH', provider_code: null },
         { external_label: 'Visa', mapping_role: 'CREDIT_PROVIDER', provider_code: 'VISA' },
       ] };
-      if (sql.includes('FROM controlling.eurocontrol_daily_values')) return { rows: [] };
+      if (sql.includes('FROM controlling.eurocontrol_derived_daily_values')) return { rows: [] };
       if (sql.includes('INSERT INTO controlling.eurocontrol_imports')) return { rows: [{
         id: 'import-http', status: 'IMPORTED', report_date: '2099-01-02', source_sha256: params[3],
       }] };

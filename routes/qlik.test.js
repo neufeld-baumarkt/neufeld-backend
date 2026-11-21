@@ -29,14 +29,14 @@ function poolFake() {
   return {
     connect: async () => client,
     async query(sql) {
-      if (sql.includes('qlik_derived_daily_aggregates')) return { rows: [{
+      if (sql.includes('canonical_daily_metric_aggregates')) return { rows: [{
         id: 'aggregate-1', metric_code: 'GESAMTUMSATZ_ALLE_FILIALEN_QLIK',
         display_name: 'Gesamtumsatz aller Filialen', value_kind: 'MONEY_CENTS',
         numeric_value: '4006194', availability_status: 'VORHANDEN',
         quality_status: 'NICHT_GEPRUEFT', expected_member_count: '4',
         actual_member_count: '4', rule_version: '1', source_count: '4',
       }] };
-      if (sql.includes('WITH candidates')) return { rows: [{ id: 'v1', metric_code: 'GESAMTUMSATZ_QLIK', display_name: 'Gesamtumsatz', value_kind: 'MONEY_CENTS', numeric_value: '961610', availability_status: 'VORHANDEN', quality_status: 'NICHT_GEPRUEFT', rule_version: 1, source_count: 2 }] };
+      if (sql.includes('canonical_daily_metric_values')) return { rows: [{ id: 'v1', metric_code: 'GESAMTUMSATZ_QLIK', display_name: 'Gesamtumsatz', value_kind: 'MONEY_CENTS', numeric_value: '961610', availability_status: 'VORHANDEN', quality_status: 'NICHT_GEPRUEFT', rule_version: 1, source_count: 2 }] };
       return { rows: [{ daily_revenue_cents: 961610, eurocontrol_bank_cents: 279507, cash_difference_cents: 7, business_day_status: 'final' }] };
     },
   };
