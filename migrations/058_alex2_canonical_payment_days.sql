@@ -3,6 +3,16 @@
 
 BEGIN;
 
+ALTER TABLE controlling.payment_review_events
+  DROP CONSTRAINT IF EXISTS payment_review_events_event_type_check;
+ALTER TABLE controlling.payment_review_events
+  ADD CONSTRAINT payment_review_events_event_type_check CHECK (event_type IN (
+    'QLIK_SYNCHRONISIERT', 'EUROCONTROL_SYNCHRONISIERT',
+    'IN_PRUEFUNG', 'BESTAETIGT', 'KORRIGIERT', 'VERTAGT',
+    'AUSGLEICH_AUSSTEHEND', 'EXTERN_BESTAETIGT', 'RUECKGESETZT',
+    'TRANSFER_KORRIGIERT'
+  )) NOT VALID;
+
 ALTER TABLE controlling.payment_days
   ADD COLUMN IF NOT EXISTS canonical_source_system varchar(20),
   ADD COLUMN IF NOT EXISTS canonical_source_value_id uuid;
