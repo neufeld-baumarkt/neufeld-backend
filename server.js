@@ -18,6 +18,7 @@ const { runQlikDerivedMigration } = require('./lib/runQlikDerivedMigration');
 const { runAlexModule2LiveSyncMigration } = require('./lib/runAlexModule2LiveSyncMigration');
 const { runAlexModule2TransferCreatorMigration } = require('./lib/runAlexModule2TransferCreatorMigration');
 const { runQlikExportJobMigration } = require('./lib/runQlikExportJobMigration');
+const { runEuroControlImportMigration } = require('./lib/runEuroControlImportMigration');
 const { startAlexModule1RetryWorker } = require('./lib/alexModule1RetryWorker');
 const { runAlexModule2StartupMaintenance } = require('./lib/alexModule2StartupMaintenance');
 const { ALLOWED_CORS_HEADERS } = require('./lib/corsPolicy');
@@ -63,7 +64,7 @@ const corsOptions = {
 // Middleware
 app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions)); // Preflight sauber beantworten
-app.use(express.json());
+app.use(express.json({ limit: '800kb' }));
 
 // Fingerprint-Header auf JEDER Response (auch Fehler)
 app.use((req, res, next) => {
@@ -178,6 +179,7 @@ const cashflowRoutes = require('./routes/cashflow');
 const devDbRoutes = require('./routes/devDb');
 const controllingRoutes = require('./routes/controlling');
 const { createQlikImportRouter } = require('./routes/qlik');
+const { createEuroControlRouter } = require('./routes/eurocontrol');
 const tageskasseRoutes = require('./routes/tageskasse');
 
 app.use('/api/reklamationen', reklamationenRoutes);
@@ -189,6 +191,7 @@ app.use('/api/bestellungen', bestellungenRoutes);
 app.use('/api/cashflow', cashflowRoutes);
 app.use('/api/controlling', controllingRoutes);
 app.use('/api/qlik', createQlikImportRouter({ pool, secret: process.env.QLIK_IMPORT_SECRET }));
+app.use('/api/eurocontrol', createEuroControlRouter({ pool, secret: process.env.EUROCONTROL_IMPORT_SECRET }));
 app.use('/api/tageskasse', tageskasseRoutes);
 // Keep the legacy safe-count router as a fallback only. V2.1 owns the
 // /safe-counts endpoints and must be allowed to handle them first.
@@ -217,6 +220,7 @@ async function startServer() {
   await runQlikImportMigration(pool);
   await runQlikDerivedMigration(pool);
   await runQlikExportJobMigration(pool);
+  await runEuroControlImportMigration(pool);
   await runAlexModule2LiveSyncMigration(pool);
   await runAlexModule2TransferCreatorMigration(pool);
   console.log('✅ Alex-2-Live-Sync-Datenbanktrigger sind bereit');
