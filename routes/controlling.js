@@ -430,16 +430,19 @@ router.get('/alex3/month', verifyToken(), async (req, res) => {
       pool.query(`WITH ranked AS (
           SELECT value.id AS qlik_derived_value_id,value.business_date,
             branch.name AS filiale,metric.metric_code,
-            value.numeric_value,value.availability_status,value.quality_status,
+            value.numeric_value,'VORHANDEN'::text AS availability_status,
+            CASE WHEN value.source_status='BOTH_CONFLICT' THEN 'AUFFAELLIG'
+                 ELSE 'NICHT_GEPRUEFT' END AS quality_status,
+            value.selected_source,value.source_status,
             confirmation.confirmed_at AS qlik_confirmed_at,
             reviewer.name AS qlik_confirmed_by,
             row_number() OVER (
-              PARTITION BY value.business_date,value.branch_id,value.metric_definition_id
-              ORDER BY value.calculated_at DESC,value.id DESC
+              PARTITION BY value.business_date,value.branch_id,metric.metric_code
+              ORDER BY CASE WHEN value.selected_source='QLIK' THEN 0 ELSE 1 END,value.id DESC
             ) AS rank
-          FROM controlling.qlik_derived_daily_values value
+          FROM controlling.canonical_daily_metric_values value
           JOIN controlling.qlik_metric_definitions metric
-            ON metric.id=value.metric_definition_id AND metric.active=true
+            ON metric.metric_code=value.metric_code AND metric.active=true
           JOIN public.filialen branch ON branch.id=value.branch_id
           LEFT JOIN controlling.alex3_qlik_value_confirmations confirmation
             ON confirmation.qlik_derived_value_id=value.id
@@ -477,13 +480,9 @@ router.post('/alex3/qlik-values/:id/confirm', verifyToken(), async (req, res) =>
         JOIN controlling.qlik_metric_definitions metric ON metric.id=value.metric_definition_id
         WHERE value.id=$1::uuid AND metric.metric_code='BAR_AN_BANK_QLIK'
           AND metric.active=true AND value.numeric_value IS NOT NULL
-          AND NOT EXISTS (
-            SELECT 1 FROM controlling.qlik_derived_daily_values newer
-            WHERE newer.business_date=value.business_date
-              AND newer.branch_id=value.branch_id
-              AND newer.metric_definition_id=value.metric_definition_id
-              AND (newer.calculated_at,newer.id) > (value.calculated_at,value.id)
-          )
+          AND value.id=(SELECT current_value.id
+            FROM controlling.canonical_daily_metric_values current_value
+            WHERE current_value.id=value.id)
       ), inserted AS (
         INSERT INTO controlling.alex3_qlik_value_confirmations
           (qlik_derived_value_id,confirmed_by_user_id)

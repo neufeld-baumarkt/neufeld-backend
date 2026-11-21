@@ -19,6 +19,7 @@ const { runAlexModule2LiveSyncMigration } = require('./lib/runAlexModule2LiveSyn
 const { runAlexModule2TransferCreatorMigration } = require('./lib/runAlexModule2TransferCreatorMigration');
 const { runQlikExportJobMigration } = require('./lib/runQlikExportJobMigration');
 const { runEuroControlImportMigration } = require('./lib/runEuroControlImportMigration');
+const { backfillEuroControlQlikProjections } = require('./lib/eurocontrolImport');
 const { startAlexModule1RetryWorker } = require('./lib/alexModule1RetryWorker');
 const { runAlexModule2StartupMaintenance } = require('./lib/alexModule2StartupMaintenance');
 const { ALLOWED_CORS_HEADERS } = require('./lib/corsPolicy');
@@ -221,6 +222,8 @@ async function startServer() {
   await runQlikDerivedMigration(pool);
   await runQlikExportJobMigration(pool);
   await runEuroControlImportMigration(pool);
+  const projectionBackfill = await backfillEuroControlQlikProjections({ pool });
+  console.log(`EUROCONTROL_QLIK_PROJECTION=${JSON.stringify(projectionBackfill)}`);
   await runAlexModule2LiveSyncMigration(pool);
   await runAlexModule2TransferCreatorMigration(pool);
   console.log('✅ Alex-2-Live-Sync-Datenbanktrigger sind bereit');

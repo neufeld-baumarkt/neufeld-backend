@@ -5,17 +5,21 @@ const { importEuroControlReport } = require('../lib/eurocontrolImport');
 
 const IMPORT_PATH = '/api/eurocontrol/internal/import';
 
-function createEuroControlRouter({ pool, secret, now = () => Date.now() }) {
+function createEuroControlRouter({
+  pool, secret, now = () => Date.now(), importer = importEuroControlReport,
+}) {
   const router = express.Router();
   router.use((_req, res, next) => {
     res.setHeader('Cache-Control', 'no-store');
     next();
   });
-  router.post('/internal/import', createImportHandler({ pool, secret, now }));
+  router.post('/internal/import', createImportHandler({ pool, secret, now, importer }));
   return router;
 }
 
-function createImportHandler({ pool, secret, now = () => Date.now() }) {
+function createImportHandler({
+  pool, secret, now = () => Date.now(), importer = importEuroControlReport,
+}) {
   return async (req, res) => {
     const suppliedDigest = String(req.get('x-eurocontrol-content-sha256') || '').toLowerCase();
     const actualDigest = crypto.createHash('sha256').update(canonicalJson(req.body)).digest('hex');
@@ -30,7 +34,7 @@ function createImportHandler({ pool, secret, now = () => Date.now() }) {
     });
     if (!valid) return res.status(401).json({ message: 'Ungültige EuroControl-Worker-Signatur.' });
     try {
-      const result = await importEuroControlReport({ pool, payload: req.body });
+      const result = await importer({ pool, payload: req.body });
       return res.status(result.deduplicated ? 200 : 201).json({
         ok: true,
         deduplicated: result.deduplicated,

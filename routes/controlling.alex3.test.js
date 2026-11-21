@@ -5,7 +5,7 @@ const path = require('node:path');
 
 const route = fs.readFileSync(path.join(__dirname, 'controlling.js'), 'utf8');
 
-test('Alex 3 reads Qlik, day-close and complete receipt coverage separately', () => {
+test('Alex 3 reads the source-neutral canonical values, day-close and receipt coverage separately', () => {
   assert.match(route, /router\.get\('\/alex3\/month'/);
   assert.match(route, /controlling\.alex3_manual_daily_values/);
   assert.match(route, /controlling\.cash_business_days/);
@@ -16,7 +16,8 @@ test('Alex 3 reads Qlik, day-close and complete receipt coverage separately', ()
   assert.match(route, /core\.cash_deposit_receipt_business_days/);
   assert.match(route, /final_report->'babReport'->>'bookedCents'/);
   assert.match(route, /businessDays:\s*\[\.\.\.coreBusinessDays\.rows,\s*\.\.\.businessDays\.rows\]/);
-  assert.match(route, /controlling\.qlik_derived_daily_values/);
+  assert.match(route, /controlling\.canonical_daily_metric_values/);
+  assert.match(route, /value\.selected_source,value\.source_status/);
   assert.match(route, /confirmed_closing_count/);
   assert.match(route, /linked_closing_count/);
   assert.match(route, /alex3_qlik_value_confirmations/);
@@ -26,7 +27,7 @@ test('Alex 3 reads Qlik, day-close and complete receipt coverage separately', ()
 test('Alex 3 confirms only the latest concrete Qlik value and keeps EZ read-only', () => {
   assert.match(route, /router\.post\('\/alex3\/qlik-values\/:id\/confirm'/);
   assert.match(route, /metric\.metric_code='BAR_AN_BANK_QLIK'/);
-  assert.match(route, /newer\.calculated_at,newer\.id/);
+  assert.match(route, /FROM controlling\.canonical_daily_metric_values current_value/);
   assert.match(route, /ON CONFLICT \(qlik_derived_value_id\) DO NOTHING/);
   assert.match(route, /RETURNING qlik_derived_value_id,confirmed_at,confirmed_by_user_id/);
   assert.match(route, /FROM inserted\s+JOIN public\.users reviewer/);

@@ -73,7 +73,19 @@ async function invoke(payload, suppliedHeaders) {
     status(value) { result.statusCode = value; return this; },
     json(value) { result.body = value; return this; },
   };
-  await createImportHandler({ pool: poolFake(), secret, now: () => nowMillis })(req, res);
+  const importer = async () => ({
+    deduplicated: false,
+    id: 'import-http',
+    status: 'IMPORTED',
+    report_date: payload.report.reportDate,
+    branch_name: 'Synthetic A',
+    source_sha256: payload.sourceSha256,
+    ec_cash_cents: 2200,
+    credit_card_cents: 400,
+  });
+  await createImportHandler({
+    pool: poolFake(), secret, now: () => nowMillis, importer,
+  })(req, res);
   return result;
 }
 
