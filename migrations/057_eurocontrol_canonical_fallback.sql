@@ -127,7 +127,8 @@ SELECT COALESCE(qlik.branch_id, eurocontrol.branch_id) AS branch_id,
        eurocontrol.numeric_value AS eurocontrol_numeric_value,
        qlik.id AS qlik_value_id,
        eurocontrol.id AS eurocontrol_value_id,
-       COALESCE(qlik.source_fingerprint, eurocontrol.source_fingerprint) AS selected_fingerprint
+       COALESCE(qlik.source_fingerprint, eurocontrol.source_fingerprint) AS selected_fingerprint,
+       COALESCE(qlik.id, eurocontrol.id) AS id
 FROM qlik
 FULL OUTER JOIN eurocontrol
   ON eurocontrol.branch_id=qlik.branch_id
