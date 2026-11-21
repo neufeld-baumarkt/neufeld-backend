@@ -49,7 +49,7 @@ ALTER TABLE controlling.payment_days
     CHECK (
       (qlik_amount_cents IS NULL AND qlik_import_run_id IS NULL)
       OR (qlik_amount_cents IS NOT NULL AND qlik_import_run_id IS NOT NULL)
-    ),
+    ) NOT VALID,
   ADD CONSTRAINT payment_days_review_metadata_check
     CHECK (
       (reviewed_by IS NULL AND reviewed_at IS NULL)
