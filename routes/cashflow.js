@@ -32,6 +32,7 @@ const {
 } = require('../lib/cashflowAmountSearch');
 
 const { amountSearchQuery, buildSqlAmountSuggestions } = require('../lib/cashflowAmountSearchSql');
+const { validateCategoryCorrection } = require('../lib/cashflowCategoryCorrection');
 
 const ALLOWED_ROLES = new Set(['Admin', 'Supervisor', 'Geschäftsführer']);
 const ALLOWED_TAGS = new Set(['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So']);
@@ -256,6 +257,9 @@ function parseFastBookingPayload(req, res) {
 }
 
 function parseUpdateBuchungPayload(req, res) {
+  const kategorieRaw = req.body?.kategorie_id ?? req.body?.kategorieId;
+  const kategorieProvided = kategorieRaw !== undefined && kategorieRaw !== null && kategorieRaw !== '';
+  const kategorieId = kategorieProvided ? Number(kategorieRaw) : undefined;
   const status =
     req.body?.status === undefined || req.body?.status === null
       ? undefined
@@ -389,6 +393,11 @@ function parseUpdateBuchungPayload(req, res) {
     return null;
   }
 
+  if (kategorieProvided && (!Number.isInteger(kategorieId) || kategorieId < 1)) {
+    res.status(400).json({ message: 'Ungültige Kategorie.' });
+    return null;
+  }
+
   if (eintragTyp === 'betrag' && betragProvided && betrag === 0) {
     res.status(400).json({
       message: 'Bei Eintragstyp betrag muss der Betrag ungleich 0 sein.',
@@ -397,6 +406,7 @@ function parseUpdateBuchungPayload(req, res) {
   }
 
   if (
+    !kategorieProvided &&
     status === undefined &&
     req.body?.notiz === undefined &&
     filiale === undefined &&
@@ -420,6 +430,7 @@ function parseUpdateBuchungPayload(req, res) {
   }
 
   return {
+    kategorieId,
     status,
     notiz,
     filiale,
@@ -429,6 +440,7 @@ function parseUpdateBuchungPayload(req, res) {
     tag,
     betrag,
     updateStatus: status !== undefined,
+    updateKategorie: kategorieProvided,
     updateNotiz: req.body?.notiz !== undefined,
     updateFiliale: filiale !== undefined,
     updateEintragTyp: eintragTyp !== undefined,
@@ -671,6 +683,7 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
     const currentResult = await client.query(
       `
       SELECT
+        b.kategorie_id,
         b.status,
         b.betrag,
         b.planbetrag,
@@ -705,6 +718,32 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
       return res.status(409).json({
         message: 'Qlik-verifizierte Einnahmen sind unveränderlich. Eine Korrektur benötigt einen eigenen nachvollziehbaren Prüfvorgang.',
       });
+    }
+
+    if (payload.updateKategorie) {
+      const targetCategoryResult = await client.query(
+        `SELECT id, name, typ
+         FROM cashflow.kategorien
+         WHERE id = $1 AND aktiv = true`,
+        [payload.kategorieId]
+      );
+
+      if (targetCategoryResult.rowCount === 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: 'Die Zielkategorie existiert nicht oder ist inaktiv.' });
+      }
+
+      const categoryError = validateCategoryCorrection({
+        currentCategoryId: current.kategorie_id,
+        targetCategoryId: payload.kategorieId,
+        currentType: current.typ,
+        targetType: targetCategoryResult.rows[0].typ,
+      });
+
+      if (categoryError) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: categoryError });
+      }
     }
 
     const hasInvoiceFieldUpdate =
@@ -760,6 +799,7 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
       `
       UPDATE cashflow.buchungen b
       SET
+        kategorie_id = CASE WHEN $27::boolean THEN $28 ELSE b.kategorie_id END,
         status = CASE WHEN $2::boolean THEN $3 ELSE b.status END,
         notiz = CASE WHEN $4::boolean AND $26::boolean THEN $5 ELSE b.notiz END,
         filiale = CASE WHEN $6::boolean THEN $7 ELSE b.filiale END,
@@ -813,6 +853,8 @@ router.patch('/buchungen/:id', verifyToken(), requireCashflowAccess, async (req,
         payload.updateZahlungsart,
         payload.zahlungsart,
         updateSharedFieldsOnSelectedRow,
+        payload.updateKategorie,
+        payload.kategorieId ?? null,
       ]
     );
 
