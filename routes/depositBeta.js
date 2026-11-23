@@ -1,6 +1,6 @@
 const { depositBetaConfig, depositCycle, depositWeek, depositScope, depositStatuses } = require('../lib/depositBeta');
 
-const statusQuery = `
+const controllingStatusQuery = `
   SELECT f.name AS branch, to_char(d.business_date, 'YYYY-MM-DD') AS date,
     d.status = 'final' AS final, c.bank_amount_cents,
     r.confirmed_at IS NOT NULL AS verified, r.receipt_total_cents, r.banknote_counts,
@@ -25,7 +25,32 @@ const statusQuery = `
   ORDER BY f.name, d.business_date, c.id
 `;
 
+// 3.0's cash archive verifies a finalized business day against its linked receipt.
+const coreStatusQuery = `
+  SELECT f.name AS branch, TO_CHAR(d.business_date, 'YYYY-MM-DD') AS date,
+    d.status = 'finalized' AS final,
+    (d.final_report->'totals'->>'bankPayoutCents')::bigint AS bank_amount_cents,
+    r.confirmed_at IS NOT NULL AS verified, r.receipt_total_cents, r.banknote_counts,
+    receipt_links.linked_total_cents, receipt_links.valid_links
+  FROM public.filialen f
+  LEFT JOIN core.cash_business_days d
+    ON d.branch_id = f.id AND d.business_date = ANY($2::date[])
+  LEFT JOIN core.cash_deposit_receipt_business_days link ON link.business_day_id = d.id
+  LEFT JOIN core.cash_deposit_receipts r ON r.id = link.receipt_id AND r.branch_id = f.id
+  LEFT JOIN LATERAL (
+    SELECT SUM((other.final_report->'totals'->>'bankPayoutCents')::bigint) AS linked_total_cents,
+      BOOL_AND(other.branch_id = f.id AND other.status = 'finalized'
+        AND other.final_report->'totals'->>'bankPayoutCents' IS NOT NULL) AS valid_links
+    FROM core.cash_deposit_receipt_business_days other_link
+    JOIN core.cash_business_days other ON other.id = other_link.business_day_id
+    WHERE other_link.receipt_id = r.id
+  ) receipt_links ON TRUE
+  WHERE f.aktiv = true AND ($1::text IS NULL OR LOWER(f.name) = LOWER($1))
+  ORDER BY f.name, d.business_date, d.id
+`;
+
 function createDepositBetaHandler({ pool, config, now = () => new Date() }) {
+  const statusQuery = config.source === 'core' ? coreStatusQuery : controllingStatusQuery;
   return async (req, res) => {
     res.set('Cache-Control', 'private, no-store');
     const scope = depositScope(config, req.user);

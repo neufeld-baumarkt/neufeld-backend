@@ -11,6 +11,7 @@ const env = {
   DEPOSIT_BETA_ADMIN_ID: '101',
   DEPOSIT_BETA_SUPERVISOR_ID: '102',
   DEPOSIT_BETA_VREDEN_ID: '103',
+  DEPOSIT_BETA_MANAGING_DIRECTOR_ID: '105',
   DEPOSIT_BETA_HOLIDAYS: '2026-10-03',
 };
 const config = depositBetaConfig(env);
@@ -20,6 +21,9 @@ test('Berlin deadlines, weekday mappings and date-specific holidays', () => {
   assert.equal(depositBetaConfig({}), null);
   assert.throws(() => depositBetaConfig({ ...env, DEPOSIT_BETA_HOLIDAYS: '2026-02-30' }));
   assert.throws(() => depositBetaConfig({ ...env, DEPOSIT_BETA_ADMIN_ID: '103' }));
+  assert.throws(() => depositBetaConfig({ ...env, DEPOSIT_BETA_MANAGING_DIRECTOR_ID: '101' }));
+  assert.throws(() => depositBetaConfig({ ...env, DEPOSIT_BETA_SOURCE: 'legacy' }));
+  assert.equal(depositBetaConfig({ ...env, DEPOSIT_BETA_MANAGING_DIRECTOR_ID: undefined }).managingDirector, undefined);
   const cycles = depositWeek(monday, config.holidays);
   assert.deepEqual(cycles.map(cycle => cycle.dates), [
     ['2026-10-02'], ['2026-10-05', '2026-10-06'], ['2026-10-07', '2026-10-08'],
@@ -66,6 +70,33 @@ test('all expected days and all funded closures must be verified and plausible',
   assert.equal(status([{ branch: 'Vreden' }], { ...cycle, dates: [] }), 'green');
 });
 
+test('3.0 reads the linked business-day receipts as a single authoritative source', async () => {
+  const queryCalls = [];
+  const verifiedDay = {
+    branch: 'Sandbox Nord', date: '2026-10-02', final: true, verified: true, valid_links: true,
+    bank_amount_cents: '500', linked_total_cents: '1000', receipt_total_cents: 1000, banknote_counts: { 500: 2 },
+  };
+  const handler = createDepositBetaHandler({
+    config: depositBetaConfig({ ...env, DEPOSIT_BETA_SOURCE: 'core', DEPOSIT_BETA_HOLIDAYS: '' }),
+    now: () => new Date('2026-10-05T10:01:00Z'),
+    pool: { async query(sql, params) {
+      assert.match(sql, /core\.cash_deposit_receipt_business_days/);
+      assert.match(sql, /core\.cash_deposit_receipts/);
+      assert.match(sql, /core\.cash_business_days/);
+      assert.match(sql, /bankPayoutCents/);
+      assert.doesNotMatch(sql, /controlling\./);
+      queryCalls.push(params);
+      return { rows: [verifiedDay, { ...verifiedDay, date: '2026-10-03' }] };
+    } },
+  });
+  let data;
+  await handler({ user: { id: 101, role: 'Admin' } }, { set() {}, json(value) { data = value; } });
+  assert.equal(queryCalls.length, 1);
+  assert.ok(queryCalls[0][1].includes('2026-10-02'));
+  assert.ok(queryCalls[0][1].includes('2026-10-03'));
+  assert.deepEqual(data.cycles[0].branches, [{ branch: 'Sandbox Nord', missingDates: [], status: 'green' }]);
+});
+
 test('handler queries only the authorized scope and emits only the relevant cycles', async () => {
   const calls = [];
   const handler = createDepositBetaHandler({
@@ -88,12 +119,13 @@ test('handler queries only the authorized scope and emits only the relevant cycl
   for (const user of [
     undefined, { id: 999, role: 'Admin', name: 'Sandbox Namensgleich' },
     { id: 101, role: 'Supervisor' }, { id: 103, role: 'Filiale', filiale: 'Andere Filiale' },
+    { id: 105, role: 'Admin' }, { id: 106, role: 'Geschäftsführer', name: 'Sandbox Namensgleich' },
   ]) assert.equal((await request(user)).status, 404);
   assert.equal(calls.length, 0);
   const branch = await request({ id: 103, role: 'Filiale', filiale: 'Vreden' });
   assert.deepEqual(calls[0], ['Vreden', ['2026-10-02']]);
   assert.equal(branch.body.cycles.length, 1);
-  for (const [id, role] of [[101, 'Admin'], [102, 'Supervisor']]) {
+  for (const [id, role] of [[101, 'Admin'], [102, 'Supervisor'], [105, 'Geschäftsführer']]) {
     const result = await request({ id, role });
     assert.equal(result.body.cycles.length, 3);
     assert.equal(calls.at(-1)[0], null);
@@ -106,6 +138,8 @@ test('HTTP route verifies real session tokens and enforces the allowlist before 
     102: { role: 'Supervisor' },
     103: { role: 'Filiale', filiale: 'Vreden' },
     104: { role: 'Admin', name: 'Sandbox Namensgleich' },
+    105: { role: 'Geschäftsführer' },
+    106: { role: 'Geschäftsführer', name: 'Sandbox Namensgleich' },
   };
   const reads = [];
   const pool = {
@@ -137,13 +171,14 @@ test('HTTP route verifies real session tokens and enforces the allowlist before 
   assert.equal((await fetch(endpoint + '/existing')).status, 204);
   assert.equal((await request()).status, 401);
   assert.equal((await request(104)).status, 404);
+  assert.equal((await request(106)).status, 404);
   assert.deepEqual(reads, []);
-  for (const id of [101, 102, 103]) {
+  for (const id of [101, 102, 103, 105]) {
     const response = await request(id);
     assert.equal(response.status, 200);
     assert.match(response.headers.get('cache-control'), /no-store/);
     const data = await response.json();
     assert.deepEqual(data.cycles[0].branches.map(row => row.branch), id === 103 ? ['Vreden'] : ['Ahaus', 'Vreden']);
   }
-  assert.deepEqual(reads, [null, null, 'Vreden']);
+  assert.deepEqual(reads, [null, null, 'Vreden', null]);
 });
