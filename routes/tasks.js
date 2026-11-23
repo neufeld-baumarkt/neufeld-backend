@@ -13,6 +13,10 @@ const { processPushTaskEscalations } = require('../services/pushTaskEscalationSe
 const router = express.Router();
 const photoParser = express.raw({ type: ['image/jpeg', 'image/png', 'image/webp'], limit: '5mb' });
 const mode = () => modeOf(process.env.PUSH_TASK_MODE);
+router.use((_req, res, next) => {
+  if (mode() === 'off') return res.sendStatus(404);
+  next();
+});
 const clean = (value) => typeof value === 'string' ? value.trim() : '';
 const hasGlobalTaskView = (user) => user?.role === 'Admin' || (mode() === 'full' && user?.role === 'Geschäftsführer');
 

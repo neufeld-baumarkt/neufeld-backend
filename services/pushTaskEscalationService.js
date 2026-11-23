@@ -5,6 +5,7 @@ const { sendPushTaskMail } = require('./pushTaskMailer');
 
 async function processPushTaskEscalations({ pool, env = process.env, now = new Date(), mailer = sendPushTaskMail }) {
   const mode = modeOf(env.PUSH_TASK_MODE);
+  if (mode === 'off') return { inspected: 0, escalated: 0, emails: { sent: 0, blocked: 0, failed: 0 } };
   const candidates = await pool.query(`SELECT a.id FROM core.push_task_assignments a JOIN core.push_tasks t ON t.id=a.task_id
     WHERE t.status='active' AND a.status NOT IN ('submitted','approved')
       AND (a.escalation_snoozed_until IS NULL OR a.escalation_snoozed_until <= $1) AND t.reminder_at <= $1

@@ -95,7 +95,7 @@ app.use(createMaintenanceGate({ pool }));
 // ✅ Public: Login (ohne Token)
 app.post('/api/login', authHandlers.login);
 app.get('/api/session', verifyToken({ allowForcePasswordChange: true }), authHandlers.session);
-require('./routes/depositBeta').mountDepositBeta(app, { pool, env: process.env, verifyToken });
+require('./routes/depositBeta').mountDepositBeta(app, { pool, env: { ...process.env, DEPOSIT_BETA_SOURCE: process.env.DEPOSIT_BETA_SOURCE ?? 'core' }, verifyToken });
 
 // ──────────────────────────────────────────────────────────────────────────────
 // USERS (PRIVATE) – aus Backup übernommen (robust umgesetzt)
