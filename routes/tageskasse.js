@@ -380,7 +380,7 @@ async function loadBusinessDayCloseContext(client, branch, businessDay) {
 
 router.get('/branches', async (req, res) => {
   try {
-    if (!canUseCashModule(req.user)) return res.status(403).json({ message: 'Die Tageskassenabrechnung ist während der DEV-Phase nicht freigegeben.' });
+    if (!canUseCashModule(req.user)) return res.status(403).json({ message: 'Die Tageskassenabrechnung ist für diesen Benutzer nicht freigegeben.' });
     const assigned = String(req.user?.filiale || '').trim();
     if (isCentralRole(req.user?.role) && assigned.toLowerCase() === 'alle') {
       const result = await pool.query(`SELECT id,name FROM public.filialen
@@ -620,7 +620,7 @@ router.post('/day-close/finalize', async (req, res) => {
 router.get('/deposit-receipts/open', async (req, res) => {
   try {
     if (!canUseCashModule(req.user)) {
-      return res.status(403).json({ message:'Die Tageskassenabrechnung ist während der DEV-Phase nicht freigegeben.' });
+      return res.status(403).json({ message:'Die Tageskassenabrechnung ist für diesen Benutzer nicht freigegeben.' });
     }
     const branch = await resolveBranch(pool, req);
     const result = await pool.query(`SELECT day.id,
@@ -652,7 +652,7 @@ router.get('/deposit-receipts/open', async (req, res) => {
 
 router.post('/deposit-receipts/confirm', async (req, res) => {
   if (!canUseCashModule(req.user)) {
-    return res.status(403).json({ message:'Die Tageskassenabrechnung ist während der DEV-Phase nicht freigegeben.' });
+    return res.status(403).json({ message:'Die Tageskassenabrechnung ist für diesen Benutzer nicht freigegeben.' });
   }
   const ids = receiptBusinessDayIds(req.body?.closingIds);
   const validation = validateDepositReceipt(req.body || {});
