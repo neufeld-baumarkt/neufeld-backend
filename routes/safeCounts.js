@@ -89,7 +89,7 @@ router.get('/context', async (req, res) => {
     assertAllowed(req);
     const branch = resolveBranch(req.user, req.query.branch);
     if (!branch) throw Object.assign(new Error('Bitte zuerst eine Filiale auswählen.'), { statusCode: 400 });
-    const businessDate = resolveAllowedBusinessDate({ requestedDate: req.query.businessDate, role: req.user?.role });
+    const businessDate = resolveAllowedBusinessDate({ requestedDate: req.query.businessDate, role: req.user?.role, name: req.user?.name });
     const [settings, existing, previous] = await Promise.all([
       settingsFor(pool, branch),
       pool.query(`SELECT * FROM core.cash_safe_counts WHERE filiale=$1 AND business_date=$2 ORDER BY submitted_at`, [branch, businessDate]),
@@ -111,7 +111,7 @@ router.post('/', async (req, res) => {
     assertAllowed(req);
     const branch = resolveBranch(req.user, req.body?.branch);
     if (!branch) throw Object.assign(new Error('Bitte zuerst eine Filiale auswählen.'), { statusCode: 400 });
-    const businessDate = resolveAllowedBusinessDate({ requestedDate: req.body?.businessDate, role: req.user?.role });
+    const businessDate = resolveAllowedBusinessDate({ requestedDate: req.body?.businessDate, role: req.user?.role, name: req.user?.name });
     await client.query('BEGIN');
     const settings = await settingsFor(client, branch);
     const validated = validateSafeCountPayload(req.body, settings);
