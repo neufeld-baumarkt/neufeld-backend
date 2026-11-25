@@ -96,6 +96,7 @@ app.use(createMaintenanceGate({ pool }));
 app.post('/api/login', authHandlers.login);
 app.get('/api/session', verifyToken({ allowForcePasswordChange: true }), authHandlers.session);
 require('./routes/depositBeta').mountDepositBeta(app, { pool, env: { ...process.env, DEPOSIT_BETA_SOURCE: process.env.DEPOSIT_BETA_SOURCE ?? 'core' }, verifyToken });
+require('./routes/cardPaymentsBeta').mountCardPaymentsBeta(app, { pool, env: process.env, verifyToken });
 
 // ──────────────────────────────────────────────────────────────────────────────
 // USERS (PRIVATE) – aus Backup übernommen (robust umgesetzt)

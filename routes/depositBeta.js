@@ -1,4 +1,5 @@
 const { depositBetaConfig, depositCycle, depositWeek, depositScope, depositStatuses } = require('../lib/depositBeta');
+const { berlinDate, sellingWeek } = require('../lib/sellingWeek');
 
 const controllingStatusQuery = `
   SELECT f.name AS branch, to_char(d.business_date, 'YYYY-MM-DD') AS date,
@@ -57,12 +58,17 @@ function createDepositBetaHandler({ pool, config, now = () => new Date() }) {
     if (!scope) return res.sendStatus(404);
     try {
       const instant = now();
+      const today = berlinDate.format(instant);
+      const week = sellingWeek(today, scope.branch ? undefined : req.query?.week);
+      if (!week) return res.status(400).json({ message: 'Bitte den Montag der Kalenderwoche als ISO-Datum angeben.' });
+      const liveWeek = week.start === sellingWeek(today).start;
       const current = depositCycle(instant, config.holidays);
-      const cycles = scope.branch ? [current] : depositWeek(instant, config.holidays);
+      const cycles = scope.branch ? [current] : depositWeek(instant, config.holidays, week.start);
       const dates = [...new Set(cycles.flatMap(cycle => cycle.dates))];
       const { rows } = await pool.query(statusQuery, [scope.branch, dates]);
       return res.json({
-        currentDueDate: current.dueDate,
+        ...(scope.branch ? {} : { week }),
+        currentDueDate: liveWeek ? current.dueDate : null,
         cycles: cycles.map(cycle => ({ dueDate: cycle.dueDate, branches: depositStatuses(rows, cycle) })),
       });
     } catch {
