@@ -10,7 +10,6 @@ const env = {
   DEPOSIT_BETA_ENABLED: '1',
   DEPOSIT_BETA_ADMIN_ID: '101',
   DEPOSIT_BETA_SUPERVISOR_ID: '102',
-  DEPOSIT_BETA_VREDEN_ID: '103',
   DEPOSIT_BETA_MANAGING_DIRECTOR_ID: '105',
   DEPOSIT_BETA_HOLIDAYS: '2026-10-03',
 };
@@ -20,7 +19,7 @@ const monday = new Date('2026-10-05T09:59:59Z');
 test('Berlin deadlines, weekday mappings and date-specific holidays', () => {
   assert.equal(depositBetaConfig({}), null);
   assert.throws(() => depositBetaConfig({ ...env, DEPOSIT_BETA_HOLIDAYS: '2026-02-30' }));
-  assert.throws(() => depositBetaConfig({ ...env, DEPOSIT_BETA_ADMIN_ID: '103' }));
+  assert.throws(() => depositBetaConfig({ ...env, DEPOSIT_BETA_ADMIN_ID: '102' }));
   assert.throws(() => depositBetaConfig({ ...env, DEPOSIT_BETA_MANAGING_DIRECTOR_ID: '101' }));
   assert.throws(() => depositBetaConfig({ ...env, DEPOSIT_BETA_SOURCE: 'legacy' }));
   assert.equal(depositBetaConfig({ ...env, DEPOSIT_BETA_MANAGING_DIRECTOR_ID: undefined }).managingDirector, undefined);
@@ -104,7 +103,7 @@ test('handler queries only the authorized scope and emits only the relevant cycl
     pool: { async query(sql, params) {
       assert.match(sql, /LOWER\(f.name\) = LOWER\(\$1\)/);
       calls.push(params);
-      return { rows: [{ branch: 'Vreden' }] };
+      return { rows: [{ branch: params[0] || 'Vreden' }] };
     } },
   });
   const request = async user => {
@@ -118,13 +117,14 @@ test('handler queries only the authorized scope and emits only the relevant cycl
   };
   for (const user of [
     undefined, { id: 999, role: 'Admin', name: 'Sandbox Namensgleich' },
-    { id: 101, role: 'Supervisor' }, { id: 103, role: 'Filiale', filiale: 'Andere Filiale' },
+    { id: 101, role: 'Supervisor' }, { id: 103, role: 'Filiale', filiale: ' Alle ' },
+    { id: 107, role: 'Filiale' },
     { id: 105, role: 'Admin' }, { id: 106, role: 'Geschäftsführer', name: 'Sandbox Namensgleich' },
   ]) assert.equal((await request(user)).status, 404);
   assert.equal(calls.length, 0);
   const branch = await request({ id: 103, role: 'Filiale', filiale: 'Vreden' });
-  assert.deepEqual(calls[0], ['Vreden', ['2026-10-02']]);
-  assert.equal(branch.body.cycles.length, 1);
+  assert.deepEqual(calls[0], ['Vreden', ['2026-10-02', '2026-10-05', '2026-10-06', '2026-10-07', '2026-10-08']]);
+  assert.deepEqual(branch.body.cycles.map(cycle => cycle.branches[0].status), ['yellow', 'planned', 'planned']);
   for (const [id, role] of [[101, 'Admin'], [102, 'Supervisor'], [105, 'Geschäftsführer']]) {
     const result = await request({ id, role });
     assert.equal(result.body.cycles.length, 3);
@@ -132,7 +132,7 @@ test('handler queries only the authorized scope and emits only the relevant cycl
   }
 });
 
-test('HTTP route verifies real session tokens and enforces the allowlist before reading status data', async t => {
+test('HTTP route verifies session tokens and restricts branch users to their own current week', async t => {
   const accounts = {
     101: { role: 'Admin' },
     102: { role: 'Supervisor' },
@@ -140,6 +140,7 @@ test('HTTP route verifies real session tokens and enforces the allowlist before 
     104: { role: 'Admin', name: 'Sandbox Namensgleich' },
     105: { role: 'Geschäftsführer' },
     106: { role: 'Geschäftsführer', name: 'Sandbox Namensgleich' },
+    107: { role: 'Filiale', filiale: 'Münster' },
   };
   const reads = [];
   const pool = {
@@ -150,7 +151,7 @@ test('HTTP route verifies real session tokens and enforces the allowlist before 
         return { rows: account ? [{ id, active: true, token_version: 0, session_epoch: 0, ...account }] : [] };
       }
       reads.push(params[0]);
-      return { rows: (params[0] ? ['Vreden'] : ['Ahaus', 'Vreden']).map(branch => ({ branch })) };
+      return { rows: (params[0] ? [params[0]] : ['Ahaus', 'Vreden']).map(branch => ({ branch })) };
     },
   };
   const jwtSecret = ['sandbox', 'deposit', 'beta', 'http'].join('-');
@@ -162,10 +163,10 @@ test('HTTP route verifies real session tokens and enforces the allowlist before 
   });
   t.after(() => new Promise(resolve => server.close(resolve)));
   const endpoint = `http://127.0.0.1:${server.address().port}`;
-  function request(id) {
+  function request(id, query = '') {
     const headers = {};
     if (id) headers.Authorization = 'Bearer ' + jwt.sign({ id, tokenVersion: 0, sessionEpoch: 0 }, jwtSecret, { expiresIn: '5m' });
-    return fetch(endpoint + '/api/deposit-beta?filiale=Ahaus', { headers });
+    return fetch(endpoint + '/api/deposit-beta?filiale=Ahaus' + query, { headers });
   }
 
   assert.equal((await fetch(endpoint + '/existing')).status, 204);
@@ -181,4 +182,18 @@ test('HTTP route verifies real session tokens and enforces the allowlist before 
     assert.deepEqual(data.cycles[0].branches.map(row => row.branch), id === 103 ? ['Vreden'] : ['Ahaus', 'Vreden']);
   }
   assert.deepEqual(reads, [null, null, 'Vreden', null]);
+  const historic = await (await request(101, '&week=2026-12-28')).json();
+  assert.equal(historic.week.week, 53);
+  assert.equal(historic.week.next, '2027-01-04');
+  assert.equal(historic.currentDueDate, null);
+  assert.deepEqual(historic.cycles.map(cycle => cycle.dueDate), ['2026-12-28', '2026-12-30', '2027-01-01']);
+  const branch = await (await request(103, '&week=2026-12-28')).json();
+  assert.equal(branch.week, undefined);
+  assert.equal(branch.currentDueDate, '2026-10-05');
+  assert.deepEqual(branch.cycles.map(cycle => cycle.dueDate), ['2026-10-05', '2026-10-07', '2026-10-09']);
+  const otherBranch = await (await request(107, '&week=2026-12-28')).json();
+  assert.equal(otherBranch.week, undefined);
+  assert.deepEqual(otherBranch.cycles.map(cycle => cycle.branches.map(row => row.branch)), [['Münster'], ['Münster'], ['Münster']]);
+  assert.equal(reads.at(-1), 'Münster');
+  assert.equal((await request(101, '&week=2026-12-29')).status, 400);
 });

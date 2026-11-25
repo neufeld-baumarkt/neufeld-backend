@@ -63,7 +63,7 @@ function createDepositBetaHandler({ pool, config, now = () => new Date() }) {
       if (!week) return res.status(400).json({ message: 'Bitte den Montag der Kalenderwoche als ISO-Datum angeben.' });
       const liveWeek = week.start === sellingWeek(today).start;
       const current = depositCycle(instant, config.holidays);
-      const cycles = scope.branch ? [current] : depositWeek(instant, config.holidays, week.start);
+      const cycles = depositWeek(instant, config.holidays, week.start);
       const dates = [...new Set(cycles.flatMap(cycle => cycle.dates))];
       const { rows } = await pool.query(statusQuery, [scope.branch, dates]);
       return res.json({
