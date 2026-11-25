@@ -408,6 +408,21 @@ router.get('/employees', async (req, res) => {
   }
 });
 
+router.get('/safe-counts/latest-rolls', async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  try {
+    const branch = await resolveBranch(pool, req);
+    const { rows } = await pool.query(`SELECT NULLIF(coin_roll_counts, '{}'::jsonb) AS counts
+      FROM core.cash_safe_counts
+      WHERE branch_id=$1 AND status='completed'
+      ORDER BY business_date DESC, completed_at DESC, id DESC LIMIT 1`, [branch.id]);
+    return res.json({ counts: rows[0]?.counts ?? null });
+  } catch (error) {
+    console.error('GET /api/tageskasse/safe-counts/latest-rolls Fehler:', error.code || error.statusCode);
+    return res.status(error.statusCode || 500).json({ message: error.statusCode ? error.message : 'Rollengeldbestand konnte nicht geladen werden.' });
+  }
+});
+
 router.get('/safe-counts/context', async (req, res) => {
   try {
     let countType;
